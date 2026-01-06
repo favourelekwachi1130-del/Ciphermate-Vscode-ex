@@ -1,0 +1,27 @@
+{
+	"name": "CipherMate Dev",
+	"build": { "dockerfile": "Dockerfile" },
+	"features": {
+		"ghcr.io/devcontainers/features/node:1": {
+			"version": "20",
+			"yarn": "true",
+			"pnpm": "false"
+		}
+	},
+	"mounts": [
+		"source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-vscode-remote.remote-containers",
+				"dbaeumer.vscode-eslint",
+				"ms-vscode.vscode-typescript-next"
+			]
+		}
+	},
+	"postCreateCommand": "npm ci",
+	"remoteUser": "vscode"
+}
+
+

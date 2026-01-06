@@ -1,0 +1,32 @@
+# Exclude build outputs and local artifacts from the VSIX
+out/**
+node_modules/**
+*.vsix
+*.log
+
+# Exclude generated compliance reports
+*_compliance_report_*.pdf
+*_compliance_report_*.html
+*_compliance_report_*.json
+
+# Exclude tests and configs not needed at runtime
+src/test/**
+vsc-extension-quickstart.md
+webpack.config.js
+tsconfig.json
+eslint.config.mjs
+.nvmrc
+.devcontainer/**
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+.yarnrc
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/.eslintrc.json
+**/*.map
+**/*.ts
+node_modules/**
+test-workspace/**
+*.vsix

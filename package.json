@@ -1,0 +1,661 @@
+{
+  "name": "ciphermate",
+  "displayName": "CipherMate",
+  "description": "AI-powered security assistant with intelligent vulnerability detection, team collaboration, and encrypted memory",
+  "version": "1.1.0",
+  "publisher": "ciphermate",
+  "engines": {
+    "vscode": "^1.102.0"
+  },
+  "categories": [
+    "Linters",
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "security",
+    "vulnerability",
+    "ai",
+    "semgrep",
+    "bandit",
+    "static-analysis",
+    "code-quality",
+    "team-collaboration"
+  ],
+  "activationEvents": [
+    "onCommand:ciphermate",
+    "onCommand:ciphermate.chat",
+    "onCommand:ciphermate.scan",
+    "onCommand:ciphermate.intelligentScan",
+    "onCommand:ciphermate.showResults",
+    "onCommand:ciphermate.settings",
+    "onCommand:ciphermate.advancedSettings",
+    "onCommand:ciphermate.home",
+    "onCommand:ciphermate.login",
+    "onCommand:ciphermate.loginGoogle",
+    "onCommand:ciphermate.loginMicrosoft",
+    "onCommand:ciphermate.logout",
+    "onCommand:ciphermate.userProfile",
+    "onCommand:ciphermate.cancelScan",
+    "onCommand:ciphermate.showCommands",
+    "onCommand:ciphermate.redTeamOps"
+  ],
+  "main": "./dist/extension.js",
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#4FC3F7",
+    "theme": "light"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/ciphermate.git"
+  },
+  "homepage": "https://github.com/your-username/ciphermate#readme",
+  "bugs": {
+    "url": "https://github.com/your-username/ciphermate/issues"
+  },
+  "license": "MIT",
+  "optionalDependencies": {
+    "semgrep": "*",
+    "bandit": "*"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ciphermate",
+          "title": "CipherMate",
+          "icon": "images/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ciphermate": [
+        {
+          "id": "ciphermateWelcome",
+          "name": "Welcome",
+          "when": "true"
+        },
+        {
+          "id": "ciphermateFindings",
+          "name": "Findings"
+        }
+      ]
+    },
+    "viewsWelcome": {
+      "ciphermate": [
+        {
+          "contents": "**Welcome to CipherMate!**\n\nAI-powered security assistant for VS Code.\n\n**Quick Start:**\n1. [Configure API Key](command:ciphermate.advancedSettings) - Set up your AI provider\n2. [Start Chatting](command:ciphermate) - Begin using CipherMate\n3. [View Results](command:ciphermate.showResults) - See security findings\n\n**Need Help?** Click any command above to get started.",
+          "when": "true"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "ciphermate",
+          "when": "view == ciphermateWelcome",
+          "group": "navigation"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ciphermate",
+        "title": "CipherMate",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "ciphermate.chat",
+        "title": "CipherMate: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "ciphermate.scan",
+        "title": "CipherMate: Scan Code"
+      },
+             {
+               "command": "ciphermate.intelligentScan",
+               "title": "CipherMate: Intelligent Repository Scan"
+             },
+             {
+               "command": "ciphermate.aiOnlyScan",
+               "title": "CipherMate: AI-Only Security Scan"
+             },
+             {
+               "command": "ciphermate.intelligentRAGScan",
+               "title": "CipherMate: Intelligent RAG-Powered Security Scan"
+             },
+             {
+               "command": "ciphermate.switchAgent",
+               "title": "CipherMate: Switch AI Agent"
+             },
+             {
+               "command": "ciphermate.testAgent",
+               "title": "CipherMate: Test AI Agent Connection"
+             },
+      {
+        "command": "ciphermate.scanSemgrep",
+        "title": "CipherMate: Scan with Semgrep"
+      },
+      {
+        "command": "ciphermate.scanBandit",
+        "title": "CipherMate: Scan with Bandit (Python)"
+      },
+      {
+        "command": "ciphermate.settings",
+        "title": "CipherMate: Settings"
+      },
+      {
+        "command": "ciphermate.advancedSettings",
+        "title": "CipherMate: Advanced Settings"
+      },
+      {
+        "command": "ciphermate.home",
+        "title": "CipherMate: Home Dashboard"
+      },
+      {
+        "command": "ciphermate.login",
+        "title": "CipherMate: Login with GitHub"
+      },
+      {
+        "command": "ciphermate.loginGoogle",
+        "title": "CipherMate: Login with Google"
+      },
+      {
+        "command": "ciphermate.loginMicrosoft",
+        "title": "CipherMate: Login with Microsoft"
+      },
+      {
+        "command": "ciphermate.logout",
+        "title": "CipherMate: Logout"
+      },
+      {
+        "command": "ciphermate.userProfile",
+        "title": "CipherMate: User Profile"
+      },
+      {
+        "command": "ciphermate.cancelScan",
+        "title": "CipherMate: Cancel Scan"
+      },
+      {
+        "command": "ciphermate.showCommands",
+        "title": "CipherMate: Show Commands"
+      },
+      {
+        "command": "ciphermate.redTeamOps",
+        "title": "CipherMate: Red Team Operations Center"
+      },
+      {
+        "command": "ciphermate.scanMe",
+        "title": "CipherMate: Scan Me"
+      },
+      {
+        "command": "ciphermate.applyFix",
+        "title": "CipherMate: Apply Security Fix"
+      },
+      {
+        "command": "ciphermate.showResults",
+        "title": "CipherMate: Show Results Panel"
+      },
+      {
+        "command": "ciphermate.clearData",
+        "title": "CipherMate: Clear Encrypted Data"
+      },
+      {
+        "command": "ciphermate.testStorage",
+        "title": "CipherMate: Test Encrypted Storage"
+      },
+      {
+        "command": "ciphermate.showProfile",
+        "title": "CipherMate: Show Developer Profile"
+      },
+      {
+        "command": "ciphermate.clearMemory",
+        "title": "CipherMate: Clear AI Memory"
+      },
+      {
+        "command": "ciphermate.setupTeam",
+        "title": "CipherMate: Setup Team Collaboration"
+      },
+      {
+        "command": "ciphermate.teamDashboard",
+        "title": "CipherMate: Team Dashboard"
+      },
+      {
+        "command": "ciphermate.viewReports",
+        "title": "CipherMate: View Team Reports"
+      },
+      {
+        "command": "ciphermate.exportResults",
+        "title": "CipherMate: Export Results"
+      },
+      {
+        "command": "ciphermate.incrementalScan",
+        "title": "CipherMate: Incremental Scan"
+      },
+      {
+        "command": "ciphermate.clearCache",
+        "title": "CipherMate: Clear Scan Cache"
+      },
+      {
+        "command": "ciphermate.cacheStatus",
+        "title": "CipherMate: Show Cache Status"
+      },
+      {
+        "command": "ciphermate.backgroundStatus",
+        "title": "CipherMate: Background Scan Status"
+      },
+      {
+        "command": "ciphermate.generateFix",
+        "title": "CipherMate: Generate Secure Fix"
+      },
+      {
+        "command": "ciphermate.feedbackAnalytics",
+        "title": "CipherMate: Show Feedback Analytics"
+      },
+      {
+        "command": "ciphermate.clearFeedback",
+        "title": "CipherMate: Clear Feedback Store"
+      },
+      {
+        "command": "ciphermate.redTeamAttack",
+        "title": "CipherMate: Red-team Sandbox Attack"
+      },
+      {
+        "command": "ciphermate.exploitHistory",
+        "title": "CipherMate: Show Exploit History"
+      },
+      {
+        "command": "ciphermate.clearExploitHistory",
+        "title": "CipherMate: Clear Exploit History"
+      },
+      {
+        "command": "ciphermate.orgLearningInsights",
+        "title": "CipherMate: Show Org Learning Insights"
+      },
+      {
+        "command": "ciphermate.personalizedRecommendations",
+        "title": "CipherMate: Show Personalized Recommendations"
+      },
+      {
+        "command": "ciphermate.createCustomRule",
+        "title": "CipherMate: Create Custom Rule"
+      },
+      {
+        "command": "ciphermate.showCustomRules",
+        "title": "CipherMate: Show Custom Rules"
+      },
+      {
+        "command": "ciphermate.resetOrgLearning",
+        "title": "CipherMate: Reset Org Learning Profile"
+      },
+      {
+        "command": "ciphermate.vulnerabilityForecast",
+        "title": "CipherMate: Generate Vulnerability Forecast"
+      },
+      {
+        "command": "ciphermate.attackTrends",
+        "title": "CipherMate: Show Attack Trends"
+      },
+      {
+        "command": "ciphermate.complianceCheck",
+        "title": "CipherMate: Compliance Check"
+      },
+      {
+        "command": "ciphermate.complianceReport",
+        "title": "CipherMate: Generate Compliance Report"
+      },
+      {
+        "command": "ciphermate.openDashboard",
+        "title": "CipherMate: Open Dashboard"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ciphermate.scan",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.intelligentScan",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.showResults",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.incrementalScan",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.generateFix",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.redTeamAttack",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.orgLearningInsights",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.personalizedRecommendations",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.createCustomRule",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.vulnerabilityForecast",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.attackTrends",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.complianceCheck",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.complianceReport",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.advancedSettings"
+        },
+        {
+          "command": "ciphermate.home"
+        },
+        {
+          "command": "ciphermate.login"
+        },
+        {
+          "command": "ciphermate.loginGoogle"
+        },
+        {
+          "command": "ciphermate.loginMicrosoft"
+        },
+        {
+          "command": "ciphermate.logout"
+        },
+        {
+          "command": "ciphermate.userProfile"
+        },
+        {
+          "command": "ciphermate.cancelScan"
+        },
+        {
+          "command": "ciphermate.showCommands"
+        },
+        {
+          "command": "ciphermate.redTeamOps"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "ciphermate.scan",
+          "group": "ciphermate",
+          "when": "resourceExtname =~ /\\.(js|ts|py|php|java|c|cpp|cs|go|rs|rb|sh)$/"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CipherMate",
+      "properties": {
+        "ciphermate.enableSemgrep": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Semgrep static analysis"
+        },
+        "ciphermate.enableBandit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Bandit Python security scanning"
+        },
+        "ciphermate.scanOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically scan files when saved"
+        },
+        "ciphermate.scanInterval": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "description": "Number of saves before triggering a full scan"
+        },
+               "ciphermate.useCloudAI": {
+                 "type": "boolean",
+                 "default": true,
+                 "description": "Use cloud-based AI service (your trained model). Set to false to use local AI (LM Studio/Ollama)."
+               },
+               "ciphermate.ai.useMultiProvider": {
+                 "type": "boolean",
+                 "default": true,
+                 "description": "Use multi-provider AI system (supports 450+ models via OpenRouter, Claude, Gemini, GPT-5, etc.)"
+               },
+               "ciphermate.ai.provider": {
+                 "type": "string",
+                 "enum": ["openrouter", "openai", "anthropic", "gemini", "ollama", "custom"],
+                 "default": "openrouter",
+                 "description": "Primary AI provider. OpenRouter supports 450+ models. Ollama for local/self-hosted models (DeepSeek Coder, etc.)"
+               },
+               "ciphermate.ai.openrouter": {
+                 "type": "object",
+                 "properties": {
+                   "apiKey": {
+                     "type": "string",
+                     "default": "",
+                     "description": "OpenRouter API key (get from https://openrouter.ai)"
+                   },
+                   "model": {
+                     "type": "string",
+                     "default": "openai/gpt-4",
+                     "description": "Model to use (e.g., 'openai/gpt-5', 'anthropic/claude-sonnet-4-20250514', 'google/gemini-2.0-flash-exp')"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 30000,
+                     "description": "Request timeout in milliseconds"
+                   }
+                 }
+               },
+               "ciphermate.ai.openai": {
+                 "type": "object",
+                 "properties": {
+                   "apiKey": {
+                     "type": "string",
+                     "default": "",
+                     "description": "OpenAI API key"
+                   },
+                   "model": {
+                     "type": "string",
+                     "default": "gpt-4",
+                     "description": "OpenAI model (gpt-5, gpt-4, gpt-3.5-turbo, etc.)"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 30000,
+                     "description": "Request timeout in milliseconds"
+                   }
+                 }
+               },
+               "ciphermate.ai.anthropic": {
+                 "type": "object",
+                 "properties": {
+                   "apiKey": {
+                     "type": "string",
+                     "default": "",
+                     "description": "Anthropic API key (for Claude models)"
+                   },
+                   "model": {
+                     "type": "string",
+                     "default": "claude-3-5-sonnet-20241022",
+                     "description": "Claude model (claude-sonnet-4-20250514, claude-3-5-sonnet, etc.)"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 30000,
+                     "description": "Request timeout in milliseconds"
+                   }
+                 }
+               },
+               "ciphermate.ai.ollama": {
+                 "type": "object",
+                 "properties": {
+                   "apiUrl": {
+                     "type": "string",
+                     "default": "http://localhost:11434",
+                     "description": "Ollama server URL (e.g., http://localhost:11434 or http://your-server:11434)"
+                   },
+                   "model": {
+                     "type": "string",
+                     "default": "deepseek-coder:6.7b",
+                     "description": "Ollama model name (e.g., 'deepseek-coder:6.7b', 'deepseek-coder:1.3b', 'deepseek-coder:33b', 'codellama:7b')"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 120000,
+                     "description": "Request timeout in milliseconds (local models may need longer)"
+                   }
+                 }
+               },
+               "ciphermate.ai.gemini": {
+                 "type": "object",
+                 "properties": {
+                   "apiKey": {
+                     "type": "string",
+                     "default": "",
+                     "description": "Google AI API key (for Gemini models)"
+                   },
+                   "model": {
+                     "type": "string",
+                     "default": "gemini-1.5-pro",
+                     "description": "Gemini model (gemini-2.0-flash-exp, gemini-1.5-pro, etc.)"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 30000,
+                     "description": "Request timeout in milliseconds"
+                   }
+                 }
+               },
+               "ciphermate.ai.custom": {
+                 "type": "object",
+                 "properties": {
+                   "apiUrl": {
+                     "type": "string",
+                     "default": "",
+                     "description": "Custom API endpoint (must be OpenAI-compatible)"
+                   },
+                   "apiKey": {
+                     "type": "string",
+                     "default": "",
+                     "description": "API key for custom provider"
+                   },
+                   "model": {
+                     "type": "string",
+                     "default": "",
+                     "description": "Model name"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 30000,
+                     "description": "Request timeout in milliseconds"
+                   }
+                 }
+               },
+               "ciphermate.ai.fallbackProviders": {
+                 "type": "array",
+                 "items": {
+                   "type": "string",
+                   "enum": ["openai", "anthropic", "gemini", "openrouter"]
+                 },
+                 "default": [],
+                 "description": "Fallback providers to use if primary provider fails (in order)"
+               },
+               "ciphermate.cloudAI": {
+                 "type": "object",
+                 "properties": {
+                   "apiUrl": {
+                     "type": "string",
+                     "default": "https://api.ciphermate.ai/v1/chat/completions",
+                     "description": "Your custom AI service API endpoint (legacy, use ai.provider instead)"
+                   },
+                   "apiKey": {
+                     "type": "string",
+                     "default": "",
+                     "description": "API key for authentication (stored securely)"
+                   },
+                   "modelName": {
+                     "type": "string",
+                     "default": "ciphermate-security-agent",
+                     "description": "Model name/version identifier"
+                   },
+                   "timeout": {
+                     "type": "number",
+                     "default": 30000,
+                     "description": "Request timeout in milliseconds"
+                   }
+                 }
+               },
+               "ciphermate.lmStudioUrl": {
+                 "type": "string",
+                 "default": "http://localhost:1234/v1/chat/completions",
+                 "description": "LM Studio API endpoint URL (only used if useCloudAI is false)"
+               },
+               "ciphermate.enableLiveReview": {
+                 "type": "boolean",
+                 "default": true,
+                 "description": "Enable live code review with real-time security suggestions"
+               }
+      }
+    }
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.65.0",
+    "@google/generative-ai": "^0.24.1",
+    "openai": "^6.10.0"
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack --mode production",
+    "compile:dev": "webpack --mode development",
+    "watch": "webpack --mode development --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile:dev && npm run lint",
+    "lint": "eslint src --ext ts",
+    "lint:fix": "eslint src --ext ts --fix",
+    "test": "vscode-test",
+    "test:enterprise": "node ./out/test/enterprise.test.js",
+    "test:coverage": "nyc npm test",
+    "build": "npm run compile && npm run test",
+    "dev": "npm run compile:dev && code --extensionDevelopmentPath=. --disable-extensions",
+    "clean": "rimraf out dist *.vsix",
+    "security:audit": "npm audit",
+    "security:fix": "npm audit fix"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.102.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "20.x",
+    "@typescript-eslint/eslint-plugin": "^8.31.1",
+    "@typescript-eslint/parser": "^8.31.1",
+    "eslint": "^9.25.1",
+    "typescript": "^5.8.3",
+    "ts-loader": "^9.5.2",
+    "webpack": "^5.99.7",
+    "webpack-cli": "^6.0.1",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "nyc": "^15.1.0",
+    "rimraf": "^5.0.5",
+    "vsce": "^2.15.0"
+  }
+}
