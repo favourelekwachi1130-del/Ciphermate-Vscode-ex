@@ -6,7 +6,7 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 ---
 
-## 🚀 GET STARTED IN 3 STEPS
+##  GET STARTED IN 3 STEPS
 
 ### Step 1: Open CipherMate
 1. **Look for the CipherMate icon** in the left sidebar (Activity Bar)
@@ -56,7 +56,7 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 ---
 
-## 🎯 COMMON TASKS
+## COMMON TASKS
 
 ### Scan Your Code
 1. Open CipherMate (click icon or `Cmd+Shift+P` → `CipherMate`)
@@ -113,7 +113,7 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 ---
 
-## 🆘 TROUBLESHOOTING
+##  TROUBLESHOOTING
 
 ### "I don't see the CipherMate icon"
 - Check Extensions view (`Cmd+Shift+X`)
@@ -140,7 +140,7 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 ---
 
-## 📚 LEARN MORE
+##  LEARN MORE
 
 **Documentation**: All guides in [`docs/`](docs/) folder
 
@@ -152,7 +152,7 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 ---
 
-## 🔧 FOR DEVELOPERS
+##  FOR DEVELOPERS
 
 ### Installation for Development
 
