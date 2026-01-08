@@ -31,6 +31,9 @@ export class ChatInterface {
   private currentSession: ChatSession | null = null;
   private chatSessions: ChatSession[] = [];
   private thinkingSteps: string[] = [];
+  private messageHandlerDisposable: vscode.Disposable | undefined;
+  private lastProcessedMessage: { text: string; timestamp: number } | null = null;
+  private isProcessingMessage: boolean = false;
 
   constructor(context: vscode.ExtensionContext, agent: AIAgentCore) {
     this.context = context;
@@ -204,7 +207,8 @@ export class ChatInterface {
       if (this.panel) {
         // Force update HTML to ensure latest changes are shown
         this.panel.webview.html = this.getChatHtml();
-        this.setupMessageHandlers();
+        // Note: Don't call setupMessageHandlers() here - handlers are already registered
+        // and calling it again would create duplicate handlers causing double messages
         // Restore messages after HTML is updated
         this.restoreMessages();
         this.panel.reveal();
@@ -226,6 +230,11 @@ export class ChatInterface {
       this.setupMessageHandlers();
 
       this.panel.onDidDispose(() => {
+        // Clean up message handler disposable
+        if (this.messageHandlerDisposable) {
+          this.messageHandlerDisposable.dispose();
+          this.messageHandlerDisposable = undefined;
+        }
         this.panel = null;
       });
 
@@ -452,13 +461,18 @@ export class ChatInterface {
 
         // Show thinking for conversational requests
         this.showThinkingStep('Thinking...');
-        
-        // Add timeout to prevent hanging (increased to 60 seconds for complex conversations)
+
+        // Get timeout from config - use longer timeout for Ollama (5 minutes default)
+        const config = vscode.workspace.getConfiguration('ciphermate');
+        const provider = config.get<string>('ai.provider') || 'openrouter';
+        // Ollama needs longer timeout (5 min), cloud providers use 2 min
+        const timeoutMs = provider === 'ollama' ? 300000 : 120000;
+
         try {
           responseText = await Promise.race([
             this.cyberAgent.chat(contextMessage),
             new Promise<string>((_, reject) => {
-              setTimeout(() => reject(new Error('Request timed out after 60 seconds')), 60000);
+              setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs / 1000} seconds`)), timeoutMs);
             })
           ]);
           
@@ -745,8 +759,15 @@ export class ChatInterface {
       return;
     }
 
+    // Dispose existing handler to prevent duplicate message processing
+    if (this.messageHandlerDisposable) {
+      console.log('ChatInterface: Disposing existing message handler');
+      this.messageHandlerDisposable.dispose();
+      this.messageHandlerDisposable = undefined;
+    }
+
     console.log('ChatInterface: Setting up message handlers');
-    this.panel.webview.onDidReceiveMessage(async (message) => {
+    this.messageHandlerDisposable = this.panel.webview.onDidReceiveMessage(async (message) => {
       console.log('ChatInterface: Received message:', message);
       
       try {
@@ -764,8 +785,31 @@ export class ChatInterface {
           }
           return;
         } else if (message.command === 'sendMessage') {
-          console.log('ChatInterface: Processing sendMessage with text:', message.text);
-          await this.processUserMessage(message.text);
+          const messageText = message.text?.trim();
+          console.log('ChatInterface: Processing sendMessage with text:', messageText);
+
+          // Prevent duplicate message processing
+          const now = Date.now();
+          if (this.isProcessingMessage) {
+            console.log('ChatInterface: Already processing a message, ignoring duplicate');
+            return;
+          }
+          if (this.lastProcessedMessage &&
+              this.lastProcessedMessage.text === messageText &&
+              now - this.lastProcessedMessage.timestamp < 5000) {
+            console.log('ChatInterface: Duplicate message detected within 5s, ignoring');
+            return;
+          }
+
+          // Mark as processing and save last message
+          this.isProcessingMessage = true;
+          this.lastProcessedMessage = { text: messageText, timestamp: now };
+
+          try {
+            await this.processUserMessage(messageText);
+          } finally {
+            this.isProcessingMessage = false;
+          }
         } else if (message.command === 'clearChat') {
           this.messageHistory = [];
           this.agent.clearHistory();
@@ -1315,6 +1359,119 @@ export class ChatInterface {
         .message.assistant .message-content {
             background: var(--vscode-input-background);
         }
+
+        /* Markdown code block styling */
+        .code-block {
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 12px;
+            margin: 8px 0;
+            overflow-x: auto;
+            font-family: var(--vscode-editor-font-family, 'Consolas', 'Monaco', 'Courier New', monospace);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .code-block code {
+            background: transparent;
+            padding: 0;
+            color: var(--vscode-editor-foreground);
+        }
+
+        .inline-code {
+            background: var(--vscode-editor-background);
+            color: var(--vscode-editor-foreground);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: var(--vscode-editor-font-family, 'Consolas', 'Monaco', 'Courier New', monospace);
+            font-size: 0.9em;
+        }
+
+        .message-content strong {
+            font-weight: 600;
+            color: var(--vscode-textLink-foreground);
+        }
+
+        .message-content em {
+            font-style: italic;
+        }
+
+        .message-content li {
+            margin: 4px 0;
+        }
+
+        .message-content a {
+            color: var(--vscode-textLink-foreground);
+            text-decoration: underline;
+        }
+
+        .message-content a:hover {
+            color: var(--vscode-textLink-activeForeground);
+        }
+
+        /* Severity badges */
+        .severity-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-right: 6px;
+        }
+        .severity-badge.critical { background: #dc3545; color: white; }
+        .severity-badge.high { background: #fd7e14; color: white; }
+        .severity-badge.medium { background: #ffc107; color: black; }
+        .severity-badge.low { background: #28a745; color: white; }
+        .severity-badge.info { background: #17a2b8; color: white; }
+
+        /* File paths */
+        .file-path {
+            font-family: var(--vscode-editor-font-family);
+            background: var(--vscode-editor-background);
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            color: var(--vscode-textLink-foreground);
+        }
+
+        /* Section dividers */
+        .section-divider {
+            border: none;
+            border-top: 1px solid var(--vscode-panel-border);
+            margin: 16px 0;
+        }
+
+        /* Stat numbers */
+        .stat-critical { color: #dc3545; font-weight: 600; }
+        .stat-high { color: #fd7e14; font-weight: 600; }
+        .stat-medium { color: #ffc107; font-weight: 600; }
+
+        /* Finding lists */
+        .finding-list {
+            list-style: none;
+            padding-left: 0;
+            margin: 8px 0;
+        }
+        .finding-list li {
+            padding: 8px 12px;
+            background: var(--vscode-editor-background);
+            border-left: 3px solid var(--vscode-panel-border);
+            margin: 4px 0;
+            border-radius: 0 4px 4px 0;
+        }
+
+        /* Headers with better spacing */
+        .message-content h2, .message-content h3, .message-content h4, .message-content h5 {
+            margin-top: 16px;
+            margin-bottom: 8px;
+            color: var(--vscode-foreground);
+        }
+        .message-content h2 { font-size: 1.3em; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; }
+        .message-content h3 { font-size: 1.15em; }
+        .message-content h4 { font-size: 1.05em; }
+        .message-content h5 { font-size: 1em; color: var(--vscode-descriptionForeground); }
 
         .thinking {
             display: none;
@@ -2276,6 +2433,76 @@ export class ChatInterface {
             }, 100);
         }
 
+            // Simple markdown parser - converts markdown to HTML
+            function parseMarkdown(text) {
+                if (!text) return '';
+
+                // Escape HTML to prevent XSS
+                var html = text
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
+
+                // Use String.fromCharCode(96) for backtick to avoid template literal issues
+                var backtick = String.fromCharCode(96);
+                var tripleBacktick = backtick + backtick + backtick;
+
+                // Code blocks (triple backticks)
+                var codeBlockRegex = new RegExp(tripleBacktick + '(\\\\w*)\\n([\\\\s\\\\S]*?)' + tripleBacktick, 'g');
+                html = html.replace(codeBlockRegex, function(match, lang, code) {
+                    return '<pre class="code-block"><code class="language-' + (lang || 'plaintext') + '">' + (code ? code.trim() : '') + '</code></pre>';
+                });
+
+                // Inline code (single backticks)
+                var inlineCodeRegex = new RegExp(backtick + '([^' + backtick + ']+)' + backtick, 'g');
+                html = html.replace(inlineCodeRegex, '<code class="inline-code">$1</code>');
+
+                // Bold (**text**)
+                html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+
+                // Italic (*text*)
+                html = html.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
+
+                // Headers (## text) - process longer patterns first
+                html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
+                html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+                html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+                html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+
+                // Bullet lists (- item)
+                html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+
+                // Numbered lists (1. item)
+                html = html.replace(/^\\d+\\. (.+)$/gm, '<li>$1</li>');
+
+                // Links [text](url)
+                html = html.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+
+                // Horizontal rules (---) - before line breaks
+                html = html.replace(/^---$/gm, '<hr class="section-divider">');
+
+                // Severity badges with colors
+                html = html.replace(/\\[CRITICAL\\]/g, '<span class="severity-badge critical">CRITICAL</span>');
+                html = html.replace(/\\[HIGH\\]/g, '<span class="severity-badge high">HIGH</span>');
+                html = html.replace(/\\[MEDIUM\\]/g, '<span class="severity-badge medium">MEDIUM</span>');
+                html = html.replace(/\\[LOW\\]/g, '<span class="severity-badge low">LOW</span>');
+                html = html.replace(/\\[INFO\\]/g, '<span class="severity-badge info">INFO</span>');
+
+                // Stats with colored numbers (Critical: 2696)
+                html = html.replace(/Critical:\\s*(\\d+)/gi, 'Critical: <span class="stat-critical">$1</span>');
+                html = html.replace(/High:\\s*(\\d+)/gi, 'High: <span class="stat-high">$1</span>');
+                html = html.replace(/Medium:\\s*(\\d+)/gi, 'Medium: <span class="stat-medium">$1</span>');
+
+                // File paths with line numbers (Windows style c:\path:123)
+                html = html.replace(/([A-Za-z]:\\\\[^\\s:]+:\\d+)/g, '<span class="file-path">$1</span>');
+
+                // Line breaks
+                html = html.replace(/\\n\\n/g, '</p><p>');
+                html = html.replace(/\\n/g, '<br>');
+
+                return html;
+            }
+
             function addMessage(role, content, timestamp) {
             console.log('addMessage called:', role, content ? content.substring(0, 50) : '');
             const container = document.getElementById('messages');
@@ -2296,9 +2523,14 @@ export class ChatInterface {
             
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
-            contentDiv.textContent = content;
+            // Use markdown parsing for assistant responses, plain text for user messages
+            if (role === 'assistant') {
+                contentDiv.innerHTML = parseMarkdown(content);
+            } else {
+                contentDiv.textContent = content;
+            }
                 contentDiv.style.cssText = 'background: var(--vscode-input-background); border: 1px solid var(--vscode-panel-border); padding: 12px 16px; line-height: 1.5; word-wrap: break-word; color: var(--vscode-editor-foreground);';
-                
+
                 if (role === 'user') {
                     contentDiv.style.cssText += 'background: var(--vscode-button-background); color: var(--vscode-button-foreground);';
                 }
@@ -2585,33 +2817,7 @@ export class ChatInterface {
                             body.classList.add('chat-mode');
                         }
                         
-                        // Add message to UI immediately for feedback
-                        if (messagesContainer) {
-                    // Ensure thinking element exists
-                    let thinkingEl = document.getElementById('thinking');
-                    if (!thinkingEl) {
-                        thinkingEl = document.createElement('div');
-                        thinkingEl.className = 'thinking';
-                        thinkingEl.id = 'thinking';
-                        thinkingEl.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">Processing<span class="thinking-dots">...</span></span>';
-                        messagesContainer.appendChild(thinkingEl);
-                    }
-                    
-                            const messageDiv = document.createElement('div');
-                            messageDiv.className = 'message user';
-                            const avatar = document.createElement('div');
-                            avatar.className = 'message-avatar';
-                            avatar.textContent = 'You';
-                            const contentDiv = document.createElement('div');
-                            contentDiv.className = 'message-content';
-                            contentDiv.textContent = actionText;
-                            messageDiv.appendChild(avatar);
-                            messageDiv.appendChild(contentDiv);
-                    messagesContainer.insertBefore(messageDiv, thinkingEl);
-                            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                        }
-                        
-                // Send message to extension
+                // Send message to extension (extension will add message to UI via addMessage)
                         console.log('Sending message to extension:', actionText);
                         try {
                     if (!vscode || typeof vscode.postMessage !== 'function') {
@@ -2644,24 +2850,8 @@ export class ChatInterface {
                 });
             }
 
-            // Set up welcome screen quick actions
-            if (welcomeQuickActions && welcomeQuickActions.length > 0) {
-                console.log('=== SETUP: Found', welcomeQuickActions.length, 'welcome quick action buttons ===');
-                welcomeQuickActions.forEach((action, index) => {
-                    const actionText = action.getAttribute('data-action');
-                    console.log('=== SETUP: Welcome quick action', index, ':', actionText, '===');
-                    action.style.cursor = 'pointer';
-                    
-                    action.addEventListener('click', (e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        console.log('=== WELCOME QUICK ACTION CLICKED ===', actionText);
-                        handleQuickActionClick(action, actionText);
-                });
-                });
-            } else {
-                console.warn('=== WARNING: No welcome quick action buttons found ===');
-            }
+            // NOTE: Welcome screen quick actions are set up by setupWelcomeScreenButtons()
+            // which is called on page load and handles deduplication via cloneNode
 
             // Set up chat mode quick actions
             if (quickActions && quickActions.length > 0) {

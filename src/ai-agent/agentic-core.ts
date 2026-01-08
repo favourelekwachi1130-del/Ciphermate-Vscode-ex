@@ -374,7 +374,8 @@ export class AgenticCore {
             filterDependencies: isDependencyRequest
           }),
           new Promise<any>((_, reject) => {
-            setTimeout(() => reject(new Error('Scan timed out after 60 seconds')), 60000);
+            // Scans can take a while for large repositories - use 3 minute timeout
+            setTimeout(() => reject(new Error('Scan timed out after 180 seconds')), 180000);
           })
         ]);
         
@@ -1154,8 +1155,9 @@ Always think step by step and use tools to accomplish tasks.`;
       this.state.vulnerabilities = allResults;
       this.state.scanResults = allResults;
 
-      const criticalCount = scanResult.aggregated.critical + allResults.filter((r: any) => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
-      const highCount = scanResult.aggregated.high + allResults.filter((r: any) => r.severity === 'HIGH' || r.severity === 'WARNING').length;
+      // Use aggregated counts directly - no need to re-filter as scanResult.aggregated already has correct totals
+      const criticalCount = scanResult.aggregated.critical;
+      const highCount = scanResult.aggregated.high;
 
       // Build detailed scanner information with per-scanner vulnerability lists
       const scannerDetails = scanResult.results.map(r => {

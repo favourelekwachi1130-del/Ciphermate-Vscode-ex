@@ -1597,10 +1597,16 @@ function postResultsToWebview() {
 }
 
 async function callLmStudio(prompt: string): Promise<string> {
-  // Get LM Studio URL from configuration
   const config = vscode.workspace.getConfiguration('ciphermate');
+  const provider = config.get<string>('ai.provider') || 'lmstudio';
+
+  // Check if Ollama is configured - use Ollama API instead of LM Studio
+  if (provider === 'ollama') {
+    return callOllamaAPI(prompt, config);
+  }
+
+  // Original LM Studio logic for backwards compatibility
   const url = config.get<string>('lmStudioUrl') || 'http://localhost:1234/v1/chat/completions';
-  // Try without specifying model first, let LM Studio use default
   const body = JSON.stringify({
     messages: [
       { role: 'system', content: 'You are a security coding assistant. Help fix or explain vulnerabilities in code.' },
@@ -1610,10 +1616,10 @@ async function callLmStudio(prompt: string): Promise<string> {
     temperature: 0.7,
     max_tokens: 1000
   });
-  
+
   console.log('Calling LM Studio at:', url);
   console.log('Request body:', body.substring(0, 200) + '...');
-  
+
   return new Promise((resolve, reject) => {
     const req = http.request(url, {
       method: 'POST',
@@ -1626,17 +1632,17 @@ async function callLmStudio(prompt: string): Promise<string> {
       let data = '';
       console.log('LM Studio response status:', res.statusCode);
       console.log('LM Studio response headers:', res.headers);
-      
+
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         console.log('LM Studio raw response:', data.substring(0, 500) + '...');
         try {
           const json = JSON.parse(data);
           console.log('LM Studio parsed response:', JSON.stringify(json, null, 2));
-          
+
           // Try different response formats that LM Studio might use
           let content = null;
-          
+
           // Standard OpenAI format
           if (json.choices && json.choices[0] && json.choices[0].message) {
             content = json.choices[0].message.content;
@@ -1661,7 +1667,7 @@ async function callLmStudio(prompt: string): Promise<string> {
           else if (json.result) {
             content = json.result;
           }
-          
+
           if (content) {
             console.log('LM Studio content found:', content.substring(0, 200) + '...');
             resolve(content);
@@ -1685,18 +1691,138 @@ async function callLmStudio(prompt: string): Promise<string> {
         }
       });
     });
-    
+
     req.on('error', (error) => {
       console.log('LM Studio request error:', error);
       reject('LM Studio connection failed: ' + error.message);
     });
-    
+
     req.on('timeout', () => {
       console.log('LM Studio request timeout');
       req.destroy();
       reject('LM Studio request timeout - check if LM Studio is running');
     });
-    
+
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Call Ollama API for AI responses
+ * Supports both local and remote Ollama instances
+ */
+async function callOllamaAPI(prompt: string, config: vscode.WorkspaceConfiguration): Promise<string> {
+  // Read Ollama configuration - try multiple methods to handle VS Code nested settings
+  let baseUrl = 'http://localhost:11434';
+  let model = 'deepseek-coder:1.3b';
+  const timeout = config.get<number>('ai.ollama.timeout') || 300000; // 5 minute default for Ollama
+
+  // Method 1: Try nested object approach (VS Code sometimes stores as object)
+  const ollamaConfig = config.get('ai.ollama') as any;
+  if (ollamaConfig && typeof ollamaConfig === 'object') {
+    if (ollamaConfig.apiUrl) baseUrl = ollamaConfig.apiUrl;
+    if (ollamaConfig.model) model = ollamaConfig.model;
+  }
+
+  // Method 2: Try dot notation (fallback)
+  const directUrl = config.get<string>('ai.ollama.apiUrl');
+  const directModel = config.get<string>('ai.ollama.model');
+  if (directUrl) baseUrl = directUrl;
+  if (directModel) model = directModel;
+
+  // Method 3: Read from workspace settings.json directly if still localhost
+  if (baseUrl === 'http://localhost:11434') {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders && workspaceFolders.length > 0) {
+      try {
+        const settingsPath = path.join(workspaceFolders[0].uri.fsPath, '.vscode', 'settings.json');
+        if (fs.existsSync(settingsPath)) {
+          const settingsContent = fs.readFileSync(settingsPath, 'utf8');
+          const settings = JSON.parse(settingsContent);
+
+          const ollamaUrl = settings['ciphermate.ai.ollama.apiUrl'];
+          const ollamaModel = settings['ciphermate.ai.ollama.model'];
+
+          if (ollamaUrl && typeof ollamaUrl === 'string') baseUrl = ollamaUrl.trim();
+          if (ollamaModel && typeof ollamaModel === 'string') model = ollamaModel.trim();
+        }
+      } catch (error) {
+        console.error('callOllamaAPI: Error reading settings.json:', error);
+      }
+    }
+  }
+
+  // Ensure URL doesn't have trailing slash
+  baseUrl = baseUrl.replace(/\/$/, '');
+  const apiUrl = `${baseUrl}/api/generate`;
+
+  console.log(`callOllamaAPI: Using Ollama at ${baseUrl} with model ${model}`);
+
+  const body = JSON.stringify({
+    model: model,
+    prompt: `You are a security coding assistant. Help fix or explain vulnerabilities in code.\n\nUser request: ${prompt}`,
+    stream: false,
+    options: {
+      temperature: 0.7,
+      num_predict: 1000
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(apiUrl);
+    const isHttps = urlObj.protocol === 'https:';
+    const httpModule = isHttps ? https : http;
+
+    const req = httpModule.request({
+      hostname: urlObj.hostname,
+      port: urlObj.port || (isHttps ? 443 : 80),
+      path: urlObj.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: timeout
+    }, (res) => {
+      let data = '';
+      console.log('Ollama response status:', res.statusCode);
+
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        console.log('Ollama raw response:', data.substring(0, 500) + '...');
+        try {
+          const json = JSON.parse(data);
+
+          // Ollama API returns response in 'response' field
+          if (json.response) {
+            console.log('Ollama content found:', json.response.substring(0, 200) + '...');
+            resolve(json.response);
+          } else if (json.error) {
+            console.log('Ollama error:', json.error);
+            reject('Ollama error: ' + json.error);
+          } else {
+            console.log('Ollama unexpected response:', json);
+            resolve('No response from Ollama - unexpected response format.');
+          }
+        } catch (e) {
+          console.log('Ollama JSON parse error:', e);
+          reject('Failed to parse Ollama response: ' + (e instanceof Error ? e.message : String(e)));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      console.log('Ollama request error:', error);
+      reject(`Ollama connection failed (${baseUrl}): ${error.message}`);
+    });
+
+    req.on('timeout', () => {
+      console.log('Ollama request timeout');
+      req.destroy();
+      reject(`Ollama request timeout - check if Ollama is running at ${baseUrl}`);
+    });
+
     req.write(body);
     req.end();
   });
@@ -2481,13 +2607,13 @@ async function intelligentRepositoryScan(workspacePath: string, context: vscode.
   
   // 1. Run unified repository scanner (NEW - Core features)
   try {
-    const { RepositoryScanner } = await import('./scanners');
+    const { RepositoryScanner } = await import('./scanners/repository-scanner');
     const scanner = new RepositoryScanner(workspacePath);
     const scanResult = await scanner.scan();
-    
+
     // Convert scanner results to existing format
     const scannerVulns = scanner.getAllVulnerabilities(scanResult.results);
-    results.push(...scannerVulns.map(v => ({
+    results.push(...scannerVulns.map((v: any) => ({
       ...v,
       severity: v.severity.toUpperCase(),
       file: v.file,

@@ -6,7 +6,7 @@
 	},
 	"ciphermate.ai.provider": "ollama",
 	"ciphermate.ai.ollama.apiUrl": "http://64.225.56.89:11434",
-	"ciphermate.ai.ollama.model": "deepseek-coder:latest",
+	"ciphermate.ai.ollama.model": "deepseek-coder:1.3b",
 	"ciphermate.ai.ollama.timeout": 300000,
 	"ciphermate.ai.fallbackProviders": [],
 	"ciphermate.ai.useMultiProvider": true,
