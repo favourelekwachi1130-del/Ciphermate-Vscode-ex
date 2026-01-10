@@ -77,25 +77,36 @@ export class CodePatternScanner extends BaseScanner {
   private initializePatterns(): void {
     this.patterns = [
       // SQL Injection (OWASP A03:2021)
+      // Fixed: Only flag concatenation when inside SQL-like function calls
       {
-        name: 'SQL Injection',
-        pattern: /(query|execute|exec)\s*\(\s*["'`][^"'`]*\$\{|\+\s*["'`]|["'`]\s*\+/i,
+        name: 'SQL Injection (Template Literal)',
+        pattern: /(query|execute|exec|sql|db\.\w+)\s*\(\s*`[^`]*\$\{/i,
         severity: 'critical',
-        description: 'Potential SQL injection vulnerability. User input may be directly concatenated into SQL queries.',
+        description: 'Template literal with variable interpolation in database query. Risk of SQL injection.',
+        cwe: ['CWE-89'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use parameterized queries instead of template literals.',
+        fileExtensions: ['.js', '.ts'],
+      },
+      {
+        name: 'SQL Injection (String Concatenation)',
+        pattern: /(query|execute|exec|sql)\s*\([^)]*["']\s*\+|\+\s*["'][^)]*\)/i,
+        severity: 'high',
+        description: 'String concatenation detected in database query context. Potential SQL injection risk.',
         cwe: ['CWE-89'],
         owasp: 'A03:2021 - Injection',
         fix: 'Use parameterized queries or prepared statements instead of string concatenation.',
         fileExtensions: ['.js', '.ts', '.py', '.java', '.php', '.cs'],
       },
       {
-        name: 'SQL Injection (Template Literal)',
-        pattern: /(query|execute|exec)\s*\(\s*`[^`]*\$\{[^}]+\}[^`]*`/i,
-        severity: 'critical',
-        description: 'SQL query uses template literals with user input, risking SQL injection.',
+        name: 'SQL Injection (Raw Query)',
+        pattern: /\.(raw|rawQuery|query)\s*\(\s*["'`].*?(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER)/i,
+        severity: 'high',
+        description: 'Raw SQL query detected. Ensure user input is properly sanitized.',
         cwe: ['CWE-89'],
         owasp: 'A03:2021 - Injection',
-        fix: 'Use parameterized queries instead of template literals.',
-        fileExtensions: ['.js', '.ts'],
+        fix: 'Use parameterized queries or ORM methods instead of raw SQL.',
+        fileExtensions: ['.js', '.ts', '.py', '.java', '.php'],
       },
 
       // XSS - Cross-Site Scripting (OWASP A03:2021)
@@ -272,7 +283,7 @@ export class CodePatternScanner extends BaseScanner {
     for (const pattern of codeExtensions) {
       const found = await vscode.workspace.findFiles(
         pattern,
-        '**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/.git/**,**/vendor/**'
+        '**/{node_modules,dist,build,target,.git,vendor,venv,.venv,coverage,__pycache__,.next,.nuxt,out,.output}/**'
       );
       files.push(...found.map(f => f.fsPath));
     }

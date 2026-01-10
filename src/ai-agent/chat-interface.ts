@@ -205,23 +205,20 @@ export class ChatInterface {
   show(): void {
     try {
       if (this.panel) {
-        // Force update HTML to ensure latest changes are shown
-        this.panel.webview.html = this.getChatHtml();
-        // Note: Don't call setupMessageHandlers() here - handlers are already registered
-        // and calling it again would create duplicate handlers causing double messages
-        // Restore messages after HTML is updated
-        this.restoreMessages();
+        // Panel already exists - just reveal it, preserving conversation state
+        // Don't regenerate HTML as that destroys DOM and loses messages
         this.panel.reveal();
         return;
       }
 
+      // Create new panel only if one doesn't exist
       this.panel = vscode.window.createWebviewPanel(
         'ciphermateChat',
         'CipherMate',
         vscode.ViewColumn.One,
         {
           enableScripts: true,
-          retainContextWhenHidden: false, // Disable to ensure fresh HTML on reload
+          retainContextWhenHidden: true, // Preserve webview state when switching tabs
           localResourceRoots: [this.context.extensionUri]
         }
       );
@@ -475,8 +472,10 @@ export class ChatInterface {
               setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs / 1000} seconds`)), timeoutMs);
             })
           ]);
-          
-          // Success - clear thinking and return response
+
+          // Success - log and clear thinking
+          console.log('ChatInterface: CyberAgent response received successfully, length:', responseText?.length);
+          console.log('ChatInterface: Response preview:', responseText?.substring(0, 100));
           this.clearThinking();
         } catch (chatError) {
           const chatErrorMessage = chatError instanceof Error ? chatError.message : String(chatError);
@@ -547,7 +546,9 @@ export class ChatInterface {
       this.hideThinking();
 
       // Add agent response
+      console.log('ChatInterface: About to add assistant message, responseText length:', responseText?.length);
       this.addMessage('assistant', responseText);
+      console.log('ChatInterface: Assistant message added to chat');
 
       } catch (error) {
         this.hideThinking();
@@ -674,19 +675,21 @@ export class ChatInterface {
   }
 
   private addMessage(role: 'user' | 'assistant', content: string): void {
+    console.log('ChatInterface: addMessage() called', { role, contentLength: content?.length });
+
     const message = {
       role,
       content,
       timestamp: new Date()
     };
-    
+
     this.messageHistory.push(message);
-    
+
     // Ensure current session exists
     if (!this.currentSession) {
       this.createNewSession();
     }
-    
+
     // Update current session and save immediately
     if (this.currentSession) {
       this.currentSession.messages.push(message);
@@ -705,13 +708,17 @@ export class ChatInterface {
       this.clearThinking();
     }
 
+    console.log('ChatInterface: Sending addMessage to webview, panel exists?', !!this.panel);
     if (this.panel) {
+      console.log('ChatInterface: Posting addMessage command to webview');
       this.panel.webview.postMessage({
         command: 'addMessage',
         role,
         content,
         timestamp: new Date().toISOString()
       });
+    } else {
+      console.error('ChatInterface: Cannot add message - panel is null');
     }
   }
 
@@ -742,14 +749,22 @@ export class ChatInterface {
   }
 
   private showThinking(): void {
+    console.log('ChatInterface: showThinking() called, panel exists?', !!this.panel);
     if (this.panel) {
+      console.log('ChatInterface: Sending showThinking to webview');
       this.panel.webview.postMessage({ command: 'showThinking' });
+    } else {
+      console.error('ChatInterface: Cannot show thinking - panel is null');
     }
   }
 
   private hideThinking(): void {
+    console.log('ChatInterface: hideThinking() called, panel exists?', !!this.panel);
     if (this.panel) {
+      console.log('ChatInterface: Sending hideThinking to webview');
       this.panel.webview.postMessage({ command: 'hideThinking' });
+    } else {
+      console.error('ChatInterface: Cannot hide thinking - panel is null');
     }
   }
 
@@ -782,6 +797,24 @@ export class ChatInterface {
             console.warn(`[Webview] ${logMessage}`, data);
           } else {
             console.log(`[Webview] ${logMessage}`, data);
+          }
+          return;
+        } else if (message.command === 'diagnostic') {
+          // Handle diagnostic data from webview - write to file for debugging
+          const diagnosticData = message.data;
+          console.log('=== WEBVIEW DIAGNOSTIC RECEIVED ===');
+          console.log(JSON.stringify(diagnosticData, null, 2));
+
+          // Write to a file for external access
+          try {
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
+            const diagnosticPath = path.join(os.tmpdir(), 'ciphermate-diagnostic.json');
+            fs.writeFileSync(diagnosticPath, JSON.stringify(diagnosticData, null, 2));
+            console.log('DIAGNOSTIC written to:', diagnosticPath);
+          } catch (writeError) {
+            console.error('Failed to write diagnostic file:', writeError);
           }
           return;
         } else if (message.command === 'sendMessage') {
@@ -849,6 +882,41 @@ export class ChatInterface {
             command: 'messageCount',
             count: this.messageHistory.length
           });
+        } else if (message.command === 'openFile') {
+          // Open file at specific line from scan results
+          const filePath = message.filePath;
+          const lineNumber = message.lineNumber || 1;
+          console.log('ChatInterface: Opening file:', filePath, 'at line:', lineNumber);
+
+          try {
+            const uri = vscode.Uri.file(filePath);
+            vscode.workspace.openTextDocument(uri).then(
+              (document) => {
+                const position = new vscode.Position(lineNumber - 1, 0);
+                vscode.window.showTextDocument(document, {
+                  selection: new vscode.Range(position, position),
+                  viewColumn: vscode.ViewColumn.One,
+                  preview: true
+                }).then(
+                  (editor) => {
+                    // Scroll to center the line
+                    editor.revealRange(
+                      new vscode.Range(lineNumber - 1, 0, lineNumber - 1, 0),
+                      vscode.TextEditorRevealType.InCenter
+                    );
+                  },
+                  (showError) => {
+                    vscode.window.showErrorMessage(`Failed to display file: ${showError.message}`);
+                  }
+                );
+              },
+              (openError) => {
+                vscode.window.showErrorMessage(`Could not open file "${filePath}": ${openError.message}`);
+              }
+            );
+          } catch (error: any) {
+            vscode.window.showErrorMessage(`Error opening file: ${error.message}`);
+          }
         } else {
           console.warn('ChatInterface: Unknown command:', message.command);
         }
@@ -1258,7 +1326,7 @@ export class ChatInterface {
             overflow-y: auto;
             padding: 16px;
             flex-direction: column;
-            gap: 16px;
+            gap: 20px;
             background: var(--vscode-editor-background);
             width: 100%;
             min-height: 200px;
@@ -1346,8 +1414,8 @@ export class ChatInterface {
         .message-content {
             background: var(--vscode-input-background);
             border: 1px solid var(--vscode-panel-border);
-            padding: 12px 16px;
-            line-height: 1.5;
+            padding: 14px 18px;
+            line-height: 1.6;
             word-wrap: break-word;
         }
 
@@ -1397,8 +1465,32 @@ export class ChatInterface {
             font-style: italic;
         }
 
+        .message-content ul,
+        .message-content ol {
+            margin: 12px 0;
+            padding-left: 24px;
+        }
+
+        .message-content ul {
+            list-style-type: disc;
+        }
+
+        .message-content ol {
+            list-style-type: decimal;
+        }
+
         .message-content li {
-            margin: 4px 0;
+            margin: 6px 0;
+            line-height: 1.6;
+        }
+
+        .message-content li ul,
+        .message-content li ol {
+            margin: 6px 0;
+        }
+
+        .message-content p {
+            margin: 10px 0;
         }
 
         .message-content a {
@@ -1426,14 +1518,29 @@ export class ChatInterface {
         .severity-badge.low { background: #28a745; color: white; }
         .severity-badge.info { background: #17a2b8; color: white; }
 
-        /* File paths */
-        .file-path {
+        /* Clickable file paths */
+        .file-path-link {
             font-family: var(--vscode-editor-font-family);
             background: var(--vscode-editor-background);
-            padding: 1px 4px;
+            padding: 2px 6px;
             border-radius: 3px;
             font-size: 0.85em;
             color: var(--vscode-textLink-foreground);
+            cursor: pointer;
+            text-decoration: underline;
+            text-decoration-style: dotted;
+            transition: all 0.15s ease;
+            display: inline-block;
+        }
+
+        .file-path-link:hover {
+            background: var(--vscode-editor-selectionBackground);
+            text-decoration-style: solid;
+            opacity: 1;
+        }
+
+        .file-path-link:active {
+            opacity: 0.8;
         }
 
         /* Section dividers */
@@ -1464,8 +1571,8 @@ export class ChatInterface {
 
         /* Headers with better spacing */
         .message-content h2, .message-content h3, .message-content h4, .message-content h5 {
-            margin-top: 16px;
-            margin-bottom: 8px;
+            margin-top: 20px;
+            margin-bottom: 10px;
             color: var(--vscode-foreground);
         }
         .message-content h2 { font-size: 1.3em; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; }
@@ -1490,8 +1597,9 @@ export class ChatInterface {
         }
 
         .thinking.active {
-            display: flex;
-            opacity: 1;
+            display: flex !important;
+            opacity: 1 !important;
+            visibility: visible !important;
         }
 
         .thinking-gear {
@@ -1698,6 +1806,59 @@ export class ChatInterface {
     </style>
 </head>
 <body>
+    <script>
+        // DIAGNOSTIC: Immediate DOM check before any other scripts
+        (function() {
+            const runDiagnostic = function() {
+                const diagnostic = {
+                    timestamp: new Date().toISOString(),
+                    location: 'body-onload',
+                    readyState: document.readyState,
+                    bodyExists: !!document.body,
+                    bodyChildCount: document.body ? document.body.children.length : 0,
+                    bodyInnerHTMLLength: document.body ? document.body.innerHTML.length : 0,
+                    elements: {
+                        messages: !!document.getElementById('messages'),
+                        thinking: !!document.getElementById('thinking'),
+                        welcomeScreen: !!document.querySelector('.welcome-screen'),
+                        header: !!document.querySelector('.header'),
+                        inputArea: !!document.querySelector('.input-area'),
+                        chatInput: !!document.getElementById('chatInput'),
+                        messageInput: !!document.getElementById('messageInput')
+                    },
+                    bodyClasses: document.body ? document.body.className : '',
+                    firstChildTag: document.body && document.body.firstElementChild ?
+                        document.body.firstElementChild.tagName : 'none',
+                    allChildTags: document.body ?
+                        Array.from(document.body.children).map(c => c.tagName + (c.id ? '#' + c.id : '') + (c.className ? '.' + c.className.split(' ')[0] : '')).join(', ') : 'none'
+                };
+
+                console.log('=== CIPHERMATE WEBVIEW DIAGNOSTIC ===');
+                console.log(JSON.stringify(diagnostic, null, 2));
+
+                // Send to extension host
+                try {
+                    const vscode = acquireVsCodeApi();
+                    vscode.postMessage({
+                        command: 'diagnostic',
+                        data: diagnostic
+                    });
+                } catch (e) {
+                    console.error('Failed to send diagnostic:', e);
+                }
+            };
+
+            // Run diagnostic after DOM is fully loaded
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', runDiagnostic);
+            } else {
+                runDiagnostic();
+            }
+
+            // Also run after a short delay to catch any async issues
+            setTimeout(runDiagnostic, 500);
+        })();
+    </script>
     <div class="welcome-screen">
         <div class="logo-container">
             <div class="logo">
@@ -1919,6 +2080,27 @@ export class ChatInterface {
             if (!body) {
                 console.error('=== ERROR: Body element not found! ===');
                 return;
+            }
+
+            // Add click handler for file path links (event delegation)
+            if (messagesContainer) {
+                messagesContainer.addEventListener('click', function(e) {
+                    var target = e.target;
+                    if (target.classList.contains('file-path-link')) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        var filePath = target.getAttribute('data-file-path');
+                        var lineNumber = parseInt(target.getAttribute('data-line-number')) || 1;
+                        console.log('File path clicked:', filePath, 'Line:', lineNumber);
+                        if (vscode && typeof vscode.postMessage === 'function') {
+                            vscode.postMessage({
+                                command: 'openFile',
+                                filePath: filePath,
+                                lineNumber: lineNumber
+                            });
+                        }
+                    }
+                });
             }
 
             // Rotating placeholder suggestions
@@ -2431,6 +2613,26 @@ export class ChatInterface {
                     messageInputEl.focus();
                 }
             }, 100);
+
+            // STEP 10: Ensure thinking element is properly set up after chat mode transition
+            setTimeout(function() {
+                const thinkingEl = document.getElementById('thinking');
+                const messagesContainer = document.getElementById('messages');
+                console.log('sendWelcomeMessage: Verifying thinking element after transition, exists?', !!thinkingEl);
+                if (!thinkingEl && messagesContainer) {
+                    console.log('sendWelcomeMessage: Thinking element missing, creating dynamically');
+                    const newThinking = document.createElement('div');
+                    newThinking.id = 'thinking';
+                    newThinking.className = 'thinking';
+                    newThinking.style.display = 'none';
+                    newThinking.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">Processing<span class="thinking-dots">...</span></span>';
+                    messagesContainer.appendChild(newThinking);
+                } else if (thinkingEl) {
+                    // Ensure it's reset to hidden state
+                    thinkingEl.style.display = 'none';
+                    thinkingEl.classList.remove('active');
+                }
+            }, 150);
         }
 
             // Simple markdown parser - converts markdown to HTML
@@ -2469,11 +2671,21 @@ export class ChatInterface {
                 html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
                 html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
 
-                // Bullet lists (- item)
-                html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+                // Bullet lists - wrap consecutive items in <ul>
+                html = html.replace(/((?:^- .+$\\n?)+)/gm, function(match) {
+                    var items = match.trim().split('\\n')
+                        .map(function(item) { return item.replace(/^- (.+)$/, '<li>$1</li>'); })
+                        .join('');
+                    return '<ul>' + items + '</ul>';
+                });
 
-                // Numbered lists (1. item)
-                html = html.replace(/^\\d+\\. (.+)$/gm, '<li>$1</li>');
+                // Numbered lists - wrap consecutive items in <ol>
+                html = html.replace(/((?:^\\d+\\. .+$\\n?)+)/gm, function(match) {
+                    var items = match.trim().split('\\n')
+                        .map(function(item) { return item.replace(/^\\d+\\. (.+)$/, '<li>$1</li>'); })
+                        .join('');
+                    return '<ol>' + items + '</ol>';
+                });
 
                 // Links [text](url)
                 html = html.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
@@ -2493,8 +2705,13 @@ export class ChatInterface {
                 html = html.replace(/High:\\s*(\\d+)/gi, 'High: <span class="stat-high">$1</span>');
                 html = html.replace(/Medium:\\s*(\\d+)/gi, 'Medium: <span class="stat-medium">$1</span>');
 
-                // File paths with line numbers (Windows style c:\path:123)
-                html = html.replace(/([A-Za-z]:\\\\[^\\s:]+:\\d+)/g, '<span class="file-path">$1</span>');
+                // File paths with line numbers (Windows style c:\path:123) - clickable
+                html = html.replace(/([A-Za-z]:\\\\[^\\s:]+):(\\d+)/g, function(match, filePath, lineNum) {
+                    var escapedPath = filePath.replace(/"/g, '&quot;');
+                    return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
+                           '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
+                           match + '</a>';
+                });
 
                 // Line breaks
                 html = html.replace(/\\n\\n/g, '</p><p>');
@@ -2947,14 +3164,32 @@ export class ChatInterface {
                         }
                     }
                 } else if (message.command === 'addMessage') {
+                    console.log('addMessage command received:', message.role, message.content ? message.content.substring(0, 50) + '...' : '(empty)');
+
+                    // Visual debug indicator - briefly flash the body to confirm message receipt
+                    document.body.style.transition = 'none';
+                    document.body.style.outline = '3px solid lime';
+                    setTimeout(function() {
+                        document.body.style.outline = 'none';
+                    }, 300);
+
+                    // Re-query the thinking element
+                    const thinkingEl = document.getElementById('thinking');
                     // Hide thinking when assistant message is added
-                    if (message.role === 'assistant' && thinking) {
-                        thinking.classList.remove('active');
+                    if (message.role === 'assistant' && thinkingEl) {
+                        console.log('addMessage: Hiding thinking indicator for assistant message');
+                        thinkingEl.classList.remove('active');
                         setTimeout(function() {
-                            if (thinking && !thinking.classList.contains('active')) {
-                                thinking.style.display = 'none';
+                            const el = document.getElementById('thinking');
+                            if (el && !el.classList.contains('active')) {
+                                el.style.display = 'none';
                             }
                         }, 200);
+                    }
+                    // Get fresh reference to messages container
+                    const container = document.getElementById('messages');
+                    if (!container) {
+                        console.error('addMessage: messages container not found!');
                     }
                     addMessage(message.role, message.content, message.timestamp);
                 } else if (message.command === 'switchToWelcome') {
@@ -2970,49 +3205,88 @@ export class ChatInterface {
                         }
                     }
                 } else if (message.command === 'showThinking') {
-                    if (thinking) {
-                        thinking.classList.add('active');
-                        const textSpan = thinking.querySelector('.thinking-text');
+                    // Visual debug indicator - blue border flash for thinking
+                    document.body.style.transition = 'none';
+                    document.body.style.outline = '3px solid cyan';
+                    setTimeout(function() {
+                        document.body.style.outline = 'none';
+                    }, 300);
+
+                    // Re-query the thinking element (don't rely on cached variable)
+                    const thinkingEl = document.getElementById('thinking');
+                    console.log('showThinking: thinking element exists?', !!thinkingEl);
+
+                    if (thinkingEl) {
+                        // Force visibility
+                        thinkingEl.style.display = 'flex';
+                        thinkingEl.classList.add('active');
+                        const textSpan = thinkingEl.querySelector('.thinking-text');
                         if (textSpan) {
                             textSpan.innerHTML = 'Processing<span class="thinking-dots">...</span>';
                         } else {
-                            thinking.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">Processing<span class="thinking-dots">...</span></span>';
+                            thinkingEl.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">Processing<span class="thinking-dots">...</span></span>';
+                        }
+                    } else {
+                        console.error('showThinking: thinking element not found, creating dynamically');
+                        // Create thinking element if it doesn't exist
+                        const container = document.getElementById('messages');
+                        if (container) {
+                            const newThinking = document.createElement('div');
+                            newThinking.id = 'thinking';
+                            newThinking.className = 'thinking active';
+                            newThinking.style.display = 'flex';
+                            newThinking.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">Processing<span class="thinking-dots">...</span></span>';
+                            container.appendChild(newThinking);
                         }
                     }
-                    if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    const container = document.getElementById('messages');
+                    if (container) container.scrollTop = container.scrollHeight;
                 } else if (message.command === 'hideThinking') {
-                    if (thinking) {
-                        thinking.classList.remove('active');
+                    // Re-query the thinking element
+                    const thinkingEl = document.getElementById('thinking');
+                    console.log('hideThinking: thinking element exists?', !!thinkingEl);
+                    if (thinkingEl) {
+                        thinkingEl.classList.remove('active');
                         // Ensure it's completely hidden
                         setTimeout(function() {
-                            if (thinking && !thinking.classList.contains('active')) {
-                                thinking.style.display = 'none';
+                            const el = document.getElementById('thinking');
+                            if (el && !el.classList.contains('active')) {
+                                el.style.display = 'none';
                             }
                         }, 200);
                     }
                 } else if (message.command === 'thinkingStep') {
-                    if (thinking) {
-                        thinking.classList.add('active');
-                        const textSpan = thinking.querySelector('.thinking-text');
+                    // Re-query the thinking element
+                    const thinkingEl = document.getElementById('thinking');
+                    console.log('thinkingStep: thinking element exists?', !!thinkingEl, 'step:', message.step);
+                    if (thinkingEl) {
+                        thinkingEl.style.display = 'flex';
+                        thinkingEl.classList.add('active');
+                        const textSpan = thinkingEl.querySelector('.thinking-text');
                         const stepText = message.step || 'Processing';
                         if (textSpan) {
                             textSpan.innerHTML = stepText + '<span class="thinking-dots">...</span>';
                         } else {
-                            thinking.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">' + stepText + '<span class="thinking-dots">...</span></span>';
+                            thinkingEl.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">' + stepText + '<span class="thinking-dots">...</span></span>';
                         }
                     }
-                    if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    const container = document.getElementById('messages');
+                    if (container) container.scrollTop = container.scrollHeight;
                 } else if (message.command === 'clearThinking') {
-                    if (thinking) {
-                        thinking.classList.remove('active');
-                        const textSpan = thinking.querySelector('.thinking-text');
+                    // Re-query the thinking element
+                    const thinkingEl = document.getElementById('thinking');
+                    console.log('clearThinking: thinking element exists?', !!thinkingEl);
+                    if (thinkingEl) {
+                        thinkingEl.classList.remove('active');
+                        const textSpan = thinkingEl.querySelector('.thinking-text');
                         if (textSpan) {
                             textSpan.textContent = '';
                         }
                         // Ensure it's completely hidden
                         setTimeout(function() {
-                            if (thinking && !thinking.classList.contains('active')) {
-                                thinking.style.display = 'none';
+                            const el = document.getElementById('thinking');
+                            if (el && !el.classList.contains('active')) {
+                                el.style.display = 'none';
                             }
                         }, 200);
                     }

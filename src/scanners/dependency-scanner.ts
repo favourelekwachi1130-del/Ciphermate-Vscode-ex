@@ -104,14 +104,14 @@ export class DependencyScanner extends BaseScanner {
     // Find requirements.txt (Python)
     const requirementsFiles = await vscode.workspace.findFiles(
       '**/requirements*.txt',
-      '**/node_modules/**,**/venv/**,**/.venv/**'
+      '**/{node_modules,venv,.venv}/**'
     );
     files.push(...requirementsFiles.map(f => f.fsPath));
 
     // Find Pipfile (Python)
     const pipfiles = await vscode.workspace.findFiles(
       '**/Pipfile',
-      '**/node_modules/**,**/venv/**,**/.venv/**'
+      '**/{node_modules,venv,.venv}/**'
     );
     files.push(...pipfiles.map(f => f.fsPath));
 

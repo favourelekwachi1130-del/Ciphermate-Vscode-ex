@@ -53,7 +53,7 @@ export class SmartContractScanner extends BaseScanner {
       // Find all Solidity files
       const solidityFiles = await vscode.workspace.findFiles(
         '**/*.sol',
-        '**/node_modules/**,**/lib/**,**/test/**,**/tests/**'
+        '**/{node_modules,lib,test,tests,dist,build}/**'
       );
 
       if (solidityFiles.length === 0) {

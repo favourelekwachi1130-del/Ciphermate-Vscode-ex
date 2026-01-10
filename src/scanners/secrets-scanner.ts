@@ -201,7 +201,7 @@ export class SecretsScanner extends BaseScanner {
     for (const pattern of codeExtensions) {
       const found = await vscode.workspace.findFiles(
         pattern,
-        '**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/.git/**'
+        '**/{node_modules,dist,build,target,.git,vendor,venv,.venv,coverage,__pycache__,.next,.nuxt,out,.output}/**'
       );
       files.push(...found.map(f => f.fsPath));
     }
