@@ -834,6 +834,14 @@ export class ChatInterface {
             return;
           }
 
+          // If we have message history but no current session, create one to continue
+          if (this.messageHistory.length > 0 && !this.currentSession) {
+            console.log('[EXT] Creating session from existing history before new message');
+            this.createNewSession();
+            // createNewSession() always sets currentSession, use non-null assertion
+            this.currentSession!.messages = [...this.messageHistory];
+          }
+
           // Mark as processing and save last message
           this.isProcessingMessage = true;
           this.lastProcessedMessage = { text: messageText, timestamp: now };
@@ -855,9 +863,22 @@ export class ChatInterface {
         } else if (message.command === 'showResults') {
           vscode.commands.executeCommand('ciphermate.showResults');
         } else if (message.command === 'goHome') {
+          // CRITICAL: Reset processing flag when going home to prevent lockout
+          this.isProcessingMessage = false;
+          console.log('[EXT] goHome - reset isProcessingMessage to false');
+
           // Save current session before going home
+          console.log('[EXT] goHome - saving session, messages:', this.messageHistory.length);
           if (this.currentSession && this.messageHistory.length > 0) {
             this.currentSession.messages = [...this.messageHistory];
+            this.currentSession.updatedAt = new Date();
+            this.saveChatSessions();
+          } else if (this.messageHistory.length > 0 && !this.currentSession) {
+            // Create session from orphan messages
+            console.log('[EXT] Creating session from orphan messages');
+            this.createNewSession();
+            // createNewSession() always sets currentSession, use non-null assertion
+            this.currentSession!.messages = [...this.messageHistory];
             this.saveChatSessions();
           }
           // Switch to welcome mode
@@ -882,6 +903,15 @@ export class ChatInterface {
             command: 'messageCount',
             count: this.messageHistory.length
           });
+        } else if (message.command === 'prepareContinueChat') {
+          // Ensure we have a valid session with messages to continue
+          console.log('[EXT] prepareContinueChat - messageHistory.length:', this.messageHistory.length, 'currentSession:', !!this.currentSession);
+          if (this.messageHistory.length > 0 && !this.currentSession) {
+            this.createNewSession();
+            // createNewSession() always sets currentSession, use non-null assertion
+            this.currentSession!.messages = [...this.messageHistory];
+          }
+          console.log('[EXT] Prepared session for continuation');
         } else if (message.command === 'openFile') {
           // Open file at specific line from scan results
           const filePath = message.filePath;
@@ -2051,7 +2081,7 @@ export class ChatInterface {
             const messageInput = document.getElementById('messageInput');
             const sendButton = document.getElementById('sendButton');
             const thinking = document.getElementById('thinking');
-            const quickActions = document.querySelectorAll('.quick-action');
+            const quickActions = document.querySelectorAll('.input-area .quick-actions .quick-action');
             const welcomeQuickActions = document.querySelectorAll('.welcome-quick-actions .quick-action');
             const chatInput = document.getElementById('chatInput');
             const sendButtonMain = document.getElementById('sendButtonMain');
@@ -2103,6 +2133,73 @@ export class ChatInterface {
                 });
             }
 
+            // GLOBAL EVENT DELEGATION for quick actions, back button, and other buttons
+            // This ensures clicks work even when DOM elements are cloned/replaced
+            console.log('[DELEGATE] Setting up global event delegation...');
+            document.addEventListener('click', function(e) {
+                // Block clicks during mode transitions to prevent race conditions
+                if (isModeSwitching) {
+                    console.log('[DELEGATE] Click ignored - mode switch in progress');
+                    return;
+                }
+
+                var target = e.target;
+
+                // Handle quick action clicks (both welcome screen and chat mode)
+                if (target.classList && target.classList.contains('quick-action')) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var actionText = target.getAttribute('data-action');
+                    console.log('[DELEGATE] Quick action clicked via delegation:', actionText);
+                    handleQuickActionClick(target, actionText);
+                    return;
+                }
+
+                // Handle back button clicks (check both element and its parent for SVG icons)
+                if (target.id === 'backButton' || (target.closest && target.closest('#backButton'))) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    console.log('[DELEGATE] Back button clicked via delegation');
+                    switchToWelcomeMode();
+                    if (vscode && typeof vscode.postMessage === 'function') {
+                        vscode.postMessage({
+                            command: 'goHome'
+                        });
+                    }
+                    return;
+                }
+
+                // Handle "Configure AI Provider" button clicks
+                if (target.id === 'useOwnModel' || (target.closest && target.closest('#useOwnModel'))) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    console.log('[DELEGATE] Configure AI Provider clicked via delegation');
+                    if (vscode && typeof vscode.postMessage === 'function') {
+                        vscode.postMessage({
+                            command: 'openSettings'
+                        });
+                    }
+                    return;
+                }
+
+                // Handle "Continue Chat" button clicks
+                if (target.id === 'continueChat' || (target.closest && target.closest('#continueChat'))) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    console.log('[DELEGATE] Continue Chat clicked via delegation');
+
+                    // First tell extension to prepare the session for continuation
+                    if (vscode && typeof vscode.postMessage === 'function') {
+                        vscode.postMessage({ command: 'prepareContinueChat' });
+                    }
+
+                    // Then switch to chat mode (which will trigger restoreChat)
+                    switchToChatMode();
+                    return;
+                }
+            }, true); // Capture phase to catch events early
+            console.log('[DELEGATE] Global event delegation set up');
+
             // Rotating placeholder suggestions
             const suggestions = [
             'Ask anything...',
@@ -2149,26 +2246,58 @@ export class ChatInterface {
                 }
             }
 
+            // Mode switching guard to prevent rapid/duplicate mode switches
+            let isModeSwitching = false;
+
             function switchToWelcomeMode() {
-            console.log('Switching to welcome mode...');
-            
-            // Get all elements fresh
+            console.log('[MODE] ========================================');
+            console.log('[MODE] switchToWelcomeMode() CALLED');
+            console.log('[MODE] isModeSwitching:', isModeSwitching);
+            console.log('[MODE] ========================================');
+
+            // CRITICAL: ALWAYS remove chat-mode class first, before any guards
+            // This ensures the UI is in correct state even if function returns early
             const body = document.body;
+            if (body.classList.contains('chat-mode')) {
+                body.classList.remove('chat-mode');
+                console.log('[MODE] FORCED removal of chat-mode class');
+            }
+
+            // CRITICAL: Reset submission flag to allow new submissions after returning to welcome
+            isSubmittingWelcome = false;
+            console.log('[MODE] Reset isSubmittingWelcome to false');
+
+            // Guard against rapid mode switching for the rest of the UI setup
+            if (isModeSwitching) {
+                console.log('[MODE] Mode switch already in progress, skipping UI setup but class is removed');
+                return;
+            }
+            isModeSwitching = true;
+            console.log('[MODE] isModeSwitching set to true');
+
+            console.log('[MODE] Switching to welcome mode...');
+
+            // Get all elements fresh (body already declared above)
+            console.log('[MODE] Got body element:', !!body);
             const welcomeScreen = document.querySelector('.welcome-screen');
             const header = document.querySelector('.header');
             const messagesContainer = document.getElementById('messages');
             const inputArea = document.querySelector('.input-area');
             const chatInput = document.getElementById('chatInput');
-            
-            // Remove chat-mode class
-            body.classList.remove('chat-mode');
-            
-            // Explicitly show welcome screen
+
+            // chat-mode class already removed at top of function
+
+            // CRITICAL: Clear ALL inline styles that were set during chat mode transition
+            // This fixes the blank screen issue where z-index: -1 persists
             if (welcomeScreen) {
+                console.log('[MODE] Clearing inline styles from welcome screen...');
+                welcomeScreen.style.removeProperty('z-index');
+                welcomeScreen.style.removeProperty('visibility');
+                welcomeScreen.style.removeProperty('opacity');
                 welcomeScreen.style.display = 'flex';
-                console.log('Welcome screen shown');
+                console.log('[MODE] Welcome screen shown with cleared inline styles');
             } else {
-                console.error(' Welcome screen not found!');
+                console.error('[MODE] Welcome screen not found!');
             }
             
             // Explicitly hide header
@@ -2218,101 +2347,53 @@ export class ChatInterface {
             }
             
             // Show continue chat button if there's history
+            console.log('[MODE] Calling updateContinueChatButton()...');
             updateContinueChatButton();
-            
+            console.log('[MODE] updateContinueChatButton() returned');
+
             // Reattach event listeners for welcome screen buttons
+            console.log('[MODE] Calling setupWelcomeScreenButtons()...');
             setupWelcomeScreenButtons();
-            
-            console.log(' Welcome mode activated');
+            console.log('[MODE] setupWelcomeScreenButtons() returned');
+
+            console.log('[MODE] Welcome mode activated');
+
+            // Reset mode switching guard after transition completes
+            console.log('[MODE] Setting timeout to reset isModeSwitching in 300ms');
+            setTimeout(function() {
+                isModeSwitching = false;
+                console.log('[MODE] isModeSwitching reset to false');
+            }, 300);
+            console.log('[MODE] switchToWelcomeMode() complete');
         }
         
         function setupWelcomeScreenButtons() {
-            console.log(' Setting up welcome screen buttons...');
-            
-            // Get fresh references to all welcome screen elements
+            console.log('[SETUP] ========================================');
+            console.log('[SETUP] setupWelcomeScreenButtons() CALLED');
+            console.log('[SETUP] Event delegation handles button clicks - only setting up form handlers');
+            console.log('[SETUP] ========================================');
+
+            // Get references to form elements only - buttons are handled by event delegation
             const welcomeQuickActions = document.querySelectorAll('.welcome-quick-actions .quick-action');
-            const useOwnModel = document.getElementById('useOwnModel');
-            const continueChatBtn = document.getElementById('continueChat');
             const chatInput = document.getElementById('chatInput');
             const sendButtonMain = document.getElementById('sendButtonMain');
             const welcomeForm = document.getElementById('welcomeForm');
-            
-            // Set up welcome quick action buttons
+
+            // Just set cursor style for quick actions (no event handlers - delegation handles clicks)
             if (welcomeQuickActions && welcomeQuickActions.length > 0) {
-                console.log('=== RE-SETUP: Found', welcomeQuickActions.length, 'welcome quick action buttons ===');
-                welcomeQuickActions.forEach(function(action, index) {
-                    const actionText = action.getAttribute('data-action');
-                    console.log('=== RE-SETUP: Welcome quick action', index, ':', actionText, '===');
+                console.log('[SETUP] Found', welcomeQuickActions.length, 'welcome quick action buttons - setting cursor style only');
+                welcomeQuickActions.forEach(function(action) {
                     action.style.cursor = 'pointer';
-                    
-                    // Remove old listeners by cloning (this removes all event listeners)
-                    const newAction = action.cloneNode(true);
-                    action.parentNode.replaceChild(newAction, action);
-                    
-                    // Reattach click listener
-                    newAction.addEventListener('click', function(e) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        console.log('=== WELCOME QUICK ACTION CLICKED ===', actionText);
-                        handleQuickActionClick(newAction, actionText);
-                    });
                 });
-            } else {
-                console.warn('=== WARNING: No welcome quick action buttons found ===');
             }
-            
-            // Set up "Configure AI Provider" button
-            if (useOwnModel) {
-                // Clone to remove old listeners
-                const newUseOwnModel = useOwnModel.cloneNode(true);
-                useOwnModel.parentNode.replaceChild(newUseOwnModel, useOwnModel);
-                
-                newUseOwnModel.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    console.log('=== Configure AI Provider clicked ===');
-                    if (vscode && typeof vscode.postMessage === 'function') {
-                        vscode.postMessage({
-                            command: 'openSettings'
-                        });
-                    } else {
-                        console.error('vscode.postMessage not available');
-                    }
-                });
-                console.log(' Configure AI Provider button set up');
-            }
-            
-            // Set up "Continue Chat" button
-            if (continueChatBtn) {
-                // Clone to remove old listeners but preserve ID
-                const newContinueChatBtn = continueChatBtn.cloneNode(true);
-                newContinueChatBtn.id = 'continueChat'; // Ensure ID is preserved
-                continueChatBtn.parentNode.replaceChild(newContinueChatBtn, continueChatBtn);
-                
-                // Get fresh reference after replacement
-                const continueChatBtnRef = document.getElementById('continueChat');
-                if (continueChatBtnRef) {
-                    continueChatBtnRef.addEventListener('click', function(e) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        console.log('=== Continue Chat clicked ===');
-                        switchToChatMode();
-                    });
-                    console.log(' Continue Chat button set up');
-                } else {
-                    console.error(' Continue Chat button not found after replacement');
-                }
-            } else {
-                console.warn(' Continue Chat button not found');
-            }
-            
-            // Set up welcome form submission - use event delegation to avoid cloning issues
+
+            // Set up welcome form submission - forms still need direct handlers
             // Don't clone form/input/button as it breaks DOM structure
             if (welcomeForm && chatInput && sendButtonMain) {
                 // Use one-time flag to prevent duplicate handlers
                 if (!welcomeForm.hasAttribute('data-handlers-attached')) {
                     welcomeForm.setAttribute('data-handlers-attached', 'true');
-                    
+
                     welcomeForm.addEventListener('submit', function(e) {
                         e.preventDefault();
                         e.stopPropagation();
@@ -2322,7 +2403,7 @@ export class ChatInterface {
                         }
                         return false;
                     });
-                    
+
                     chatInput.addEventListener('keydown', function(e) {
                         if (e.key === 'Enter' && !e.shiftKey) {
                             e.preventDefault();
@@ -2334,7 +2415,7 @@ export class ChatInterface {
                             return false;
                         }
                     });
-                    
+
                     sendButtonMain.addEventListener('click', function(e) {
                         e.preventDefault();
                         e.stopPropagation();
@@ -2344,22 +2425,119 @@ export class ChatInterface {
                         }
                         return false;
                     });
-                    
-                    console.log(' Welcome form handlers attached');
+
+                    console.log('[SETUP] Welcome form handlers attached');
                 } else {
-                    console.log(' Welcome form handlers already attached, skipping');
+                    console.log('[SETUP] Welcome form handlers already attached, skipping');
                 }
             }
+
+            // Update continue chat button visibility
+            console.log('[SETUP] Calling updateContinueChatButton()...');
+            updateContinueChatButton();
+        }
+
+        function setupChatModeListeners() {
+            console.log('Setting up chat mode listeners...');
+
+            // Get FRESH references to chat mode elements
+            var chatModeQuickActions = document.querySelectorAll('.input-area .quick-actions .quick-action');
+            var sendButton = document.getElementById('sendButton');
+            var messageInput = document.getElementById('messageInput');
+            var chatForm = document.getElementById('chatForm');
+
+            // Quick action clicks are handled by global event delegation
+            // Just set cursor style here
+            if (chatModeQuickActions && chatModeQuickActions.length > 0) {
+                chatModeQuickActions.forEach(function(action) {
+                    action.style.cursor = 'pointer';
+                });
+            }
+
+            // Setup send button
+            if (sendButton && !sendButton.hasAttribute('data-chat-handlers')) {
+                sendButton.setAttribute('data-chat-handlers', 'true');
+                sendButton.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    sendMessage();
+                });
+            }
+
+            // Setup message input Enter key
+            if (messageInput && !messageInput.hasAttribute('data-chat-handlers')) {
+                messageInput.setAttribute('data-chat-handlers', 'true');
+                messageInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' || e.keyCode === 13) {
+                        e.preventDefault();
+                        sendMessage();
+                    }
+                });
+            }
+
+            // Setup chat form submit
+            if (chatForm && !chatForm.hasAttribute('data-chat-handlers')) {
+                chatForm.setAttribute('data-chat-handlers', 'true');
+                chatForm.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    sendMessage();
+                });
+            }
+
+            // Back button is handled by global event delegation
+
+            console.log('Chat mode listeners setup complete');
         }
 
         function switchToChatMode(text) {
             if (!text) text = undefined;
             body.classList.add('chat-mode');
-            if (messageInput) {
+
+            // CRITICAL: Show chat UI elements that were hidden by switchToWelcomeMode
+            const welcomeScreen = document.querySelector('.welcome-screen');
+            const header = document.querySelector('.header');
+            const messagesContainer = document.getElementById('messages');
+            const inputArea = document.querySelector('.input-area');
+
+            // Hide welcome screen
+            if (welcomeScreen) {
+                welcomeScreen.style.setProperty('display', 'none', 'important');
+            }
+
+            // Show header
+            if (header) {
+                header.style.setProperty('display', 'block', 'important');
+            }
+
+            // Show messages container with proper flex layout
+            if (messagesContainer) {
+                messagesContainer.style.setProperty('display', 'flex', 'important');
+                messagesContainer.style.setProperty('flex-direction', 'column', 'important');
+                messagesContainer.style.setProperty('flex', '1 1 auto', 'important');
+                messagesContainer.style.setProperty('overflow-y', 'auto', 'important');
+                messagesContainer.style.setProperty('visibility', 'visible', 'important');
+            }
+
+            // Show input area
+            if (inputArea) {
+                inputArea.style.setProperty('display', 'block', 'important');
+            }
+
+            // Reset body styles for chat mode
+            body.style.justifyContent = 'flex-start';
+            body.style.alignItems = 'stretch';
+            body.style.padding = '0';
+
+            // CRITICAL: Re-attach chat mode event listeners
+            setupChatModeListeners();
+
+            // Re-query messageInput for fresh reference
+            var freshMessageInput = document.getElementById('messageInput');
+            if (freshMessageInput) {
                 if (text) {
-                    messageInput.value = text;
+                    freshMessageInput.value = text;
                 }
-                messageInput.focus();
+                freshMessageInput.focus();
                 if (text) {
                     // Small delay to ensure input is ready
                     setTimeout(function() {
@@ -2367,8 +2545,12 @@ export class ChatInterface {
                     }, 50);
                 }
             }
-            // Request messages from extension to restore chat
-            if (vscode && typeof vscode.postMessage === 'function') {
+
+            // ONLY restore chat when NOT sending a new message
+            // This fixes the race condition that caused double messages:
+            // Previously restoreChat was sent immediately while sendMessage ran after 50ms,
+            // causing the new message to appear twice (once from sendMessage, once from restoreChat)
+            if (!text && vscode && typeof vscode.postMessage === 'function') {
                 vscode.postMessage({
                     command: 'restoreChat'
                 });
@@ -2460,13 +2642,11 @@ export class ChatInterface {
             body.style.setProperty('visibility', 'visible', 'important');
             body.style.setProperty('opacity', '1', 'important');
             
-            // STEP 3: Hide welcome screen with !important to ensure it's hidden
+            // STEP 3: Hide welcome screen - display:none is sufficient
+            // DO NOT set z-index, visibility, or opacity - they persist and cause blank screen on back navigation
             if (welcomeScreen) {
                 welcomeScreen.style.setProperty('display', 'none', 'important');
-                welcomeScreen.style.setProperty('visibility', 'hidden', 'important');
-                welcomeScreen.style.setProperty('opacity', '0', 'important');
-                welcomeScreen.style.setProperty('z-index', '-1', 'important');
-                console.log(' Welcome screen hidden');
+                console.log('[MODE] Welcome screen hidden');
             }
             
             // STEP 4: Show header
@@ -2900,7 +3080,8 @@ export class ChatInterface {
         }
 
             // Continue chat button - initial setup (will be re-setup in setupWelcomeScreenButtons when needed)
-            if (continueChatBtn) {
+            if (continueChatBtn && !continueChatBtn.hasAttribute('data-initial-handler')) {
+                continueChatBtn.setAttribute('data-initial-handler', 'true');
                 console.log('=== Setting up continueChat button (initial) ===');
                 continueChatBtn.addEventListener('click', function(e) {
                     e.preventDefault();
@@ -2908,7 +3089,7 @@ export class ChatInterface {
                     console.log('=== continueChat clicked (initial handler) ===');
                     switchToChatMode();
                 });
-            } else {
+            } else if (!continueChatBtn) {
                 console.warn('=== WARNING: continueChat button not found (initial setup) ===');
             }
 
@@ -2981,18 +3162,7 @@ export class ChatInterface {
                         return false;
                     }
                 });
-                
-                // Also handle keypress as additional backup
-                messageInput.addEventListener('keypress', function(e) {
-                    if (e.key === 'Enter' || e.keyCode === 13) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        console.log(' Enter keypress in messageInput - submitting');
-                        sendMessage();
-                        return false;
-                    }
-                });
-                
+
                 // Ensure Send button also calls the same function
                 const sendButton = document.getElementById('sendButton');
                 if (sendButton) {
@@ -3008,11 +3178,25 @@ export class ChatInterface {
 
             // Helper function to handle quick action clicks
             function handleQuickActionClick(action, actionText) {
-                console.log('=== QUICK ACTION CLICKED ===', actionText);
-                
+                console.log('[HANDLE] ========================================');
+                console.log('[HANDLE] handleQuickActionClick() CALLED');
+                console.log('[HANDLE] actionText:', actionText);
+                console.log('[HANDLE] action element:', action);
+                console.log('[HANDLE] body.classList.contains("chat-mode"):', body.classList.contains('chat-mode'));
+
+                // Check BOTH the class AND the welcome screen visibility for accurate mode detection
+                const welcomeScreen = document.querySelector('.welcome-screen');
+                const isWelcomeVisible = welcomeScreen && getComputedStyle(welcomeScreen).display !== 'none';
+                console.log('[HANDLE] welcomeScreen visible:', isWelcomeVisible);
+
+                // If welcome screen is visible, we're in welcome mode regardless of class
+                const actuallyInChatMode = body.classList.contains('chat-mode') && !isWelcomeVisible;
+                console.log('[HANDLE] actuallyInChatMode:', actuallyInChatMode);
+                console.log('[HANDLE] ========================================');
+
                 // Special handling for "show results" - execute command directly
                 if (actionText.toLowerCase().includes('show results') || actionText.toLowerCase().includes('view results')) {
-                    console.log(' Executing showResults command');
+                    console.log('[HANDLE] Detected showResults action');
                     try {
                         if (!vscode || typeof vscode.postMessage !== 'function') {
                             console.error('vscode.postMessage not available');
@@ -3027,76 +3211,66 @@ export class ChatInterface {
                         console.error('Error executing showResults:', error);
                     }
                 }
-                
-                        // Switch to chat mode if not already
-                        if (!body.classList.contains('chat-mode')) {
-                    console.log('Switching to chat mode from welcome screen');
-                            body.classList.add('chat-mode');
-                        }
-                        
-                // Send message to extension (extension will add message to UI via addMessage)
-                        console.log('Sending message to extension:', actionText);
-                        try {
+
+                // Switch to chat mode if not already (use accurate mode detection)
+                console.log('[HANDLE] Checking if need to switch to chat mode...');
+                if (!actuallyInChatMode) {
+                    console.log('[HANDLE] Not in chat mode (or welcome visible), calling switchToChatMode()...');
+                    // Force remove chat-mode class first if it's stale
+                    if (body.classList.contains('chat-mode')) {
+                        console.log('[HANDLE] Removing stale chat-mode class');
+                        body.classList.remove('chat-mode');
+                    }
+                    // Call switchToChatMode which properly sets up UI and sends the message
+                    switchToChatMode(actionText);
+                    console.log('[HANDLE] switchToChatMode() called with:', actionText);
+                    console.log('[HANDLE] handleQuickActionClick() complete - message sent via switchToChatMode');
+                    return; // switchToChatMode handles sending the message
+                } else {
+                    console.log('[HANDLE] Already in chat mode, sending message directly');
+                }
+
+                // Only reach here if already in chat mode - send message directly
+                console.log('[HANDLE] Preparing to send message to extension:', actionText);
+                try {
                     if (!vscode || typeof vscode.postMessage !== 'function') {
-                        console.error('vscode.postMessage not available');
+                        console.error('[HANDLE] ERROR: vscode.postMessage not available');
                         return;
                     }
-                            vscode.postMessage({
-                                command: 'sendMessage',
-                                text: actionText
-                            });
-                    console.log(' Message sent successfully');
-                        } catch (postError) {
-                            console.error('Error calling vscode.postMessage:', postError);
+                    console.log('[HANDLE] vscode.postMessage is available, sending...');
+                    vscode.postMessage({
+                        command: 'sendMessage',
+                        text: actionText
+                    });
+                    console.log('[HANDLE] Message sent successfully to extension');
+                } catch (postError) {
+                    console.error('[HANDLE] Error calling vscode.postMessage:', postError);
                 }
+                console.log('[HANDLE] handleQuickActionClick() complete');
             }
 
-            // Back button handler
-            if (backButton) {
-                backButton.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    console.log('=== backButton clicked ===');
-                    switchToWelcomeMode();
-                    // Notify extension to save current session
-                    if (vscode && typeof vscode.postMessage === 'function') {
-                        vscode.postMessage({
-                            command: 'goHome'
-                        });
-                    }
-                });
-            }
+            // NOTE: Back button clicks are handled by global event delegation
+            console.log('[INIT] Back button will be handled by event delegation');
 
-            // NOTE: Welcome screen quick actions are set up by setupWelcomeScreenButtons()
-            // which is called on page load and handles deduplication via cloneNode
+            // NOTE: All button clicks are now handled by global event delegation
+            // We only need to set cursor styles here
 
-            // Set up chat mode quick actions
+            // Set cursor style for chat mode quick actions
             if (quickActions && quickActions.length > 0) {
-            console.log('=== SETUP: Found', quickActions.length, 'chat mode quick action buttons ===');
-            quickActions.forEach((action, index) => {
-                const actionText = action.getAttribute('data-action');
-                console.log('=== SETUP: Quick action', index, ':', actionText, '===');
-                action.style.cursor = 'pointer';
-                
-                // Add visual feedback on click
-                action.addEventListener('mousedown', function() {
-                    action.style.opacity = '0.7';
+                console.log('[INIT] Setting cursor style for', quickActions.length, 'chat mode quick action buttons');
+                quickActions.forEach((action) => {
+                    action.style.cursor = 'pointer';
                 });
-                action.addEventListener('mouseup', function() {
-                    action.style.opacity = '1';
-                });
-                
-                action.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    console.log('=== CHAT MODE QUICK ACTION CLICKED ===', actionText);
-                    handleQuickActionClick(action, actionText);
-                });
-                });
-            } else {
-                console.warn('=== WARNING: No chat mode quick action buttons found ===');
             }
-            
+
+            // Set cursor style for welcome screen quick actions
+            if (welcomeQuickActions && welcomeQuickActions.length > 0) {
+                console.log('[INIT] Setting cursor style for', welcomeQuickActions.length, 'welcome quick action buttons');
+                welcomeQuickActions.forEach((action) => {
+                    action.style.cursor = 'pointer';
+                });
+            }
+
             // Log summary of all button setups
             console.log('=== BUTTON SETUP SUMMARY ===');
             console.log('Welcome quick actions:', welcomeQuickActions.length);

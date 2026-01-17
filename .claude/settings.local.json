@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo bash -c 'cat > /etc/wsl.conf << EOF\n[boot]\nsystemd=true\n\n[interop]\nenabled=true\nappendWindowsPath=true\nEOF')"
+    ]
+  }
+}
