@@ -67,6 +67,10 @@ export class OllamaProvider implements AIProvider {
           throw new Error('Invalid response from Ollama API');
         }
 
+        // Debug logging for AI response debugging (especially for small models like deepseek-coder)
+        console.log('Ollama: Raw response data:', JSON.stringify(data, null, 2).substring(0, 1000));
+        console.log('Ollama: Response content preview:', data.message?.content?.substring(0, 500));
+
         console.log('Ollama: Received response from Ollama');
         return data.message.content;
       } finally {

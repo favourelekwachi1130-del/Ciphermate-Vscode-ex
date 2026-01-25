@@ -4710,6 +4710,300 @@ Return a security suggestion if there's an issue, or null if safe:
     });
   }
 
+  // Fix System Commands
+  const { FixService } = require('./fix-system');
+  const fixService = new FixService(context);
+
+  // Connect fix service to chat interface for result communication
+  // This allows fix results to be shown in the chat UI
+  if (chatInterface && typeof chatInterface.setFixService === 'function') {
+    chatInterface.setFixService(fixService);
+  }
+
+  // Generate a fix for a vulnerability
+  let generateFixDisposable = vscode.commands.registerCommand('ciphermate.generateFix', async (vulnerability: any) => {
+    if (!vulnerability) {
+      vscode.window.showWarningMessage('No vulnerability provided for fix generation');
+      return;
+    }
+
+    try {
+      // Show progress while generating fix
+      await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'CipherMate: Generating secure fix...',
+        cancellable: false
+      }, async (progress) => {
+        progress.report({ increment: 0, message: 'Analyzing vulnerability...' });
+
+        // Generate the fix proposal
+        const proposal = await fixService.generateFix(vulnerability);
+
+        progress.report({ increment: 50, message: 'Generating diff preview...' });
+
+        // Generate preview diff
+        const diff = await fixService.previewFix(proposal);
+
+        progress.report({ increment: 100, message: 'Fix generated!' });
+
+        // Show the fix preview with options
+        const confidencePercent = Math.round(proposal.confidence * 100);
+        const choice = await vscode.window.showInformationMessage(
+          `Fix Generated for ${vulnerability.type || 'vulnerability'}\n\n` +
+          `File: ${proposal.vulnerability.file}\n` +
+          `Confidence: ${confidencePercent}%\n` +
+          `Risk Level: ${proposal.riskLevel}\n` +
+          `Changes: +${diff.additions} -${diff.deletions} lines\n\n` +
+          `${proposal.explanation}`,
+          { modal: true },
+          'Apply Fix',
+          'Preview Diff',
+          'Cancel'
+        );
+
+        if (choice === 'Apply Fix') {
+          const result = await fixService.applyFix(proposal, true);
+          if (result.success) {
+            vscode.window.showInformationMessage(
+              `Fix applied successfully to ${proposal.vulnerability.file}. You can undo with "CipherMate: Undo Last Fix"`
+            );
+          } else {
+            vscode.window.showErrorMessage(`Failed to apply fix: ${result.error}`);
+          }
+        } else if (choice === 'Preview Diff') {
+          // Show diff in output channel
+          const outputChannel = vscode.window.createOutputChannel('CipherMate Fix Preview');
+          outputChannel.clear();
+          outputChannel.appendLine('='.repeat(60));
+          outputChannel.appendLine(`FIX PREVIEW: ${proposal.vulnerability.file}`);
+          outputChannel.appendLine('='.repeat(60));
+          outputChannel.appendLine('');
+          outputChannel.appendLine(`Vulnerability: ${vulnerability.type || 'Security Issue'}`);
+          outputChannel.appendLine(`Severity: ${vulnerability.severity || 'Unknown'}`);
+          outputChannel.appendLine(`Confidence: ${confidencePercent}%`);
+          outputChannel.appendLine(`Risk Level: ${proposal.riskLevel}`);
+          outputChannel.appendLine('');
+          outputChannel.appendLine('--- ORIGINAL CODE ---');
+          outputChannel.appendLine(proposal.originalCode);
+          outputChannel.appendLine('');
+          outputChannel.appendLine('+++ FIXED CODE +++');
+          outputChannel.appendLine(proposal.fixedCode);
+          outputChannel.appendLine('');
+          outputChannel.appendLine('--- EXPLANATION ---');
+          outputChannel.appendLine(proposal.explanation);
+          if (proposal.securityImprovements && proposal.securityImprovements.length > 0) {
+            outputChannel.appendLine('');
+            outputChannel.appendLine('--- SECURITY IMPROVEMENTS ---');
+            proposal.securityImprovements.forEach((imp: string) => {
+              outputChannel.appendLine(`• ${imp}`);
+            });
+          }
+          outputChannel.show();
+
+          // After showing preview, offer to apply
+          const applyChoice = await vscode.window.showInformationMessage(
+            'Would you like to apply this fix?',
+            'Apply Fix',
+            'Cancel'
+          );
+          if (applyChoice === 'Apply Fix') {
+            const result = await fixService.applyFix(proposal, true);
+            if (result.success) {
+              vscode.window.showInformationMessage(
+                `Fix applied successfully. You can undo with "CipherMate: Undo Last Fix"`
+              );
+            } else {
+              vscode.window.showErrorMessage(`Failed to apply fix: ${result.error}`);
+            }
+          }
+        }
+      });
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to generate fix: ${error.message || error}`);
+    }
+  });
+
+  let previewFixDisposable = vscode.commands.registerCommand('ciphermate.previewFix', async (fixId: string) => {
+    const proposals = fixService.getPendingProposals();
+    const proposal = proposals.find((p: any) => p.id === fixId);
+    if (proposal) {
+      const diff = await fixService.previewFix(proposal);
+      vscode.window.showInformationMessage(`Preview for fix: ${diff.additions} additions, ${diff.deletions} deletions`);
+    } else {
+      vscode.window.showWarningMessage('Fix proposal not found');
+    }
+  });
+
+  let applySelectedFixDisposable = vscode.commands.registerCommand('ciphermate.applySelectedFix', async (fixId: string, confirmed: boolean = false) => {
+    const proposals = fixService.getPendingProposals();
+    const proposal = proposals.find((p: any) => p.id === fixId);
+    if (proposal) {
+      if (!confirmed) {
+        const diff = await fixService.previewFix(proposal);
+        const choice = await vscode.window.showInformationMessage(
+          `Apply fix to ${proposal.vulnerability.file}?\n\nConfidence: ${Math.round(proposal.confidence * 100)}%\nRisk: ${proposal.riskLevel}\nChanges: ${diff.additions} additions, ${diff.deletions} deletions`,
+          { modal: true },
+          'Apply Fix',
+          'Cancel'
+        );
+        if (choice !== 'Apply Fix') {
+          return;
+        }
+      }
+      const result = await fixService.applyFix(proposal, true);
+      if (result.success) {
+        vscode.window.showInformationMessage(`Fix applied successfully. You can undo with "CipherMate: Undo Last Fix"`);
+      } else {
+        vscode.window.showErrorMessage(`Failed to apply fix: ${result.error}`);
+      }
+    } else {
+      vscode.window.showWarningMessage('Fix proposal not found');
+    }
+  });
+
+  let undoLastFixDisposable = vscode.commands.registerCommand('ciphermate.undoLastFix', async () => {
+    const canUndo = await fixService.canUndo();
+    if (!canUndo) {
+      vscode.window.showInformationMessage('No fixes to undo');
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      'Undo the last applied fix?',
+      { modal: true },
+      'Undo',
+      'Cancel'
+    );
+    if (choice === 'Undo') {
+      const success = await fixService.undoLastFix();
+      if (success) {
+        vscode.window.showInformationMessage('Fix undone successfully');
+      } else {
+        vscode.window.showErrorMessage('Failed to undo fix');
+      }
+    }
+  });
+
+  let batchFixDisposable = vscode.commands.registerCommand('ciphermate.batchFix', async (vulnerabilities: any[]) => {
+    if (!vulnerabilities || vulnerabilities.length === 0) {
+      vscode.window.showWarningMessage('No vulnerabilities provided for batch fix');
+      return;
+    }
+
+    try {
+      // Show progress while generating fixes
+      await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'CipherMate: Generating batch fixes...',
+        cancellable: true
+      }, async (progress, token) => {
+        const proposals: any[] = [];
+        const total = vulnerabilities.length;
+
+        // Generate fix proposals for each vulnerability
+        for (let i = 0; i < vulnerabilities.length; i++) {
+          if (token.isCancellationRequested) {
+            vscode.window.showInformationMessage('Batch fix generation cancelled');
+            return;
+          }
+
+          const vuln = vulnerabilities[i];
+          progress.report({
+            increment: (100 / total),
+            message: `Generating fix ${i + 1}/${total}: ${vuln.type || 'vulnerability'}...`
+          });
+
+          try {
+            const proposal = await fixService.generateFix(vuln);
+            proposals.push(proposal);
+          } catch (error: any) {
+            console.error(`Failed to generate fix for vulnerability ${i + 1}:`, error);
+            // Continue with other vulnerabilities
+          }
+        }
+
+        if (proposals.length === 0) {
+          vscode.window.showErrorMessage('Failed to generate any fixes');
+          return;
+        }
+
+        // Generate batch preview
+        const preview = await fixService.generateBatchPreview(proposals);
+
+        // Show summary and confirmation
+        const highConfidence = proposals.filter((p: any) => p.confidence >= 0.7).length;
+        const lowConfidence = proposals.length - highConfidence;
+
+        const choice = await vscode.window.showInformationMessage(
+          `Batch Fix Summary\n\n` +
+          `Total fixes: ${proposals.length}\n` +
+          `High confidence (≥70%): ${highConfidence}\n` +
+          `Low confidence (<70%): ${lowConfidence}\n` +
+          `Files affected: ${preview.summary.totalFiles}\n` +
+          `Total changes: +${preview.summary.totalAdditions} -${preview.summary.totalDeletions} lines\n` +
+          `Overall confidence: ${Math.round(preview.summary.overallConfidence * 100)}%`,
+          { modal: true },
+          'Apply All Fixes',
+          'Apply High Confidence Only',
+          'Cancel'
+        );
+
+        if (choice === 'Apply All Fixes') {
+          const result = await fixService.applyBatchFixes(proposals, true);
+          vscode.window.showInformationMessage(
+            `Batch fix complete: ${result.successful} applied, ${result.failed} failed. Use "CipherMate: Undo Last Fix" to rollback.`
+          );
+        } else if (choice === 'Apply High Confidence Only') {
+          const highConfidenceProposals = proposals.filter((p: any) => p.confidence >= 0.7);
+          if (highConfidenceProposals.length === 0) {
+            vscode.window.showWarningMessage('No high confidence fixes available');
+            return;
+          }
+          const result = await fixService.applyBatchFixes(highConfidenceProposals, true);
+          vscode.window.showInformationMessage(
+            `Batch fix complete: ${result.successful} applied, ${result.failed} failed. Use "CipherMate: Undo Last Fix" to rollback.`
+          );
+        }
+      });
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Batch fix failed: ${error.message || error}`);
+    }
+  });
+
+  let showFixHistoryDisposable = vscode.commands.registerCommand('ciphermate.showFixHistory', async () => {
+    const history = await fixService.getUndoHistory();
+    if (history.length === 0) {
+      vscode.window.showInformationMessage('No fix history available');
+      return;
+    }
+    const items: vscode.QuickPickItem[] = history.map((entry: any) => ({
+      label: `${entry.backup.filePath}`,
+      description: `Applied: ${new Date(entry.addedAt).toLocaleString()}`,
+      detail: `Fix ID: ${entry.fixResultId}`
+    }));
+    const selected = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Select a fix to view details or undo',
+      canPickMany: false
+    });
+    if (selected) {
+      const choice = await vscode.window.showInformationMessage(
+        `Fix: ${selected.label}\n${selected.description || ''}`,
+        'Undo This Fix',
+        'Close'
+      );
+      if (choice === 'Undo This Fix') {
+        const entry = history.find((e: any) => e.backup.filePath === selected.label);
+        if (entry) {
+          const success = await fixService.undoFix(entry.fixResultId);
+          if (success) {
+            vscode.window.showInformationMessage('Fix undone successfully');
+          } else {
+            vscode.window.showErrorMessage('Failed to undo fix');
+          }
+        }
+      }
+    }
+  });
+
   // Start initial scan when extension activates
   if (activeCodeReviewer) {
     setTimeout(() => {
@@ -4751,8 +5045,14 @@ Return a security suggestion if there's an issue, or null if safe:
     logoutDisposable, 
     userProfileDisposable, 
     cancelScanDisposable, 
-    showCommandsDisposable, 
-    redTeamOpsDisposable
+    showCommandsDisposable,
+    redTeamOpsDisposable,
+    generateFixDisposable,
+    previewFixDisposable,
+    applySelectedFixDisposable,
+    undoLastFixDisposable,
+    batchFixDisposable,
+    showFixHistoryDisposable
   );
 }
 

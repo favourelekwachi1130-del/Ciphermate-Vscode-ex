@@ -78,21 +78,32 @@ export class MultiProviderAIService {
       console.log(`MultiProviderAIService: Using default value: ${providerType}`);
     }
     
-    // TEMPORARY FIX: Force Ollama if settings aren't working
-    // Check if Ollama URL is configured - if so, force Ollama provider
-    const ollamaUrl = config.get('ai.ollama.apiUrl');
+    // Check for Ollama configuration from environment variable or VS Code settings
+    // Use Ollama if:
+    // 1. OLLAMA_BASE_URL environment variable is set, OR
+    // 2. ai.ollama.apiUrl is explicitly configured in settings (workspace or global)
+    const envOllamaUrl = process.env.OLLAMA_BASE_URL;
+    const configuredOllamaUrl = config.get('ai.ollama.apiUrl') as string | undefined;
     const ollamaUrlInspect = config.inspect('ai.ollama.apiUrl');
-    console.log(`MultiProviderAIService: Ollama URL check:`, {
-      value: ollamaUrl,
+
+    console.log(`MultiProviderAIService: Ollama detection check:`, {
+      envOllamaUrl: envOllamaUrl,
+      configuredOllamaUrl: configuredOllamaUrl,
       workspaceValue: ollamaUrlInspect?.workspaceValue,
       globalValue: ollamaUrlInspect?.globalValue,
     });
-    
-    if (ollamaUrl && typeof ollamaUrl === 'string' && ollamaUrl.trim() !== '' && ollamaUrl !== 'http://localhost:11434') {
-      console.log(`MultiProviderAIService: Ollama URL is configured (${ollamaUrl}), FORCING Ollama provider`);
+
+    // Detect Ollama from environment variable OR explicit VS Code configuration
+    const hasEnvOllama = envOllamaUrl && envOllamaUrl.trim() !== '';
+    const hasConfiguredOllama = ollamaUrlInspect?.workspaceValue !== undefined ||
+                                 ollamaUrlInspect?.globalValue !== undefined;
+
+    if (hasEnvOllama || hasConfiguredOllama) {
+      const source = hasEnvOllama ? `env (${envOllamaUrl})` : `config (${configuredOllamaUrl})`;
+      console.log(`MultiProviderAIService: Ollama detected via ${source}, using Ollama provider`);
       providerType = 'ollama';
     } else {
-      console.log(`MultiProviderAIService: Ollama URL not configured or is default, using providerType: ${providerType}`);
+      console.log(`MultiProviderAIService: No Ollama configuration detected, using providerType: ${providerType}`);
     }
     
     this.currentProviderType = providerType;

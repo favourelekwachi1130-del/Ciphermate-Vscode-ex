@@ -19,6 +19,12 @@ export interface Vulnerability {
   fix?: string;
   references?: string[];
   metadata?: Record<string, any>;
+
+  /** Whether this vulnerability can be automatically fixed */
+  fixable?: boolean;
+
+  /** Complexity of fixing this vulnerability */
+  fixComplexity?: 'simple' | 'moderate' | 'complex';
 }
 
 export interface ScanResult {

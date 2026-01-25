@@ -52,7 +52,7 @@ export class ChatInterface {
           // Workspace opened, retry the pending request
           const pendingRequest = state.context.pendingRequest;
           state.context.pendingRequest = undefined;
-          
+
           if (this.panel) {
             this.addMessage('assistant', `Great! I see you've opened a repository. Let me retry your previous request: "${pendingRequest}"`);
             // Small delay to let the message appear
@@ -63,6 +63,26 @@ export class ChatInterface {
         }
       }
     });
+
+    // Set up the chat interface reference on agenticCore for message sending
+    this.agenticCore.setChatInterface(this);
+  }
+
+  /**
+   * Set the fix service reference for result listening
+   * This forwards to the internal AgenticCore
+   */
+  public setFixService(fixService: any): void {
+    if (this.agenticCore && typeof this.agenticCore.setFixService === 'function') {
+      this.agenticCore.setFixService(fixService);
+    }
+  }
+
+  /**
+   * Get the internal AgenticCore instance
+   */
+  public getAgenticCore(): AgenticCore {
+    return this.agenticCore;
   }
 
   /**
@@ -674,7 +694,11 @@ export class ChatInterface {
     return fallbacks[Math.floor(Math.random() * fallbacks.length)];
   }
 
-  private addMessage(role: 'user' | 'assistant', content: string): void {
+  /**
+   * Add a message to the chat interface
+   * Made public to allow external components (like AgenticCore) to send messages
+   */
+  public addMessage(role: 'user' | 'assistant', content: string): void {
     console.log('ChatInterface: addMessage() called', { role, contentLength: content?.length });
 
     const message = {
@@ -947,6 +971,37 @@ export class ChatInterface {
           } catch (error: any) {
             vscode.window.showErrorMessage(`Error opening file: ${error.message}`);
           }
+        } else if (message.command === 'generateFix') {
+          // Generate fix for a vulnerability
+          const vulnerability = message.vulnerability;
+          if (vulnerability) {
+            vscode.commands.executeCommand('ciphermate.generateFix', vulnerability);
+          }
+        } else if (message.command === 'previewFix') {
+          // Show diff preview for a fix
+          const fixId = message.fixId;
+          if (fixId) {
+            vscode.commands.executeCommand('ciphermate.previewFix', fixId);
+          }
+        } else if (message.command === 'applyFix') {
+          // Apply a fix with user confirmation
+          const fixId = message.fixId;
+          const confirmed = message.confirmed || false;
+          if (fixId) {
+            vscode.commands.executeCommand('ciphermate.applySelectedFix', fixId, confirmed);
+          }
+        } else if (message.command === 'undoFix') {
+          // Undo last fix
+          vscode.commands.executeCommand('ciphermate.undoLastFix');
+        } else if (message.command === 'batchFix') {
+          // Apply batch fixes
+          const vulnerabilityIds = message.vulnerabilityIds;
+          if (vulnerabilityIds && vulnerabilityIds.length > 0) {
+            vscode.commands.executeCommand('ciphermate.batchFix', vulnerabilityIds);
+          }
+        } else if (message.command === 'showFixHistory') {
+          // Show fix history
+          vscode.commands.executeCommand('ciphermate.showFixHistory');
         } else {
           console.warn('ChatInterface: Unknown command:', message.command);
         }
@@ -1548,6 +1603,49 @@ export class ChatInterface {
         .severity-badge.low { background: #28a745; color: white; }
         .severity-badge.info { background: #17a2b8; color: white; }
 
+        /* Fix buttons for vulnerabilities */
+        .fix-vuln-btn {
+            display: inline-block;
+            padding: 2px 8px;
+            margin-left: 8px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            text-decoration: none;
+            vertical-align: middle;
+        }
+        .fix-vuln-btn:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        .fix-vuln-btn:active {
+            transform: translateY(1px);
+        }
+        .fix-vuln-btn.generating {
+            opacity: 0.7;
+            cursor: wait;
+        }
+
+        /* Vulnerability finding row */
+        .vuln-finding {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin: 4px 0;
+            padding: 4px 0;
+        }
+        .vuln-finding .vuln-location {
+            font-family: var(--vscode-editor-font-family);
+            font-size: 12px;
+        }
+        .vuln-finding .vuln-description {
+            flex: 1;
+            min-width: 200px;
+        }
+
         /* Clickable file paths */
         .file-path-link {
             font-family: var(--vscode-editor-font-family);
@@ -1934,6 +2032,7 @@ export class ChatInterface {
                 <div class="quick-action" data-action="find hardcoded secrets">Find Secrets</div>
                 <div class="quick-action" data-action="scan smart contracts">Scan Contracts</div>
                 <div class="quick-action" data-action="check dependencies">Check Dependencies</div>
+                <div class="quick-action" data-action="fix vulnerabilities">Fix Vulnerabilities</div>
                 <div class="quick-action" data-action="show results">View Results</div>
             </div>
             
@@ -1994,6 +2093,7 @@ export class ChatInterface {
             <div class="quick-action" data-action="find hardcoded secrets">Find Secrets</div>
             <div class="quick-action" data-action="scan smart contracts">Scan Contracts</div>
             <div class="quick-action" data-action="check dependencies">Check Dependencies</div>
+            <div class="quick-action" data-action="fix vulnerabilities">Fix Vulnerabilities</div>
             <div class="quick-action" data-action="show results">View Results</div>
         </div>
     </div>
@@ -2112,10 +2212,12 @@ export class ChatInterface {
                 return;
             }
 
-            // Add click handler for file path links (event delegation)
+            // Add click handler for file path links and fix buttons (event delegation)
             if (messagesContainer) {
                 messagesContainer.addEventListener('click', function(e) {
                     var target = e.target;
+
+                    // Handle file path link clicks
                     if (target.classList.contains('file-path-link')) {
                         e.preventDefault();
                         e.stopPropagation();
@@ -2129,6 +2231,50 @@ export class ChatInterface {
                                 lineNumber: lineNumber
                             });
                         }
+                        return;
+                    }
+
+                    // Handle fix button clicks
+                    if (target.classList.contains('fix-vuln-btn')) {
+                        e.preventDefault();
+                        e.stopPropagation();
+
+                        // Prevent double-clicks
+                        if (target.classList.contains('generating')) {
+                            console.log('Fix already generating, ignoring click');
+                            return;
+                        }
+
+                        var vulnDataStr = target.getAttribute('data-vulnerability');
+                        if (!vulnDataStr) {
+                            console.error('No vulnerability data found on fix button');
+                            return;
+                        }
+
+                        try {
+                            var vulnerability = JSON.parse(vulnDataStr.replace(/&quot;/g, '"'));
+                            console.log('Fix button clicked for vulnerability:', vulnerability);
+
+                            // Update button state
+                            target.classList.add('generating');
+                            target.textContent = 'Fixing...';
+
+                            if (vscode && typeof vscode.postMessage === 'function') {
+                                vscode.postMessage({
+                                    command: 'generateFix',
+                                    vulnerability: vulnerability
+                                });
+                            }
+
+                            // Reset button after a delay (the actual fix will take time)
+                            setTimeout(function() {
+                                target.classList.remove('generating');
+                                target.textContent = 'Fix';
+                            }, 3000);
+                        } catch (parseError) {
+                            console.error('Failed to parse vulnerability data:', parseError);
+                        }
+                        return;
                     }
                 });
             }
@@ -2873,7 +3019,34 @@ export class ChatInterface {
                 // Horizontal rules (---) - before line breaks
                 html = html.replace(/^---$/gm, '<hr class="section-divider">');
 
-                // Severity badges with colors
+                // Vulnerability findings with Fix buttons
+                // Pattern: "1. **[SEVERITY]** file.js:123 - Description"
+                // First, detect and enhance numbered vulnerability findings with fix buttons
+                html = html.replace(/(\\d+)\\.\\s*\\*\\*\\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\\]\\*\\*\\s*([^:]+):(\\d+)\\s*-\\s*([^\\n<]+)/gi, function(match, num, severity, filePath, lineNum, description) {
+                    var severityLower = severity.toLowerCase();
+                    var escapedPath = filePath.replace(/"/g, '&quot;').trim();
+                    var escapedDesc = description.replace(/"/g, '&quot;').trim();
+                    var vulnData = JSON.stringify({
+                        type: escapedDesc,
+                        severity: severityLower,
+                        file: escapedPath,
+                        line: parseInt(lineNum, 10),
+                        description: escapedDesc,
+                        title: escapedDesc
+                    }).replace(/"/g, '&quot;');
+
+                    return '<div class="vuln-finding">' +
+                        '<span>' + num + '. </span>' +
+                        '<span class="severity-badge ' + severityLower + '">' + severity.toUpperCase() + '</span>' +
+                        '<a class="file-path-link vuln-location" href="#" data-file-path="' + escapedPath +
+                        '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
+                        filePath.trim() + ':' + lineNum + '</a>' +
+                        '<span class="vuln-description"> - ' + description.trim() + '</span>' +
+                        '<button class="fix-vuln-btn" data-vulnerability="' + vulnData + '" title="Generate and apply a fix for this vulnerability">Fix</button>' +
+                        '</div>';
+                });
+
+                // Severity badges with colors (for non-finding uses)
                 html = html.replace(/\\[CRITICAL\\]/g, '<span class="severity-badge critical">CRITICAL</span>');
                 html = html.replace(/\\[HIGH\\]/g, '<span class="severity-badge high">HIGH</span>');
                 html = html.replace(/\\[MEDIUM\\]/g, '<span class="severity-badge medium">MEDIUM</span>');
@@ -2888,6 +3061,26 @@ export class ChatInterface {
                 // File paths with line numbers (Windows style c:\path:123) - clickable
                 html = html.replace(/([A-Za-z]:\\\\[^\\s:]+):(\\d+)/g, function(match, filePath, lineNum) {
                     var escapedPath = filePath.replace(/"/g, '&quot;');
+                    return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
+                           '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
+                           match + '</a>';
+                });
+
+                // File paths with line numbers (Unix/Mac absolute paths /path/to/file.ts:123) - clickable
+                // Match paths starting with / that have a file extension and line number
+                html = html.replace(/(\\/(?:[^\\s:&<>]+\\/)*[^\\s:&<>]+\\.[a-zA-Z0-9]+):(\\d+)(?![^<]*<\\/a>)/g, function(match, filePath, lineNum) {
+                    var escapedPath = filePath.replace(/"/g, '&quot;');
+                    return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
+                           '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
+                           match + '</a>';
+                });
+
+                // File paths with line numbers (relative paths like src/file.ts:123 or ./src/file.ts:123) - clickable
+                // Match paths that look like relative file paths with extensions and line numbers
+                // Negative lookbehind equivalent: ensure not already wrapped in an <a> tag
+                html = html.replace(/(?<!["\\/])(\\.?\\.?\\/)?([a-zA-Z0-9_][a-zA-Z0-9_.-]*(?:\\/[a-zA-Z0-9_][a-zA-Z0-9_.-]*)+\\.[a-zA-Z0-9]+):(\\d+)(?![^<]*<\\/a>)/g, function(match, prefix, filePath, lineNum) {
+                    var fullPath = (prefix || '') + filePath;
+                    var escapedPath = fullPath.replace(/"/g, '&quot;');
                     return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
                            '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
                            match + '</a>';

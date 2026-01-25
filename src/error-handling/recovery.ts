@@ -10,7 +10,12 @@ export enum ErrorCategory {
   CONFIGURATION = 'configuration',
   MEMORY = 'memory',
   PERMISSION = 'permission',
-  UNKNOWN = 'unknown'
+  UNKNOWN = 'unknown',
+  // Fix system error categories
+  FIX_GENERATION = 'fix_generation',
+  FIX_APPLICATION = 'fix_application',
+  FIX_VALIDATION = 'fix_validation',
+  FIX_ROLLBACK = 'fix_rollback'
 }
 
 // Error Severity Levels
@@ -141,6 +146,18 @@ export class ErrorRecoveryManager {
     if (message.includes('permission') || message.includes('access')) {
       return ErrorCategory.PERMISSION;
     }
+    if (message.includes('fix') && message.includes('generation')) {
+      return ErrorCategory.FIX_GENERATION;
+    }
+    if (message.includes('fix') && (message.includes('apply') || message.includes('application'))) {
+      return ErrorCategory.FIX_APPLICATION;
+    }
+    if (message.includes('fix') && message.includes('validat')) {
+      return ErrorCategory.FIX_VALIDATION;
+    }
+    if (message.includes('rollback') || message.includes('undo') || message.includes('restore')) {
+      return ErrorCategory.FIX_ROLLBACK;
+    }
 
     return ErrorCategory.UNKNOWN;
   }
@@ -176,7 +193,11 @@ export class ErrorRecoveryManager {
       [ErrorCategory.CONFIGURATION]: 'Configuration error. Please check your settings.',
       [ErrorCategory.MEMORY]: 'Memory issue detected. Please restart VS Code if problems persist.',
       [ErrorCategory.PERMISSION]: 'Permission denied. Please check file and folder permissions.',
-      [ErrorCategory.UNKNOWN]: 'An unexpected error occurred. Please try again.'
+      [ErrorCategory.UNKNOWN]: 'An unexpected error occurred. Please try again.',
+      [ErrorCategory.FIX_GENERATION]: 'Failed to generate a fix for this vulnerability. The AI service may be unavailable.',
+      [ErrorCategory.FIX_APPLICATION]: 'Failed to apply the fix. The file may have been modified or is read-only.',
+      [ErrorCategory.FIX_VALIDATION]: 'Fix validation failed. The vulnerability may still be present.',
+      [ErrorCategory.FIX_ROLLBACK]: 'Failed to undo the fix. You may need to restore manually from backup.'
     };
 
     let message = messages[category];

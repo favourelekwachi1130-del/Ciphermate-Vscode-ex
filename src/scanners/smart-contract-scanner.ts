@@ -374,8 +374,9 @@ export class SmartContractScanner extends BaseScanner {
         
         // Check for block.timestamp usage
         if (/block\.timestamp|now\b/.test(body)) {
-          const line = func.lineStart + body.split('\n').findIndex((l: string) => /block\.timestamp|now\b/.test(l));
-          
+          const matchIndex = body.split('\n').findIndex((l: string) => /block\.timestamp|now\b/.test(l));
+          const line = func.lineStart + (matchIndex >= 0 ? matchIndex : 0);
+
           vulnerabilities.push({
             id: this.generateVulnId('timestamp-dependence', filePath, line),
             type: 'timestamp-dependence',
@@ -409,10 +410,11 @@ export class SmartContractScanner extends BaseScanner {
         
         // Check for weak randomness sources
         if (/block\.timestamp|block\.hash|block\.difficulty|block\.number/.test(body)) {
-          const line = func.lineStart + body.split('\n').findIndex((l: string) => 
+          const matchIndex = body.split('\n').findIndex((l: string) =>
             /block\.timestamp|block\.hash|block\.difficulty|block\.number/.test(l)
           );
-          
+          const line = func.lineStart + (matchIndex >= 0 ? matchIndex : 0);
+
           vulnerabilities.push({
             id: this.generateVulnId('weak-randomness', filePath, line),
             type: 'weak-randomness',

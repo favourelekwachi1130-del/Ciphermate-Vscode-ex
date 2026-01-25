@@ -62,6 +62,10 @@ export class OpenAIProvider extends BaseAIProvider {
             }
 
             const parsed = JSON.parse(data);
+
+            // Debug logging for AI response debugging
+            console.log('OpenAI: Raw response:', JSON.stringify(parsed, null, 2).substring(0, 500));
+
             resolve({
               content: parsed.choices?.[0]?.message?.content || '',
               tool_calls: parsed.choices?.[0]?.message?.tool_calls,

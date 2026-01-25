@@ -71,7 +71,10 @@ export class AnthropicProvider extends BaseAIProvider {
             }
 
             const parsed = JSON.parse(data);
-            
+
+            // Debug logging for AI response debugging
+            console.log('Anthropic: Raw response:', JSON.stringify(parsed, null, 2).substring(0, 500));
+
             // Anthropic response format is different
             const content = parsed.content?.[0]?.text || '';
             resolve({

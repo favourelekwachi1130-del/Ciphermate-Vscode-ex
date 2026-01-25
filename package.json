@@ -309,6 +309,26 @@
       {
         "command": "ciphermate.openDashboard",
         "title": "CipherMate: Open Dashboard"
+      },
+      {
+        "command": "ciphermate.previewFix",
+        "title": "CipherMate: Preview Fix"
+      },
+      {
+        "command": "ciphermate.applySelectedFix",
+        "title": "CipherMate: Apply Selected Fix"
+      },
+      {
+        "command": "ciphermate.undoLastFix",
+        "title": "CipherMate: Undo Last Fix"
+      },
+      {
+        "command": "ciphermate.batchFix",
+        "title": "CipherMate: Batch Fix Vulnerabilities"
+      },
+      {
+        "command": "ciphermate.showFixHistory",
+        "title": "CipherMate: Show Fix History"
       }
     ],
     "menus": {
@@ -612,6 +632,35 @@
                  "type": "boolean",
                  "default": true,
                  "description": "Enable live code review with real-time security suggestions"
+               },
+               "ciphermate.fixes.requireConfirmation": {
+                 "type": "boolean",
+                 "default": true,
+                 "description": "Require user confirmation before applying any vulnerability fix"
+               },
+               "ciphermate.fixes.autoBackup": {
+                 "type": "boolean",
+                 "default": true,
+                 "description": "Automatically create backups before applying fixes"
+               },
+               "ciphermate.fixes.validateAfterFix": {
+                 "type": "boolean",
+                 "default": true,
+                 "description": "Re-scan files after applying fixes to validate they resolved the vulnerability"
+               },
+               "ciphermate.fixes.minConfidence": {
+                 "type": "number",
+                 "default": 0.7,
+                 "minimum": 0,
+                 "maximum": 1,
+                 "description": "Minimum confidence level (0-1) required to apply a fix automatically"
+               },
+               "ciphermate.fixes.backupRetentionDays": {
+                 "type": "number",
+                 "default": 7,
+                 "minimum": 1,
+                 "maximum": 90,
+                 "description": "Number of days to retain fix backups before automatic cleanup"
                }
       }
     }
@@ -627,12 +676,19 @@
     "compile:dev": "webpack --mode development",
     "watch": "webpack --mode development --watch",
     "package": "webpack --mode production --devtool hidden-source-map",
-    "compile-tests": "tsc -p . --outDir out",
-    "watch-tests": "tsc -p . -w --outDir out",
+    "compile-tests": "tsc -p tsconfig.test.json",
+    "watch-tests": "tsc -p tsconfig.test.json -w",
     "pretest": "npm run compile-tests && npm run compile:dev && npm run lint",
     "lint": "eslint src --ext ts",
     "lint:fix": "eslint src --ext ts --fix",
     "test": "vscode-test",
+    "test:unit": "vscode-test --label 'Unit Tests - Fix System'",
+    "test:scanners": "vscode-test --label 'Unit Tests - Scanners'",
+    "test:integration": "vscode-test --label 'Integration Tests'",
+    "test:e2e": "vscode-test --label 'E2E Tests'",
+    "test:existing": "vscode-test --label 'Existing Tests'",
+    "test:all": "vscode-test --label 'All Tests'",
+    "test:standalone": "mocha out/test/standalone/**/*.test.js --timeout 30000",
     "test:enterprise": "node ./out/test/enterprise.test.js",
     "test:coverage": "nyc npm test",
     "build": "npm run compile && npm run test",

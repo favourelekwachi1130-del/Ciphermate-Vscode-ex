@@ -20,6 +20,28 @@ interface Pattern {
   fileExtensions?: string[];
 }
 
+/**
+ * Maps pattern names to specific vulnerability types for better fix matching
+ */
+const PATTERN_TO_TYPE: Record<string, string> = {
+  'SQL Injection (Template Literal)': 'sql-injection',
+  'SQL Injection (String Concatenation)': 'sql-injection',
+  'SQL Injection (Raw Query)': 'sql-injection',
+  'XSS - innerHTML': 'xss',
+  'XSS - dangerouslySetInnerHTML': 'xss',
+  'Command Injection': 'command-injection',
+  'Path Traversal': 'path-traversal',
+  'Weak Hash Algorithm (MD5)': 'weak-hash',
+  'Weak Hash Algorithm (SHA1)': 'weak-hash',
+  'Insecure Random (Math.random)': 'insecure-random',
+  'Hardcoded Password': 'hardcoded-secret',
+  'Weak Password Validation': 'weak-password',
+  'Insecure Deserialization': 'insecure-deserialization',
+  'SSRF Vulnerability': 'ssrf',
+  'Insecure Direct Object Reference': 'idor',
+  'Debug Mode Enabled': 'debug-mode',
+};
+
 export class CodePatternScanner extends BaseScanner {
   private patterns: Pattern[] = [];
 
@@ -90,7 +112,9 @@ export class CodePatternScanner extends BaseScanner {
       },
       {
         name: 'SQL Injection (String Concatenation)',
-        pattern: /(query|execute|exec|sql)\s*\([^)]*["']\s*\+|\+\s*["'][^)]*\)/i,
+        // Fixed: The original pattern had two alternatives where the second matched ANY string concatenation.
+        // Now requires BOTH the SQL function call AND the concatenation with SQL keywords.
+        pattern: /(query|execute|exec|sql|db\.\w+)\s*\([^)]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|JOIN|VALUES)[^)]*["']\s*\+/i,
         severity: 'high',
         description: 'String concatenation detected in database query context. Potential SQL injection risk.',
         cwe: ['CWE-89'],
@@ -311,9 +335,12 @@ export class CodePatternScanner extends BaseScanner {
 
           const matches = line.match(pattern.pattern);
           if (matches) {
+            // Use specific vulnerability type from mapping, fallback to 'code-pattern'
+            const vulnType = PATTERN_TO_TYPE[pattern.name] || 'code-pattern';
+
             vulnerabilities.push({
               id: this.generateVulnId(pattern.name.toLowerCase().replace(/\s+/g, '-'), filePath, lineNumber),
-              type: 'code-pattern',
+              type: vulnType,
               severity: pattern.severity,
               title: `${pattern.name} detected`,
               description: pattern.description,

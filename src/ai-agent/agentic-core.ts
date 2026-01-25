@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { RepositoryScanner } from '../scanners';
+import { FixService, FixProposal } from '../fix-system';
 
 const execAsync = promisify(exec);
 
@@ -71,10 +72,17 @@ export class AgenticCore {
   private multiProviderService?: any;
   private lmStudioUrl: string = 'http://localhost:1234/v1/chat/completions';
   private maxIterations: number = 20;
+  private fixService: FixService;
+  private externalFixService: any = null; // External fix service for result listening
+  private fixResultDisposable: vscode.Disposable | null = null;
+  private chatInterface: any = null; // Reference to chat interface for sending messages
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
-    
+
+    // Initialize FixService for safe vulnerability fixing
+    this.fixService = new FixService(context);
+
     // Determine which AI service to use
     const config = vscode.workspace.getConfiguration('ciphermate');
     const useCloudAI = config.get('useCloudAI', true);
@@ -225,13 +233,17 @@ export class AgenticCore {
       }
     });
 
-    // Tool 5: Apply Fix
+    // Tool 5: Apply Fix (uses FixService for safe application with backup and undo)
     this.tools.set('apply_fix', {
       name: 'apply_fix',
-      description: 'Apply a generated fix to a file. Modifies the actual code file.',
+      description: 'Apply a generated fix to a file safely with backup, diff preview, and undo capability. Requires user confirmation.',
       parameters: {
         type: 'object',
         properties: {
+          vulnerability: {
+            type: 'object',
+            description: 'Vulnerability object with type, severity, file, line, code, and description'
+          },
           filePath: {
             type: 'string',
             description: 'Path to file to fix'
@@ -247,12 +259,16 @@ export class AgenticCore {
           lineNumber: {
             type: 'number',
             description: 'Line number where fix should be applied'
+          },
+          confirmed: {
+            type: 'boolean',
+            description: 'Whether user has confirmed the fix (required for application)'
           }
         },
         required: ['filePath', 'originalCode', 'fixedCode', 'lineNumber']
       },
       execute: async (params: any) => {
-        return await this.executeApplyFix(params.filePath, params.originalCode, params.fixedCode, params.lineNumber);
+        return await this.executeSafeApplyFix(params);
       }
     });
 
@@ -323,6 +339,44 @@ export class AgenticCore {
   }
 
   /**
+   * Set the chat interface reference for sending messages
+   */
+  public setChatInterface(chatInterface: any): void {
+    this.chatInterface = chatInterface;
+  }
+
+  /**
+   * Set the fix service reference for result listening
+   */
+  public setFixService(fixService: any): void {
+    this.externalFixService = fixService;
+
+    // Dispose of any existing subscription
+    if (this.fixResultDisposable) {
+      this.fixResultDisposable.dispose();
+      this.fixResultDisposable = null;
+    }
+
+    // Subscribe to fix completion events
+    if (fixService && fixService.onFixComplete) {
+      this.fixResultDisposable = fixService.onFixComplete((event: any) => {
+        console.log('AgenticCore: Received fix completion event');
+
+        // Add result summary to conversation
+        this.state.conversation.push({
+          role: 'assistant',
+          content: event.summary
+        });
+
+        // Notify chat interface if available
+        if (this.chatInterface && typeof this.chatInterface.addMessage === 'function') {
+          this.chatInterface.addMessage('assistant', event.summary);
+        }
+      });
+    }
+  }
+
+  /**
    * Main agent execution - processes user request autonomously
    */
   async processRequest(userRequest: string, workspacePath?: string): Promise<string> {
@@ -346,11 +400,131 @@ export class AgenticCore {
     }
     
     // Initialize state - detect workspace path from multiple sources
-    const detectedPath = workspacePath || 
-                        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 
+    const detectedPath = workspacePath ||
+                        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ||
                         process.cwd();
     this.state.context.workspacePath = detectedPath;
-    
+
+    // Check for "fix vulnerabilities" request with priority detection
+    const isFixRequest = /fix.*vulnerabilit|fix.*issue|fix.*finding|apply.*fix|generate.*fix|auto.*fix/i.test(userRequest);
+    const isHighPriorityOnly = /fix.*(high|critical)\s*(priority|issues?|vulns?)|high\s*priority.*fix|(critical|high)\s+only/i.test(userRequest);
+    const isCriticalOnly = /fix.*critical\s*only|only.*critical|critical\s+issues?\s+only/i.test(userRequest);
+
+    if (isFixRequest) {
+      console.log('AgenticCore: Detected fix vulnerabilities request');
+      console.log('AgenticCore: High priority only:', isHighPriorityOnly, 'Critical only:', isCriticalOnly);
+
+      // Add user message to conversation for context
+      this.state.conversation.push({
+        role: 'user',
+        content: userRequest
+      });
+
+      // Check if we have scan results to fix
+      const vulnerabilities = this.state.vulnerabilities || this.state.scanResults || [];
+
+      if (vulnerabilities.length === 0) {
+        const noVulnsMessage = `I don't have any vulnerability scan results to fix yet.\n\n` +
+          `**To generate fixes, I first need to scan your repository:**\n\n` +
+          `1. Say "scan my repository" to find vulnerabilities\n` +
+          `2. Once vulnerabilities are found, say "fix vulnerabilities" to generate fixes\n\n` +
+          `Alternatively, you can click the **Fix** button next to any vulnerability in the scan results.`;
+
+        this.state.conversation.push({
+          role: 'assistant',
+          content: noVulnsMessage
+        });
+
+        return noVulnsMessage;
+      }
+
+      // Determine severity filter based on user request
+      let severityFilter: string[];
+      let priorityDescription: string;
+
+      if (isCriticalOnly) {
+        severityFilter = ['critical'];
+        priorityDescription = 'critical';
+      } else if (isHighPriorityOnly) {
+        severityFilter = ['critical', 'high'];
+        priorityDescription = 'critical and high priority';
+      } else {
+        severityFilter = ['critical', 'high', 'medium', 'low'];
+        priorityDescription = '';
+      }
+
+      // Filter to fixable vulnerabilities
+      const fixableVulns = vulnerabilities
+        .filter((v: any) => {
+          if (!v.file || !v.severity) return false;
+          return severityFilter.includes(v.severity?.toLowerCase());
+        })
+        .sort((a: any, b: any) => {
+          const severityOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+          return (severityOrder[a.severity?.toLowerCase()] || 5) - (severityOrder[b.severity?.toLowerCase()] || 5);
+        })
+        .slice(0, 10); // Limit to first 10 for performance
+
+      if (fixableVulns.length === 0) {
+        const priorityLabel = priorityDescription ? ` ${priorityDescription}` : '';
+        const noFixableMessage = `I found ${vulnerabilities.length} vulnerability findings, but none of them${priorityLabel ? ` are${priorityLabel}` : ' have enough context to generate automatic fixes'}.\n\n` +
+          `**You can:**\n` +
+          `- Try "fix vulnerabilities" without priority filter to fix all\n` +
+          `- Click on file paths in the scan results to open the files\n` +
+          `- Review the vulnerability descriptions for manual fixes\n` +
+          `- Click the **Fix** button next to specific findings for individual fixes`;
+
+        this.state.conversation.push({
+          role: 'assistant',
+          content: noFixableMessage
+        });
+
+        return noFixableMessage;
+      }
+
+      // Trigger batch fix via VS Code command
+      const priorityLabel = priorityDescription ? ` ${priorityDescription}` : '';
+      const fixMessage = `I found **${fixableVulns.length}**${priorityLabel} vulnerabilities that can be automatically fixed.\n\n` +
+        `**Vulnerabilities to fix:**\n` +
+        fixableVulns.slice(0, 5).map((v: any, i: number) =>
+          `${i + 1}. **[${(v.severity || 'UNKNOWN').toUpperCase()}]** [\`${path.basename(v.file)}:${v.line || '?'}\`](${v.file}) - ${v.type || v.description || 'Security Issue'}`
+        ).join('\n') +
+        (fixableVulns.length > 5 ? `\n... and ${fixableVulns.length - 5} more\n` : '\n') +
+        `\n**Generating fixes now...** This may take a moment.\n\n` +
+        `You'll be prompted to review and confirm before fixes are applied.`;
+
+      this.state.conversation.push({
+        role: 'assistant',
+        content: fixMessage
+      });
+
+      // Execute batch fix command
+      // The fix service will emit an event when complete, which we'll handle
+      // via the onFixComplete subscription set up in setFixService()
+      try {
+        await vscode.commands.executeCommand('ciphermate.batchFix', fixableVulns);
+      } catch (error) {
+        console.error('AgenticCore: Failed to execute batch fix:', error);
+        const errorMessage = `**Fix operation encountered an error**\n\n` +
+          `Error: ${error instanceof Error ? error.message : String(error)}\n\n` +
+          `Please try again or fix vulnerabilities individually by clicking the Fix button.`;
+
+        this.state.conversation.push({
+          role: 'assistant',
+          content: errorMessage
+        });
+
+        // Notify chat interface if available
+        if (this.chatInterface && typeof this.chatInterface.addMessage === 'function') {
+          this.chatInterface.addMessage('assistant', errorMessage);
+        }
+
+        return errorMessage;
+      }
+
+      return fixMessage;
+    }
+
     if (isSecurityRequest) {
       // IMMEDIATELY execute security request - don't even ask the AI
       // This ensures security requests always work, regardless of AI model capabilities
@@ -1323,6 +1497,92 @@ Generate a secure fix. Return JSON:
     }
   }
 
+  /**
+   * Execute a safe fix using FixService with backup, preview, and undo capability
+   */
+  private async executeSafeApplyFix(params: any): Promise<any> {
+    try {
+      const { vulnerability, filePath, originalCode, fixedCode, lineNumber, confirmed } = params;
+
+      // If no vulnerability object provided, construct one from params
+      const vuln = vulnerability || {
+        id: `vuln-${Date.now()}`,
+        type: 'detected_vulnerability',
+        severity: 'medium' as const,
+        title: 'Detected Vulnerability',
+        description: 'Vulnerability detected during scan',
+        file: filePath,
+        line: lineNumber,
+        code: originalCode
+      };
+
+      // Generate fix proposal using FixService
+      const proposal = await this.fixService.generateFix(vuln);
+
+      // Override with provided fixed code if available
+      if (fixedCode) {
+        (proposal as any).fixedCode = fixedCode;
+      }
+      if (originalCode) {
+        (proposal as any).originalCode = originalCode;
+      }
+
+      // If not confirmed, return preview info for user confirmation
+      if (!confirmed) {
+        const diff = await this.fixService.previewFix(proposal);
+        return {
+          success: false,
+          needsConfirmation: true,
+          message: 'Fix requires user confirmation before application',
+          preview: {
+            fixId: proposal.id,
+            filePath: proposal.vulnerability.file,
+            line: proposal.startLine,
+            originalCode: proposal.originalCode,
+            fixedCode: proposal.fixedCode,
+            explanation: proposal.explanation,
+            confidence: proposal.confidence,
+            riskLevel: proposal.riskLevel,
+            diff: diff.unified,
+            additions: diff.additions,
+            deletions: diff.deletions
+          }
+        };
+      }
+
+      // User confirmed - apply the fix
+      const result = await this.fixService.applyFix(proposal, true);
+
+      if (result.success) {
+        return {
+          success: true,
+          message: `Fix applied successfully to ${path.basename(filePath)} at line ${lineNumber}`,
+          file: filePath,
+          line: lineNumber,
+          fixId: result.fixId,
+          backupId: result.backupId,
+          validated: result.validated,
+          canUndo: true
+        };
+      } else {
+        return {
+          success: false,
+          error: result.error || 'Failed to apply fix',
+          fixId: result.fixId
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  /**
+   * Legacy apply fix method (kept for backward compatibility)
+   * @deprecated Use executeSafeApplyFix instead
+   */
   private async executeApplyFix(filePath: string, originalCode: string, fixedCode: string, lineNumber: number): Promise<any> {
     try {
       if (!fs.existsSync(filePath)) {
