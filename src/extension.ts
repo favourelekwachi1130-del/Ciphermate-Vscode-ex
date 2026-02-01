@@ -12,6 +12,7 @@ import { SocialEngineeringToolkit } from './redteam/social-engineering';
 import { AILearningEngine } from './redteam/ai-learning-engine';
 import { AIAgentCore } from './ai-agent/core';
 import { ChatInterface } from './ai-agent/chat-interface';
+import { ScanDataService } from './database/scan-data-service';
 
 // Enterprise Architecture - Core Infrastructure
 interface Logger {
@@ -1465,9 +1466,74 @@ const DEFAULT_SETTINGS = {
 
 let saveCounter = 0;
 let lastScanResults: any[] = [];
+
+// Store highlighted vulnerabilities for CodeLens
+interface HighlightedVulnerability {
+  filePath: string;
+  lineNumber: number;
+  vulnerability: any | null;
+  document: string;
+}
+
+let highlightedVulnerabilities = new Map<string, HighlightedVulnerability>();
+
+// CodeLens Provider for Explain buttons
+class VulnerabilityCodeLensProvider implements vscode.CodeLensProvider {
+  private _onDidChangeCodeLenses: vscode.EventEmitter<void> = new vscode.EventEmitter<void>();
+  public readonly onDidChangeCodeLenses: vscode.Event<void> = this._onDidChangeCodeLenses.event;
+
+  public refresh(): void {
+    this._onDidChangeCodeLenses.fire();
+  }
+
+  public provideCodeLenses(document: vscode.TextDocument, token: vscode.CancellationToken): vscode.CodeLens[] | Thenable<vscode.CodeLens[]> {
+    const codeLenses: vscode.CodeLens[] = [];
+    const filePath = document.uri.fsPath;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    
+    // Normalize path for comparison
+    const normalizePath = (p: string): string => {
+      if (!p) return '';
+      const normalized = path.normalize(p.trim());
+      if (workspaceRoot && !path.isAbsolute(normalized)) {
+        return path.join(workspaceRoot, normalized);
+      }
+      return normalized;
+    };
+    
+    const normalizedDocPath = normalizePath(filePath);
+    
+    // Find vulnerabilities for this file
+    for (const [key, info] of highlightedVulnerabilities.entries()) {
+      const normalizedInfoPath = normalizePath(info.filePath);
+      if (info.document === document.uri.toString() || normalizedInfoPath === normalizedDocPath) {
+        const line = info.lineNumber - 1; // Convert to 0-based index
+        if (line >= 0 && line < document.lineCount) {
+          const range = new vscode.Range(line, 0, line, 0);
+          const vulnerabilityType = info.vulnerability ? detectVulnerabilityType(info.vulnerability) : 'Security Issue';
+          const codeLens = new vscode.CodeLens(range, {
+            title: `🔍 Explain ${vulnerabilityType}`,
+            command: 'ciphermate.explainLine',
+            arguments: [info.filePath, info.lineNumber, info.vulnerability]
+          });
+          codeLenses.push(codeLens);
+        }
+      }
+    }
+    
+    return codeLenses;
+  }
+
+  public resolveCodeLens(codeLens: vscode.CodeLens, token: vscode.CancellationToken): vscode.CodeLens {
+    return codeLens;
+  }
+}
+
+const vulnerabilityCodeLensProvider = new VulnerabilityCodeLensProvider();
 let resultsPanel: vscode.WebviewPanel | null = null;
 let encryptionKey: Buffer | null = null;
 let activeCodeReviewer: ActiveCodeReviewer | null = null;
+let scanDataService: ScanDataService | null = null;
 
 // Export functions for use in other modules
 export function getScanDataService(): ScanDataService | null {
@@ -4302,6 +4368,10 @@ export function activate(context: vscode.ExtensionContext) {
   // Initialize encryption key
   encryptionKey = generateEncryptionKey();
 
+  // Initialize Scan Data Service (database with JWT authentication)
+  scanDataService = new ScanDataService(context, logger);
+  logger.info('Scan data service initialized');
+
   // Initialize AI Agent Core - The heart of CipherMate
   // AgenticCore is the true autonomous agent with tool calling
   // AIAgentCore is kept as fallback for simple commands
@@ -4837,62 +4907,118 @@ export function activate(context: vscode.ExtensionContext) {
       } else if (message.command === 'openFile') {
         // Open file at specific line and highlight it
         // Split the view: move results panel to right side, open file on left side
-        const filePath = message.filePath?.trim();
-        const lineNumber = parseInt(message.lineNumber) || 1;
+        let filePath = message.filePath?.trim();
+        let lineNumber = parseInt(message.lineNumber);
+        
+        logger?.info('openFile command received', { filePath, lineNumber: message.lineNumber, parsedLineNumber: lineNumber });
         
         // Validate file path before attempting to open
-        if (!filePath || filePath === '' || filePath === 'undefined' || filePath === 'null' || lineNumber < 1) {
-          logger?.warn('openFile: Invalid file path or line number', { filePath, lineNumber });
-          vscode.window.showWarningMessage('Invalid file path or line number');
+        if (!filePath || filePath === '' || filePath === 'undefined' || filePath === 'null') {
+          logger?.warn('openFile: Invalid file path', { filePath });
+          vscode.window.showWarningMessage('Invalid file path');
           return;
         }
         
-        if (filePath) {
-          try {
-            // Move results panel to column Two (right side) to create split view
-            if (resultsPanel) {
-              resultsPanel.reveal(vscode.ViewColumn.Two, false);
-            }
-            
-            const uri = vscode.Uri.file(filePath);
-            vscode.workspace.openTextDocument(uri).then(
-              (document) => {
-                const position = new vscode.Position(Math.max(0, lineNumber - 1), 0);
-                // Open file in column One (left side), creating split view with results panel on right
-                vscode.window.showTextDocument(document, {
-                  selection: new vscode.Range(position, position),
-                  viewColumn: vscode.ViewColumn.One,
-                  preview: false
-                }).then(
-                  (editor) => {
-                    // Highlight the line by revealing it in the center and selecting it
-                    const lineRange = new vscode.Range(
-                      Math.max(0, lineNumber - 1),
-                      0,
-                      Math.max(0, lineNumber - 1),
-                      Number.MAX_VALUE
-                    );
-                    editor.revealRange(lineRange, vscode.TextEditorRevealType.InCenter);
-                    editor.selection = new vscode.Selection(lineRange.start, lineRange.end);
+        // Validate line number - use the actual line number from message, don't default to 1
+        if (isNaN(lineNumber) || lineNumber < 1) {
+          logger?.warn('openFile: Invalid line number, using 1', { lineNumber, original: message.lineNumber });
+          lineNumber = 1;
+        } else {
+          logger?.info('openFile: Using line number', { lineNumber });
+        }
+        
+        // Normalize file path to absolute
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (workspaceRoot && !path.isAbsolute(filePath)) {
+          filePath = path.join(workspaceRoot, filePath);
+        }
+        
+        try {
+          // Move results panel to column Two (right side) to create split view
+          if (resultsPanel) {
+            resultsPanel.reveal(vscode.ViewColumn.Two, false);
+          }
+          
+          const uri = vscode.Uri.file(filePath);
+          vscode.workspace.openTextDocument(uri).then(
+            (document) => {
+              // Fix: Ensure line number is valid and within document bounds
+              const validLineNumber = Math.max(1, Math.min(lineNumber, document.lineCount));
+              const lineIndex = Math.max(0, validLineNumber - 1);
+              const position = new vscode.Position(lineIndex, 0);
+              
+              // Open file in column One (left side), creating split view with results panel on right
+              vscode.window.showTextDocument(document, {
+                selection: new vscode.Range(position, position),
+                viewColumn: vscode.ViewColumn.One,
+                preview: false
+              }).then(
+                (editor) => {
+                  // Highlight the line by revealing it in the center and selecting it
+                  const lineRange = new vscode.Range(
+                    lineIndex,
+                    0,
+                    lineIndex,
+                    Number.MAX_VALUE
+                  );
+                  editor.revealRange(lineRange, vscode.TextEditorRevealType.InCenter);
+                  editor.selection = new vscode.Selection(lineRange.start, lineRange.end);
+                  
+                  // Add a prominent decoration to highlight the line with bold question mark
+                  const decorationType = vscode.window.createTextEditorDecorationType({
+                    backgroundColor: new vscode.ThemeColor('editor.selectionBackground'),
+                    isWholeLine: true,
+                    border: '2px solid',
+                    borderColor: new vscode.ThemeColor('textLink.foreground'),
+                    gutterIconPath: vscode.Uri.parse('data:image/svg+xml;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#007acc" opacity="0.4"/><circle cx="14" cy="14" r="11" fill="none" stroke="#007acc" stroke-width="2"/><text x="14" y="19" font-size="18" font-weight="bold" fill="#007acc" text-anchor="middle" font-family="Arial, sans-serif">?</text></svg>').toString('base64')),
+                    gutterIconSize: 'contain',
+                    overviewRulerColor: new vscode.ThemeColor('textLink.foreground'),
+                    overviewRulerLane: vscode.OverviewRulerLane.Right
+                  });
+                  // Find the vulnerability for this line - normalize paths for comparison
+                  const normalizePath = (p: string): string => {
+                    if (!p) return '';
+                    const normalized = path.normalize(p.trim());
+                    if (workspaceRoot && !path.isAbsolute(normalized)) {
+                      return path.join(workspaceRoot, normalized);
+                    }
+                    return normalized;
+                  };
+                  
+                  const normalizedFilePath = normalizePath(filePath);
+                  const vulnerability = lastScanResults.find((r: any) => {
+                    const rPath = normalizePath(r.path || r.filename || '');
+                    const rLine = r.start?.line || r.line_number || 0;
+                    // Match by normalized path and line number (allow ±1 line tolerance)
+                    return rPath === normalizedFilePath && Math.abs(rLine - validLineNumber) <= 1;
+                  });
+                  
+                  editor.setDecorations(decorationType, [lineRange]);
+                  
+                  // Store vulnerability info for CodeLens (no notification popup)
+                  highlightedVulnerabilities.set(`${filePath}:${validLineNumber}`, {
+                    filePath,
+                    lineNumber: validLineNumber,
+                    vulnerability,
+                    document: document.uri.toString()
+                  });
+                  
+                  // Trigger CodeLens refresh to show Explain button above the line
+                  setTimeout(() => {
+                    vulnerabilityCodeLensProvider.refresh();
+                  }, 100);
                     
-                    // Add a decoration to highlight the line
-                    const decorationType = vscode.window.createTextEditorDecorationType({
-                      backgroundColor: new vscode.ThemeColor('editor.selectionBackground'),
-                      isWholeLine: true
-                    });
-                    editor.setDecorations(decorationType, [lineRange]);
-                    
-                    // Remove decoration after 3 seconds
+                    // Remove decoration after 5 seconds
                     setTimeout(() => {
                       decorationType.dispose();
-                    }, 3000);
+                    }, 5000);
                     
                     // Ensure results panel stays visible on right side after opening file
                     if (resultsPanel) {
                       resultsPanel.reveal(vscode.ViewColumn.Two, false);
                     }
                     
-                    logger?.info('File opened and highlighted', { filePath, lineNumber });
+                    logger?.info('File opened and highlighted', { filePath, lineNumber: validLineNumber, vulnerabilityFound: !!vulnerability });
                   },
                   (showError) => {
                     logger?.error('Failed to display file', showError as Error);
@@ -4909,10 +5035,6 @@ export function activate(context: vscode.ExtensionContext) {
             logger?.error('Error opening file', error as Error);
             vscode.window.showErrorMessage(`Error opening file: ${error.message}`);
           }
-        } else {
-          logger?.warn('openFile: No file path provided');
-          vscode.window.showWarningMessage('No file path provided');
-        }
       } else if (message.command === 'explainVulnerability') {
         const idx = message.index;
         const issue = lastScanResults[idx];
@@ -5188,6 +5310,135 @@ Please provide:
     vscode.window.showInformationMessage(
       `Recent Team Vulnerability Reports:\n\n${reportSummary}`
     );
+  });
+
+  // Command: Lookup CVE
+  let lookupCVEDisposable = vscode.commands.registerCommand('ciphermate.lookupCVE', async () => {
+    const cveId = await vscode.window.showInputBox({
+      prompt: 'Enter CVE ID (e.g., CVE-2024-1234)',
+      placeHolder: 'CVE-2024-1234',
+      validateInput: (value) => {
+        if (!value) {
+          return 'CVE ID is required';
+        }
+        const cveRegex = /^CVE-\d{4}-\d{4,}$/i;
+        if (!cveRegex.test(value.trim())) {
+          return 'Invalid CVE format. Expected: CVE-YYYY-NNNNN';
+        }
+        return null;
+      },
+    });
+
+    if (!cveId) {
+      return;
+    }
+
+    const normalizedCveId = cveId.trim().toUpperCase();
+    
+    try {
+      vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Looking up ${normalizedCveId}...`,
+          cancellable: false,
+        },
+        async (progress) => {
+          const { cveLookupService } = await import('./scanners/cve-lookup-service');
+          const cveData = await cveLookupService.lookupCVE(normalizedCveId);
+
+          if (!cveData) {
+            vscode.window.showWarningMessage(
+              `CVE ${normalizedCveId} not found in the database.`,
+              'Open in Browser'
+            ).then((action) => {
+              if (action === 'Open in Browser') {
+                vscode.env.openExternal(vscode.Uri.parse(`https://nvd.nist.gov/vuln/detail/${normalizedCveId}`));
+              }
+            });
+            return;
+          }
+
+          // Display CVE details in a webview panel
+          const panel = vscode.window.createWebviewPanel(
+            'cveDetails',
+            `CVE ${normalizedCveId}`,
+            vscode.ViewColumn.One,
+            { enableScripts: true }
+          );
+
+          const cvssInfo = cveData.cvss?.v3 || cveData.cvss?.v2;
+          const cvssScore = cvssInfo ? `${cvssInfo.score} (${cvssInfo.severity})` : 'Not available';
+          
+          panel.webview.html = `
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <style>
+                body {
+                  font-family: var(--vscode-font-family);
+                  padding: 20px;
+                  color: var(--vscode-foreground);
+                  background: var(--vscode-editor-background);
+                }
+                h1 { color: var(--vscode-textLink-foreground); margin-top: 0; }
+                .section { margin: 20px 0; padding: 15px; background: var(--vscode-panel-background); border: 1px solid var(--vscode-panel-border); }
+                .label { font-weight: bold; color: var(--vscode-descriptionForeground); }
+                .value { margin-top: 5px; }
+                .cvss { font-size: 24px; font-weight: bold; color: var(--vscode-textLink-foreground); }
+                a { color: var(--vscode-textLink-foreground); }
+              </style>
+            </head>
+            <body>
+              <h1>${cveData.id}</h1>
+              
+              <div class="section">
+                <div class="label">CVSS Score</div>
+                <div class="cvss">${cvssScore}</div>
+              </div>
+              
+              ${cveData.description ? `
+              <div class="section">
+                <div class="label">Description</div>
+                <div class="value">${cveData.description}</div>
+              </div>
+              ` : ''}
+              
+              ${cveData.published ? `
+              <div class="section">
+                <div class="label">Published</div>
+                <div class="value">${new Date(cveData.published).toLocaleDateString()}</div>
+              </div>
+              ` : ''}
+              
+              ${cveData.remediation ? `
+              <div class="section">
+                <div class="label">Remediation</div>
+                <div class="value">${cveData.remediation.replace(/\n/g, '<br>')}</div>
+              </div>
+              ` : ''}
+              
+              ${cveData.references && cveData.references.length > 0 ? `
+              <div class="section">
+                <div class="label">References</div>
+                <div class="value">
+                  ${cveData.references.map((ref: string) => `<a href="${ref}" target="_blank">${ref}</a>`).join('<br>')}
+                </div>
+              </div>
+              ` : ''}
+              
+              <div class="section">
+                <a href="https://nvd.nist.gov/vuln/detail/${normalizedCveId}" target="_blank">View on NVD</a>
+              </div>
+            </body>
+            </html>
+          `;
+        }
+      );
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to lookup CVE: ${error.message}`);
+    }
   });
 
   // Command: Intelligent RAG-Powered Security Scan
@@ -5565,6 +5816,105 @@ Return a security suggestion if there's an issue, or null if safe:
     { scheme: 'file' },
     inlineSuggestionProvider
   );
+
+  // Register CodeLens provider for Explain buttons
+  const codeLensDisposable = vscode.languages.registerCodeLensProvider(
+    { scheme: 'file' },
+    vulnerabilityCodeLensProvider
+  );
+
+  // Command: Explain line (triggered by CodeLens)
+  let explainLineDisposable = vscode.commands.registerCommand('ciphermate.explainLine', async (filePath: string, lineNumber: number, vulnerability: any | null) => {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    let normalizedPath = filePath;
+    
+    // Normalize path
+    if (workspaceRoot && !path.isAbsolute(filePath)) {
+      normalizedPath = path.join(workspaceRoot, filePath);
+    }
+    
+    try {
+      const uri = vscode.Uri.file(normalizedPath);
+      const document = await vscode.workspace.openTextDocument(uri);
+      const codeContext = getCodeContext(normalizedPath, lineNumber);
+      const vulnerabilityType = vulnerability ? detectVulnerabilityType(vulnerability) : 'Security Issue';
+      
+      let explainPrompt: string;
+      if (vulnerability) {
+        // Explain specific vulnerability
+        explainPrompt = `
+As a security expert, provide a brief explanation of this vulnerability:
+
+Vulnerability: ${vulnerability.extra?.message || vulnerability.issue_text || vulnerability.check_id || 'Security issue'}
+File: ${vulnerability.path || vulnerability.filename}
+Line: ${vulnerability.start?.line || vulnerability.line_number || 1}
+Severity: ${vulnerability.extra?.severity || vulnerability.severity || 'Unknown'}
+Type: ${vulnerabilityType}
+
+Code Context:
+${codeContext}
+
+Provide a concise explanation (2-3 sentences) of what this vulnerability is and why it's dangerous.
+        `;
+      } else {
+        // Explain code at this line (general security analysis)
+        const lineText = document.lineAt(Math.max(0, lineNumber - 1)).text;
+        explainPrompt = `
+As a security expert, analyze this line of code for potential security issues:
+
+File: ${normalizedPath}
+Line: ${lineNumber}
+Code: ${lineText}
+
+Code Context:
+${codeContext}
+
+Provide a brief security analysis (2-3 sentences) of this code line, highlighting any potential security concerns.
+        `;
+      }
+        
+      callLmStudio(explainPrompt).then((response) => {
+        // Show explanation in a webview panel or notification
+        if (resultsPanel) {
+          resultsPanel.webview.postMessage({
+            command: 'showExplanation',
+            title: `Security Explanation - ${vulnerabilityType}`,
+            text: response
+          });
+          resultsPanel.reveal(vscode.ViewColumn.Two, false);
+        } else {
+          vscode.window.showInformationMessage(
+            `${vulnerabilityType}: ${response.substring(0, 200)}${response.length > 200 ? '...' : ''}`,
+            'View Full Explanation'
+          ).then((viewAction) => {
+            if (viewAction === 'View Full Explanation') {
+              vscode.commands.executeCommand('ciphermate.showResults');
+            }
+          });
+        }
+      }).catch((error) => {
+        let fallbackExplanation: string;
+        if (vulnerability) {
+          fallbackExplanation = getFallbackExplanation(vulnerability, vulnerabilityType);
+        } else {
+          fallbackExplanation = `This line of code may contain security concerns. Review the code carefully for common vulnerabilities like injection attacks, insecure deserialization, or improper access control.`;
+        }
+        
+        if (resultsPanel) {
+          resultsPanel.webview.postMessage({
+            command: 'showExplanation',
+            title: `Security Explanation - ${vulnerabilityType}`,
+            text: fallbackExplanation
+          });
+          resultsPanel.reveal(vscode.ViewColumn.Two, false);
+        } else {
+          vscode.window.showInformationMessage(fallbackExplanation.substring(0, 200));
+        }
+      });
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to explain line: ${error.message}`);
+    }
+  });
 
   // Initialize active code reviewer
   activeCodeReviewer = new ActiveCodeReviewer();
@@ -6155,7 +6505,10 @@ Return a security suggestion if there's an issue, or null if safe:
     applySelectedFixDisposable,
     undoLastFixDisposable,
     batchFixDisposable,
-    showFixHistoryDisposable
+    showFixHistoryDisposable,
+    lookupCVEDisposable,
+    codeLensDisposable,
+    explainLineDisposable
   );
 }
 
@@ -10285,16 +10638,20 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
                     severityClass = 'severity-medium';
                 }
                 
-                const filePath = (r.path || r.filename || '').trim();
-                const lineNumber = r.start?.line || r.line_number || 0;
+                const filePath = (r.path || r.filename || r.file || '').trim();
+                // Extract line number from multiple possible fields
+                const lineNumber = r.start?.line || r.line || r.line_number || (r.start ? r.start.line : null) || 0;
                 // Format file path with line number: /path/to/file.js:42
                 const fileLine = filePath ? \`\${filePath}\${lineNumber > 0 ? ':' + lineNumber : ''}\` : 'No file path';
-                const desc = (r.extra && r.extra.message) || r.issue_text || r.check_id || r.message || 'Security issue detected';
+                const desc = (r.extra && r.extra.message) || r.issue_text || r.check_id || r.message || r.description || 'Security issue detected';
                 const tool = r.tool || 'Unknown';
                 
                 // Only make file path clickable if it's valid - use mousedown to prevent accidental triggers
+                // Fix: Use actual lineNumber if > 0, otherwise default to 1 for navigation
+                const validLineNumber = lineNumber > 0 ? lineNumber : 1;
+                console.log('Rendering vulnerability:', { filePath, lineNumber, validLineNumber, hasStart: !!r.start });
                 const fileLinkHtml = filePath && filePath !== '' && filePath !== 'undefined' && filePath !== 'null'
-                  ? \`<a href="#" class="result-file" onmousedown="event.preventDefault(); openFile('\${filePath.replace(/'/g, "\\'")}', \${lineNumber || 1}); return false;" onclick="return false;">\${fileLine}</a>\`
+                  ? \`<a href="#" class="result-file" onmousedown="event.preventDefault(); console.log('Opening file:', '\${filePath.replace(/'/g, "\\'")}', \${validLineNumber}); openFile('\${filePath.replace(/'/g, "\\'")}', \${validLineNumber}); return false;" onclick="return false;">\${fileLine}</a>\`
                   : \`<span class="result-file" style="color: var(--vscode-descriptionForeground);">\${fileLine}</span>\`;
                 
                 html += \`
@@ -10630,11 +10987,18 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
                 return;
             }
             
-            // Ensure line number is valid
-            const line = parseInt(lineNumber) || 1;
-            if (line < 1) {
-                console.warn('openFile: Invalid line number', lineNumber);
-                return;
+            // Ensure line number is valid - use actual lineNumber if provided and > 0, otherwise default to 1
+            let line = 1;
+            if (lineNumber !== undefined && lineNumber !== null && lineNumber !== '') {
+                const parsed = parseInt(lineNumber, 10);
+                console.log('openFile: Parsing line number', { original: lineNumber, parsed, isNaN: isNaN(parsed) });
+                if (!isNaN(parsed) && parsed > 0) {
+                    line = parsed;
+                } else {
+                    console.warn('openFile: Invalid line number, using 1', { lineNumber, parsed });
+                }
+            } else {
+                console.warn('openFile: No line number provided, using 1', { lineNumber });
             }
             
             console.log('openFile: Opening file', filePath, 'at line', line);

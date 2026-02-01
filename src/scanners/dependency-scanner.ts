@@ -10,6 +10,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { BaseScanner } from './base-scanner';
 import { ScanResult, Vulnerability, Severity } from './types';
+import { cveLookupService } from './cve-lookup-service';
 
 const execAsync = promisify(exec);
 
@@ -69,6 +70,9 @@ export class DependencyScanner extends BaseScanner {
         const fileVulns = await this.scanDependencyFile(file);
         vulnerabilities.push(...fileVulns);
       }
+
+      // Enrich vulnerabilities with CVE data
+      await this.enrichWithCVEData(vulnerabilities);
 
       return {
         scanner: this.getName(),
@@ -279,6 +283,76 @@ export class DependencyScanner extends BaseScanner {
     if (normalized.includes('medium') || normalized.includes('moderate')) return 'medium';
     if (normalized.includes('low')) return 'low';
     return 'info';
+  }
+
+  /**
+   * Enrich vulnerabilities with CVE data
+   */
+  private async enrichWithCVEData(vulnerabilities: Vulnerability[]): Promise<void> {
+    // Collect all CVE IDs
+    const cveIds: string[] = [];
+    const vulnCveMap = new Map<Vulnerability, string[]>();
+
+    for (const vuln of vulnerabilities) {
+      if (vuln.cve && vuln.cve.length > 0) {
+        cveIds.push(...vuln.cve);
+        vulnCveMap.set(vuln, vuln.cve);
+      }
+    }
+
+    if (cveIds.length === 0) {
+      return;
+    }
+
+    // Lookup all CVEs
+    const cveDataMap = await cveLookupService.lookupMultipleCVEs([...new Set(cveIds)]);
+
+    // Enrich vulnerabilities with CVE data
+    for (const [vuln, cveIds] of vulnCveMap.entries()) {
+      const enrichedCVEs: string[] = [];
+      const cveReferences: string[] = [];
+
+      for (const cveId of cveIds) {
+        const cveData = cveDataMap.get(cveId);
+        if (cveData) {
+          enrichedCVEs.push(cveId);
+          
+          // Add CVSS score to description if available
+          if (cveData.cvss?.v3 || cveData.cvss?.v2) {
+            const cvss = cveData.cvss.v3 || cveData.cvss.v2;
+            if (cvss) {
+              const existingDesc = vuln.description || '';
+              vuln.description = `${existingDesc}\n\nCVE ${cveId}: CVSS ${cvss.score} (${cvss.severity})`;
+            }
+          }
+
+          // Add remediation if not already present
+          if (cveData.remediation && !vuln.fix) {
+            vuln.fix = cveData.remediation;
+          }
+
+          // Add references
+          if (cveData.references) {
+            cveReferences.push(...cveData.references);
+          }
+        }
+      }
+
+      // Update CVE list and references
+      if (enrichedCVEs.length > 0) {
+        vuln.cve = enrichedCVEs;
+      }
+      
+      if (cveReferences.length > 0) {
+        vuln.references = [...(vuln.references || []), ...cveReferences];
+      }
+
+      // Add CVE data to metadata
+      if (!vuln.metadata) {
+        vuln.metadata = {};
+      }
+      vuln.metadata.cveEnriched = true;
+    }
   }
 }
 

@@ -9,4 +9,5 @@ export * from './secrets-scanner';
 export * from './smart-contract-scanner';
 export * from './code-pattern-scanner';
 export * from './repository-scanner';
+export * from './cve-lookup-service';
 

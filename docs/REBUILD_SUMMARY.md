@@ -119,21 +119,26 @@ src/scanners/
 ## 🚀 Next Steps (TODO)
 
 ### Phase 1: Complete Core Scanners
-1. ⏳ **Smart Contract Scanner**
-   - Port from CipherMate Core
-   - 11 vulnerability detectors
+1. ✅ **Smart Contract Scanner** - COMPLETE
+   - Ported from CipherMate Core
+   - 6 vulnerability detectors (Reentrancy, Access Control, Unchecked Calls, Timestamp Dependence, Weak Randomness, Integer Overflow)
    - Inline diagnostics for `.sol` files
+   - SWC ID mapping
 
-2. ⏳ **Code Pattern Scanner**
+2. ✅ **Code Pattern Scanner** - COMPLETE
    - Enhanced OWASP Top 10 detection
    - SQL injection patterns
    - XSS patterns
-   - CSRF detection
+   - Command injection, Path traversal, Weak cryptography, SSRF, IDOR, and more
+   - 15+ vulnerability patterns
 
-3. ⏳ **CVE Lookup Integration**
-   - Enrich vulnerabilities with CVE data
-   - CVSS scoring
+3. ✅ **CVE Lookup Integration** - COMPLETE
+   - CVE lookup service using NVD and MITRE APIs
+   - Automatic enrichment of dependency vulnerabilities with CVE data
+   - CVSS v2/v3 scoring
    - Remediation guidance
+   - Manual CVE lookup command (`CipherMate: Lookup CVE`)
+   - Caching for performance
 
 ### Phase 2: Advanced Features
 4. ⏳ **SSL/TLS Analyzer**
