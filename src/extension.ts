@@ -1469,6 +1469,19 @@ let resultsPanel: vscode.WebviewPanel | null = null;
 let encryptionKey: Buffer | null = null;
 let activeCodeReviewer: ActiveCodeReviewer | null = null;
 
+// Export functions for use in other modules
+export function getScanDataService(): ScanDataService | null {
+  return scanDataService;
+}
+
+export function setLastScanResults(results: any[]): void {
+  lastScanResults = results;
+}
+
+export async function postResultsToWebviewExported(): Promise<void> {
+  return postResultsToWebview();
+}
+
 // User Authentication System
 interface UserProfile {
   id: string;
@@ -1509,6 +1522,7 @@ let currentUser: UserProfile | null = null;
 let vulnerabilityHistory: VulnerabilityHistory[] = [];
 let currentScanProcess: any = null;
 let isScanning = false;
+let logger: any = null; // Will be initialized in activate()
 
 // Encryption functions
 function generateEncryptionKey(): Buffer {
@@ -1521,22 +1535,34 @@ function getEncryptionKey(context: vscode.ExtensionContext): Buffer {
   const keyPath = path.join(context.globalStorageUri.fsPath, ENCRYPTION_KEY_FILE);
   
   try {
-    if (fs.existsSync(keyPath)) {
-      encryptionKey = fs.readFileSync(keyPath);
-    } else {
-      // Generate new key
-      encryptionKey = generateEncryptionKey();
-      // Ensure directory exists
-      const dir = path.dirname(keyPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(keyPath, encryptionKey);
+    // Ensure directory exists first
+    const dir = path.dirname(keyPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
+    
+    // Try to read existing key
+    if (fs.existsSync(keyPath)) {
+      const keyData = fs.readFileSync(keyPath);
+      // Validate key is correct size (32 bytes for AES-256)
+      if (keyData.length === 32) {
+        encryptionKey = keyData;
+        return encryptionKey;
+      } else {
+        // Invalid key file, regenerate
+        console.warn('Invalid encryption key file detected, regenerating...');
+      }
+    }
+    
+    // Generate new key and save it
+    encryptionKey = generateEncryptionKey();
+    fs.writeFileSync(keyPath, encryptionKey, { mode: 0o600 }); // Secure file permissions
   } catch (error) {
     console.error('Error handling encryption key:', error);
-    // Fallback to a default key (less secure but functional)
-    encryptionKey = crypto.scryptSync('ciphermate-default-key', 'salt', 32);
+    // Use a deterministic fallback key based on storage path to maintain consistency
+    // This ensures the same key is used even if file operations fail
+    const storagePath = context.globalStorageUri.fsPath;
+    encryptionKey = crypto.scryptSync(storagePath + 'ciphermate-stable-key', 'salt-v1', 32);
   }
   
   return encryptionKey;
@@ -1555,18 +1581,40 @@ function encryptData(data: any, context: vscode.ExtensionContext): string {
 
 function decryptData(encryptedData: string, context: vscode.ExtensionContext): any {
   try {
-    const key = getEncryptionKey(context);
+    // Validate encrypted data format
+    if (!encryptedData || typeof encryptedData !== 'string') {
+      return null;
+    }
+    
     const parts = encryptedData.split(':');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      // Invalid format - clear corrupted data
+      return null;
+    }
+    
+    const key = getEncryptionKey(context);
     const iv = Buffer.from(parts[0], 'hex');
     const encrypted = parts[1];
+    
+    // Validate IV and encrypted data are valid hex
+    if (iv.length === 0 || encrypted.length === 0) {
+      return null;
+    }
     
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     
     return JSON.parse(decrypted);
-  } catch (error) {
-    console.error('Error decrypting data:', error);
+  } catch (error: any) {
+    // Silently handle decryption failures - data may be corrupted or key changed
+    // Don't log as error since this is expected when encryption key changes or data is corrupted
+    if (error?.message?.includes('BAD_DECRYPT') || error?.code === 'ERR_OSSL_BAD_DECRYPT') {
+      // This is a known case - corrupted or incompatible encrypted data
+      // Return null to allow fallback to default values
+      return null;
+    }
+    // For other errors, still return null but could log if needed
     return null;
   }
 }
@@ -1587,12 +1635,553 @@ function getSettings(context: vscode.ExtensionContext) {
 }
 
 function updateSettings(context: vscode.ExtensionContext, newSettings: any) {
-  context.globalState.update(SETTINGS_KEY, newSettings);
+context.globalState.update(SETTINGS_KEY, newSettings);
 }
 
-function postResultsToWebview() {
-  if (resultsPanel) {
-    resultsPanel.webview.postMessage({ command: 'updateResults', results: lastScanResults });
+/**
+ * Export comprehensive security audit report
+ */
+async function exportSecurityAudit(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    const workspacePath = workspaceFolders?.[0]?.uri.fsPath || 'Unknown';
+    const workspaceName = workspaceFolders?.[0]?.name || 'Unknown Project';
+    
+    // Helper function to safely convert timestamp to Date
+    const safeDate = (timestamp: any): Date => {
+      if (timestamp instanceof Date) {
+        return timestamp;
+      }
+      if (typeof timestamp === 'number') {
+        return new Date(timestamp);
+      }
+      if (typeof timestamp === 'string') {
+        const parsed = Date.parse(timestamp);
+        return isNaN(parsed) ? new Date() : new Date(parsed);
+      }
+      return new Date();
+    };
+    
+    // Get scan data
+    let results = Array.isArray(lastScanResults) ? lastScanResults : [];
+    let scanStatistics = null;
+    let recentScans: any[] = [];
+    
+    if (scanDataService) {
+      scanStatistics = scanDataService.getStatistics();
+      recentScans = scanDataService.getRecentScans(10);
+      
+      // Ensure timestamps are Date objects
+      recentScans = recentScans.map(scan => ({
+        ...scan,
+        timestamp: safeDate(scan.timestamp)
+      }));
+      
+      if (recentScans.length > 0 && results.length === 0) {
+        const latestScan = recentScans[0];
+        const dbVulns = scanDataService.getVulnerabilities(latestScan.id);
+        results = dbVulns.map(v => ({
+          tool: v.type || 'Unknown',
+          path: v.file,
+          start: { line: v.line || 0 },
+          severity: v.severity?.toUpperCase() || 'INFO',
+          extra: {
+            message: v.description || v.title,
+            severity: v.severity,
+            cwe: v.cwe,
+            cve: v.cve
+          },
+          title: v.title,
+          description: v.description,
+          fix: v.fix,
+          fixable: v.fixable,
+          cwe: v.cwe,
+          cve: v.cve,
+          metadata: v.metadata ? JSON.parse(v.metadata) : {}
+        }));
+      }
+    }
+    
+    // Calculate statistics
+    const stats = {
+      total: results.length,
+      critical: results.filter((r: any) => (r.severity || '').toUpperCase() === 'CRITICAL' || (r.severity || '').toUpperCase() === 'ERROR').length,
+      high: results.filter((r: any) => (r.severity || '').toUpperCase() === 'HIGH' || (r.severity || '').toUpperCase() === 'WARNING').length,
+      medium: results.filter((r: any) => (r.severity || '').toUpperCase() === 'MEDIUM' || (r.severity || '').toUpperCase() === 'INFO').length,
+      low: results.filter((r: any) => (r.severity || '').toUpperCase() === 'LOW').length
+    };
+    
+    // Group by type and file
+    const byType: Record<string, number> = {};
+    const byFile: Record<string, number> = {};
+    
+    results.forEach((r: any) => {
+      const type = r.tool || r.type || 'Unknown';
+      byType[type] = (byType[type] || 0) + 1;
+      
+      const file = r.path || r.filename || 'Unknown';
+      byFile[file] = (byFile[file] || 0) + 1;
+    });
+    
+    // Generate HTML report
+    const reportHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Audit Report - ${workspaceName}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #fff;
+            padding: 40px;
+        }
+        .header {
+            border-bottom: 3px solid #007acc;
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            color: #007acc;
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+        .header .meta {
+            color: #666;
+            font-size: 14px;
+        }
+        .executive-summary {
+            background: #f5f5f5;
+            padding: 25px;
+            border-left: 4px solid #007acc;
+            margin-bottom: 30px;
+        }
+        .executive-summary h2 {
+            color: #007acc;
+            margin-bottom: 15px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .stat-card {
+            background: white;
+            border: 2px solid #ddd;
+            padding: 20px;
+            text-align: center;
+            border-radius: 0;
+        }
+        .stat-card.critical { border-color: #d32f2f; }
+        .stat-card.high { border-color: #f57c00; }
+        .stat-card.medium { border-color: #1976d2; }
+        .stat-card.low { border-color: #666; }
+        .stat-number {
+            font-size: 36px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .stat-card.critical .stat-number { color: #d32f2f; }
+        .stat-card.high .stat-number { color: #f57c00; }
+        .stat-card.medium .stat-number { color: #1976d2; }
+        .stat-card.low .stat-number { color: #666; }
+        .stat-label {
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 1px;
+            color: #666;
+        }
+        .section {
+            margin: 40px 0;
+        }
+        .section h2 {
+            color: #007acc;
+            border-bottom: 2px solid #007acc;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        .vulnerability-item {
+            background: #f9f9f9;
+            border-left: 4px solid #ddd;
+            padding: 15px;
+            margin-bottom: 15px;
+            page-break-inside: avoid;
+        }
+        .vulnerability-item.critical { border-left-color: #d32f2f; }
+        .vulnerability-item.high { border-left-color: #f57c00; }
+        .vulnerability-item.medium { border-left-color: #1976d2; }
+        .vulnerability-item.low { border-left-color: #666; }
+        .vuln-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 10px;
+        }
+        .vuln-title {
+            font-weight: bold;
+            font-size: 16px;
+            color: #333;
+        }
+        .vuln-severity {
+            padding: 4px 12px;
+            border-radius: 0;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .vuln-severity.critical { background: #d32f2f; color: white; }
+        .vuln-severity.high { background: #f57c00; color: white; }
+        .vuln-severity.medium { background: #1976d2; color: white; }
+        .vuln-severity.low { background: #666; color: white; }
+        .vuln-details {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        .vuln-details p {
+            margin: 5px 0;
+        }
+        .vuln-file {
+            font-family: 'Courier New', monospace;
+            color: #007acc;
+            font-weight: bold;
+        }
+        .recommendations {
+            background: #e3f2fd;
+            padding: 20px;
+            border-left: 4px solid #1976d2;
+            margin-top: 30px;
+        }
+        .recommendations h3 {
+            color: #1976d2;
+            margin-bottom: 15px;
+        }
+        .recommendations ul {
+            margin-left: 20px;
+        }
+        .recommendations li {
+            margin: 8px 0;
+        }
+        @media print {
+            body { padding: 20px; }
+            .vulnerability-item { page-break-inside: avoid; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Security Audit Report</h1>
+        <div class="meta">
+            <p><strong>Project:</strong> ${workspaceName}</p>
+            <p><strong>Scan Date:</strong> ${new Date().toLocaleString()}</p>
+            <p><strong>Generated By:</strong> CipherMate Security Scanner</p>
+        </div>
+    </div>
+    
+    <div class="executive-summary">
+        <h2>Executive Summary</h2>
+        <p>This security audit report provides a comprehensive analysis of vulnerabilities identified in the codebase. 
+        The scan identified <strong>${stats.total}</strong> security issues across the repository, with 
+        <strong>${stats.critical}</strong> critical, <strong>${stats.high}</strong> high, 
+        <strong>${stats.medium}</strong> medium, and <strong>${stats.low}</strong> low severity findings.</p>
+        
+        <div class="stats-grid">
+            <div class="stat-card critical">
+                <div class="stat-number">${stats.critical}</div>
+                <div class="stat-label">Critical</div>
+            </div>
+            <div class="stat-card high">
+                <div class="stat-number">${stats.high}</div>
+                <div class="stat-label">High</div>
+            </div>
+            <div class="stat-card medium">
+                <div class="stat-number">${stats.medium}</div>
+                <div class="stat-label">Medium</div>
+            </div>
+            <div class="stat-card low">
+                <div class="stat-number">${stats.low}</div>
+                <div class="stat-label">Low</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">${stats.total}</div>
+                <div class="stat-label">Total</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h2>Detailed Findings</h2>
+        ${results.map((r: any, idx: number) => {
+          const severity = (r.severity || 'INFO').toLowerCase();
+          const severityClass = severity === 'critical' || severity === 'error' ? 'critical' :
+                               severity === 'high' || severity === 'warning' ? 'high' :
+                               severity === 'medium' || severity === 'info' ? 'medium' : 'low';
+          return `
+        <div class="vulnerability-item ${severityClass}">
+            <div class="vuln-header">
+                <div class="vuln-title">${idx + 1}. ${r.title || r.extra?.message || r.description || 'Security Issue'}</div>
+                <span class="vuln-severity ${severityClass}">${(r.severity || 'INFO').toUpperCase()}</span>
+            </div>
+            <div class="vuln-details">
+                <p><strong>Description:</strong> ${r.description || r.extra?.message || 'No description available'}</p>
+                <p><strong>Location:</strong> <span class="vuln-file">${r.path || r.filename || 'Unknown'}:${r.start?.line || r.line_number || 'N/A'}</span></p>
+                ${r.cwe ? `<p><strong>CWE:</strong> ${r.cwe}</p>` : ''}
+                ${r.cve ? `<p><strong>CVE:</strong> ${r.cve}</p>` : ''}
+                ${r.tool ? `<p><strong>Detected By:</strong> ${r.tool}</p>` : ''}
+                ${r.fix ? `<p><strong>Recommended Fix:</strong> ${r.fix}</p>` : ''}
+            </div>
+        </div>`;
+        }).join('')}
+    </div>
+    
+    <div class="section">
+        <h2>Vulnerability Distribution</h2>
+        <h3>By Type</h3>
+        <ul>
+            ${Object.entries(byType).sort((a, b) => b[1] - a[1]).map(([type, count]) => 
+              `<li><strong>${type}:</strong> ${count} finding(s)</li>`
+            ).join('')}
+        </ul>
+        
+        <h3 style="margin-top: 20px;">Top Affected Files</h3>
+        <ul>
+            ${Object.entries(byFile).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([file, count]) => 
+              `<li><strong>${file}:</strong> ${count} finding(s)</li>`
+            ).join('')}
+        </ul>
+    </div>
+    
+    <div class="recommendations">
+        <h3>Recommendations</h3>
+        <ul>
+            <li>Address all <strong>Critical</strong> and <strong>High</strong> severity issues immediately</li>
+            <li>Review and remediate medium severity issues within 30 days</li>
+            <li>Implement secure coding practices and regular security scanning</li>
+            <li>Establish a vulnerability management process</li>
+            <li>Conduct regular security training for development teams</li>
+            <li>Consider implementing automated security testing in CI/CD pipeline</li>
+        </ul>
+    </div>
+    
+    <div style="margin-top: 40px; padding-top: 20px; border-top: 2px solid #ddd; text-align: center; color: #666; font-size: 12px;">
+        <p>Report generated by CipherMate Security Scanner</p>
+        <p>© ${new Date().getFullYear()} CipherMate. All rights reserved.</p>
+    </div>
+</body>
+</html>`;
+    
+    // Save report
+    const reportPath = path.join(workspacePath, `security-audit-${Date.now()}.html`);
+    fs.writeFileSync(reportPath, reportHtml, 'utf8');
+    
+    // Open the report
+    const uri = vscode.Uri.file(reportPath);
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document);
+    
+    // Offer to save as PDF (user can use browser print)
+    const action = await vscode.window.showInformationMessage(
+      `Security audit report generated successfully!`,
+      'Open in Browser',
+      'OK'
+    );
+    
+    if (action === 'Open in Browser') {
+      vscode.env.openExternal(uri);
+    }
+    
+    logger?.info('Security audit report exported', { reportPath, vulnerabilityCount: results.length });
+  } catch (error: any) {
+    logger?.error('Failed to export security audit', error as Error);
+    vscode.window.showErrorMessage(`Failed to export security audit: ${error.message}`);
+  }
+}
+
+/**
+ * Show notification asking user to review dashboard after scan
+ */
+async function promptReviewDashboard(scanType: string, resultCount: number, criticalCount: number = 0) {
+  const message = resultCount > 0 
+    ? `Scan complete: ${resultCount} ${resultCount === 1 ? 'issue' : 'issues'} found${criticalCount > 0 ? ` (${criticalCount} critical)` : ''}. Review dashboard?`
+    : `Scan complete: No issues found. Review dashboard?`;
+  
+  const action = await vscode.window.showInformationMessage(
+    message,
+    'View Dashboard',
+    'Dismiss'
+  );
+  
+  if (action === 'View Dashboard') {
+    await vscode.commands.executeCommand('ciphermate.showResults');
+  }
+}
+
+async function postResultsToWebview() {
+  // Only update if panel already exists - don't auto-open
+  if (!resultsPanel || !resultsPanel.webview) {
+    logger?.info('Results panel not open, skipping update (user can open manually)');
+    return;
+  }
+  
+  try {
+    // Load scan data - prioritize lastScanResults (current scan), fallback to database
+    let results = Array.isArray(lastScanResults) ? lastScanResults : [];
+    let recentScans: any[] = [];
+    let latestScanInfo = null;
+    
+    logger?.info('postResultsToWebview: Starting', { 
+      lastScanResultsLength: lastScanResults.length,
+      hasScanDataService: !!scanDataService
+    });
+    
+    if (scanDataService) {
+      try {
+        // Get recent scans for history
+        recentScans = scanDataService.getRecentScans(10);
+        
+        logger?.info('postResultsToWebview: Got recent scans', { 
+          recentScansCount: recentScans.length,
+          currentResultsLength: results.length
+        });
+        
+        // Don't auto-load from database - show empty state if no current scan
+        // Database results should only be shown when user explicitly requests them (e.g., via Scan History)
+        if (recentScans.length > 0 && results.length === 0) {
+          // Store latest scan info for reference but don't load results
+          latestScanInfo = recentScans[0];
+          logger?.info('No current scan results - showing empty state. Latest scan available:', {
+            scanId: latestScanInfo.id,
+            timestamp: latestScanInfo.timestamp
+          });
+        } else if (recentScans.length > 0 && results.length > 0) {
+          // We have current results, store latest scan info for reference
+          latestScanInfo = recentScans[0];
+        }
+      } catch (error) {
+        logger?.error('Failed to load scan data from database', error as Error);
+        // Fallback to lastScanResults
+      }
+    }
+    
+    logger?.info('postResultsToWebview: After loading', { 
+      resultsLength: results.length,
+      hasLatestScanInfo: !!latestScanInfo
+    });
+    
+    // Ensure we have valid results array
+    if (!Array.isArray(results)) {
+      results = [];
+    }
+    
+    // Enhance results with detected vulnerability types for better categorization
+    results = results.map(r => {
+      // Detect vulnerability type if not already set
+      if (!r.vulnerabilityType) {
+        try {
+          r.vulnerabilityType = detectVulnerabilityType(r);
+        } catch (error) {
+          // Fallback to existing type or tool name
+          r.vulnerabilityType = r.type || r.check_id || r.tool || 'Security Issue';
+        }
+      }
+      return r;
+    });
+    
+    // Calculate statistics from CURRENT scan results only (not aggregated)
+    const currentScanStatistics = {
+      totalVulnerabilities: results.length,
+      criticalCount: results.filter((r: any) => {
+        const s = (r.severity || '').toUpperCase();
+        return s === 'CRITICAL' || s === 'ERROR';
+      }).length,
+      highCount: results.filter((r: any) => {
+        const s = (r.severity || '').toUpperCase();
+        return s === 'HIGH' || s === 'WARNING';
+      }).length,
+      mediumCount: results.filter((r: any) => {
+        const s = (r.severity || '').toUpperCase();
+        return s === 'MEDIUM' || s === 'INFO';
+      }).length,
+      lowCount: results.filter((r: any) => {
+        const s = (r.severity || '').toUpperCase();
+        return s === 'LOW';
+      }).length,
+      latestScan: latestScanInfo
+    };
+    
+    logger?.info('Posting results to webview', { 
+      resultCount: results.length,
+      currentScanStats: currentScanStatistics,
+      hasRecentScans: recentScans.length > 0,
+      panelExists: !!resultsPanel,
+      webviewExists: !!resultsPanel?.webview
+    });
+    
+    // Ensure webview is available
+    if (!resultsPanel || !resultsPanel.webview) {
+      logger?.warn('Cannot post to webview - panel or webview not available');
+      return;
+    }
+    
+    // Get vulnerability analysis for charts and trends
+    let vulnerabilityAnalysis = null;
+    if (scanDataService) {
+      try {
+        vulnerabilityAnalysis = scanDataService.getVulnerabilityAnalysis(30);
+        logger?.info('Loaded vulnerability analysis', {
+          hasTrends: !!(vulnerabilityAnalysis?.trends?.length),
+          trendsCount: vulnerabilityAnalysis?.trends?.length || 0
+        });
+      } catch (error) {
+        logger?.warn('Failed to load vulnerability analysis', error as Error);
+      }
+    }
+    
+    // Send comprehensive data to webview (using current scan statistics, not aggregated)
+    try {
+      const message = { 
+        command: 'updateResults', 
+        results: results,
+        scanStatistics: currentScanStatistics, // Use current scan stats, not aggregated
+        recentScans: recentScans,
+        vulnerabilityAnalysis: vulnerabilityAnalysis // Include analysis for charts and trends
+      };
+      
+      logger?.info('Posting message to webview', { 
+        resultCount: results.length,
+        hasPanel: !!resultsPanel,
+        hasWebview: !!resultsPanel?.webview,
+        messageSize: JSON.stringify(message).length
+      });
+      
+      if (!resultsPanel || !resultsPanel.webview) {
+        logger?.error('Cannot post message - panel or webview is null');
+        return;
+      }
+      
+      resultsPanel.webview.postMessage(message);
+      logger?.info('Successfully posted message to webview', { 
+        resultCount: results.length,
+        messageSize: JSON.stringify(message).length
+      });
+    } catch (error) {
+      logger?.error('Failed to post message to webview', error as Error);
+      console.error('Error posting to webview:', error);
+      throw error;
+    }
+  } catch (error) {
+    logger?.error('Failed to post results to webview', error as Error);
+    // Fallback to basic results
+    if (resultsPanel) {
+      const fallbackResults = Array.isArray(lastScanResults) ? lastScanResults : [];
+      resultsPanel.webview.postMessage({ 
+        command: 'updateResults', 
+        results: fallbackResults 
+      });
+    }
   }
 }
 
@@ -2390,9 +2979,19 @@ async function loadUserProfile(context: vscode.ExtensionContext): Promise<UserPr
     if (!encryptedProfile || typeof encryptedProfile !== 'string') {
       return null;
     }
-    return decryptData(encryptedProfile, context);
+    const profile = decryptData(encryptedProfile, context);
+    if (!profile) {
+      // Clear corrupted data
+      await context.workspaceState.update('ciphermate.userProfile', undefined);
+    }
+    return profile;
   } catch (error) {
-    console.error('Load user profile error:', error);
+    // Clear corrupted data on error
+    try {
+      await context.workspaceState.update('ciphermate.userProfile', undefined);
+    } catch (clearError) {
+      // Ignore errors when clearing
+    }
     return null;
   }
 }
@@ -2440,9 +3039,20 @@ async function loadVulnerabilityHistory(context: vscode.ExtensionContext): Promi
     if (!encryptedHistory || typeof encryptedHistory !== 'string') {
       return [];
     }
-    return decryptData(encryptedHistory, context) || [];
+    const history = decryptData(encryptedHistory, context);
+    if (!history) {
+      // Clear corrupted data
+      await context.workspaceState.update('ciphermate.vulnerabilityHistory', undefined);
+      return [];
+    }
+    return history || [];
   } catch (error) {
-    console.error('Load vulnerability history error:', error);
+    // Clear corrupted data on error
+    try {
+      await context.workspaceState.update('ciphermate.vulnerabilityHistory', undefined);
+    } catch (clearError) {
+      // Ignore errors when clearing
+    }
     return [];
   }
 }
@@ -3035,9 +3645,19 @@ function loadDeveloperProfile(context: vscode.ExtensionContext): DeveloperProfil
   
   try {
     const profile = decryptData(encrypted, context);
-    return profile || createNewDeveloperProfile();
+    if (!profile) {
+      // Decryption failed - clear corrupted data and create new profile
+      context.globalState.update(MEMORY_KEY, '');
+      return createNewDeveloperProfile();
+    }
+    return profile;
   } catch (e) {
-    console.error('Failed to load developer profile:', e);
+    // Clear corrupted data on any error
+    try {
+      context.globalState.update(MEMORY_KEY, '');
+    } catch (clearError) {
+      // Ignore errors when clearing
+    }
     return createNewDeveloperProfile();
   }
 }
@@ -3166,19 +3786,282 @@ function getPersonalizedPrompt(basePrompt: string, vulnerabilityType: string, co
   return personalizedPrompt;
 }
 
-function detectVulnerabilityType(issue: any): string {
-  const description = (issue.extra?.message || issue.issue_text || issue.check_id || '').toLowerCase();
+export function detectVulnerabilityType(issue: any): string {
+  // Get all available text fields for comprehensive detection
+  const description = (issue.extra?.message || issue.issue_text || issue.check_id || issue.description || issue.title || '').toLowerCase();
+  const checkId = (issue.check_id || issue.type || '').toLowerCase();
+  const tool = (issue.tool || '').toLowerCase();
+  const code = (issue.code || '').toLowerCase();
   
-  if (description.includes('sql') || description.includes('injection')) {return 'sql_injection';}
-  if (description.includes('xss') || description.includes('cross-site')) {return 'xss';}
-  if (description.includes('authentication') || description.includes('auth')) {return 'authentication';}
-  if (description.includes('authorization') || description.includes('permission')) {return 'authorization';}
-  if (description.includes('input') || description.includes('validation')) {return 'input_validation';}
-  if (description.includes('password') || description.includes('credential')) {return 'credential_management';}
-  if (description.includes('encryption') || description.includes('crypto')) {return 'encryption';}
-  if (description.includes('session') || description.includes('token')) {return 'session_management';}
+  // Combine all text for comprehensive matching
+  const combinedText = `${description} ${checkId} ${tool} ${code}`;
   
-  return 'general_security';
+  // SQL Injection - comprehensive detection
+  if (combinedText.includes('sql') && (combinedText.includes('injection') || combinedText.includes('query') || combinedText.includes('concatenat'))) {
+    return 'SQL Injection';
+  }
+  if (combinedText.includes('nosql') && combinedText.includes('injection')) {
+    return 'NoSQL Injection';
+  }
+  
+  // XSS - comprehensive detection
+  if (combinedText.includes('xss') || combinedText.includes('cross-site scripting') || 
+      combinedText.includes('cross site') || combinedText.includes('innerhtml') ||
+      combinedText.includes('dangerouslysetinnerhtml') || combinedText.includes('eval(') ||
+      (combinedText.includes('dom') && combinedText.includes('manipulation'))) {
+    return 'Cross-Site Scripting (XSS)';
+  }
+  
+  // Command Injection
+  if (combinedText.includes('command injection') || combinedText.includes('cmd injection') ||
+      combinedText.includes('os command') || combinedText.includes('shell injection') ||
+      combinedText.includes('exec(') || combinedText.includes('system(') ||
+      combinedText.includes('popen(') || combinedText.includes('subprocess')) {
+    return 'Command Injection';
+  }
+  
+  // Path Traversal
+  if (combinedText.includes('path traversal') || combinedText.includes('directory traversal') ||
+      combinedText.includes('../') || combinedText.includes('..\\') ||
+      combinedText.includes('file inclusion') || combinedText.includes('lfi') ||
+      combinedText.includes('rfi')) {
+    return 'Path Traversal / Directory Traversal';
+  }
+  
+  // Authentication Issues
+  if (combinedText.includes('authentication bypass') || combinedText.includes('auth bypass') ||
+      combinedText.includes('weak authentication') || combinedText.includes('missing authentication') ||
+      combinedText.includes('broken authentication')) {
+    return 'Authentication Bypass';
+  }
+  if (combinedText.includes('brute force') || combinedText.includes('rate limit') ||
+      combinedText.includes('account lockout')) {
+    return 'Authentication Weakness';
+  }
+  
+  // Authorization Issues
+  if (combinedText.includes('authorization') || combinedText.includes('permission') ||
+      combinedText.includes('access control') || combinedText.includes('privilege') ||
+      combinedText.includes('idor') || combinedText.includes('insecure direct object')) {
+    return 'Authorization / Access Control';
+  }
+  
+  // Input Validation
+  if (combinedText.includes('input validation') || combinedText.includes('unsanitized input') ||
+      combinedText.includes('unvalidated input') || combinedText.includes('tainted data') ||
+      combinedText.includes('user input')) {
+    return 'Input Validation';
+  }
+  
+  // Credential Management
+  if (combinedText.includes('password') || combinedText.includes('credential') ||
+      combinedText.includes('hardcoded') || combinedText.includes('secret') ||
+      combinedText.includes('api key') || combinedText.includes('api_token') ||
+      combinedText.includes('private key') || combinedText.includes('private_key') ||
+      combinedText.includes('aws_access') || combinedText.includes('bearer token')) {
+    if (combinedText.includes('weak') || combinedText.includes('plaintext') || combinedText.includes('hardcoded')) {
+      return 'Weak Credential Management';
+    }
+    return 'Credential Management';
+  }
+  
+  // Encryption & Cryptography
+  if (combinedText.includes('encryption') || combinedText.includes('crypto') ||
+      combinedText.includes('cipher') || combinedText.includes('hash')) {
+    if (combinedText.includes('weak') || combinedText.includes('md5') || combinedText.includes('sha1') ||
+        combinedText.includes('des') || combinedText.includes('rc4') || combinedText.includes('ssl') ||
+        combinedText.includes('tls') && combinedText.includes('weak')) {
+      return 'Weak Cryptography';
+    }
+    return 'Cryptography / Encryption';
+  }
+  
+  // Session Management
+  if (combinedText.includes('session') || combinedText.includes('token') ||
+      combinedText.includes('cookie') || combinedText.includes('jwt')) {
+    if (combinedText.includes('fixation') || combinedText.includes('hijack') ||
+        combinedText.includes('weak') || combinedText.includes('insecure')) {
+      return 'Session Management Weakness';
+    }
+    return 'Session Management';
+  }
+  
+  // SSRF
+  if (combinedText.includes('ssrf') || combinedText.includes('server-side request forgery') ||
+      combinedText.includes('server side request')) {
+    return 'Server-Side Request Forgery (SSRF)';
+  }
+  
+  // CSRF
+  if (combinedText.includes('csrf') || combinedText.includes('cross-site request forgery') ||
+      combinedText.includes('cross site request')) {
+    return 'Cross-Site Request Forgery (CSRF)';
+  }
+  
+  // XXE
+  if (combinedText.includes('xxe') || combinedText.includes('xml external entity') ||
+      combinedText.includes('xml injection')) {
+    return 'XML External Entity (XXE)';
+  }
+  
+  // Deserialization
+  if (combinedText.includes('deserialization') || combinedText.includes('unserialize') ||
+      combinedText.includes('pickle') || combinedText.includes('marshal')) {
+    return 'Insecure Deserialization';
+  }
+  
+  // Race Condition
+  if (combinedText.includes('race condition') || combinedText.includes('time-of-check') ||
+      combinedText.includes('toctou')) {
+    return 'Race Condition / TOCTOU';
+  }
+  
+  // Buffer Overflow
+  if (combinedText.includes('buffer overflow') || combinedText.includes('buffer overrun') ||
+      combinedText.includes('stack overflow') || combinedText.includes('heap overflow')) {
+    return 'Buffer Overflow';
+  }
+  
+  // Integer Overflow
+  if (combinedText.includes('integer overflow') || combinedText.includes('integer underflow') ||
+      combinedText.includes('arithmetic overflow')) {
+    return 'Integer Overflow';
+  }
+  
+  // Format String
+  if (combinedText.includes('format string') || combinedText.includes('printf') ||
+      combinedText.includes('sprintf')) {
+    return 'Format String Vulnerability';
+  }
+  
+  // LDAP Injection
+  if (combinedText.includes('ldap injection') || combinedText.includes('ldap query')) {
+    return 'LDAP Injection';
+  }
+  
+  // XPATH Injection
+  if (combinedText.includes('xpath injection') || combinedText.includes('xpath query')) {
+    return 'XPath Injection';
+  }
+  
+  // HTTP Header Injection
+  if (combinedText.includes('header injection') || combinedText.includes('http header') ||
+      combinedText.includes('response splitting')) {
+    return 'HTTP Header Injection';
+  }
+  
+  // Open Redirect
+  if (combinedText.includes('open redirect') || combinedText.includes('unvalidated redirect') ||
+      combinedText.includes('url redirect')) {
+    return 'Open Redirect';
+  }
+  
+  // Insecure Random
+  if (combinedText.includes('insecure random') || combinedText.includes('weak random') ||
+      combinedText.includes('math.random') || combinedText.includes('predictable random')) {
+    return 'Insecure Random Number Generation';
+  }
+  
+  // Weak Hash
+  if (combinedText.includes('weak hash') || combinedText.includes('md5') ||
+      combinedText.includes('sha1') || combinedText.includes('crc32')) {
+    return 'Weak Hash Algorithm';
+  }
+  
+  // Information Disclosure
+  if (combinedText.includes('information disclosure') || combinedText.includes('information leak') ||
+      combinedText.includes('sensitive data') || combinedText.includes('debug mode') ||
+      combinedText.includes('stack trace') || combinedText.includes('error message')) {
+    return 'Information Disclosure';
+  }
+  
+  // Security Misconfiguration
+  if (combinedText.includes('misconfiguration') || combinedText.includes('default password') ||
+      combinedText.includes('debug enabled') || combinedText.includes('verbose error') ||
+      combinedText.includes('exposed endpoint') || combinedText.includes('cors misconfiguration')) {
+    return 'Security Misconfiguration';
+  }
+  
+  // Insecure Direct Object Reference
+  if (combinedText.includes('idor') || combinedText.includes('insecure direct object reference') ||
+      combinedText.includes('direct object')) {
+    return 'Insecure Direct Object Reference (IDOR)';
+  }
+  
+  // Business Logic Flaw
+  if (combinedText.includes('business logic') || combinedText.includes('logic flaw') ||
+      combinedText.includes('workflow bypass')) {
+    return 'Business Logic Flaw';
+  }
+  
+  // Denial of Service
+  if (combinedText.includes('denial of service') || combinedText.includes('dos') ||
+      combinedText.includes('ddos') || combinedText.includes('resource exhaustion') ||
+      combinedText.includes('reDoS') || combinedText.includes('regex dos')) {
+    return 'Denial of Service (DoS)';
+  }
+  
+  // Code Injection
+  if (combinedText.includes('code injection') || combinedText.includes('remote code execution') ||
+      combinedText.includes('rce') || combinedText.includes('arbitrary code')) {
+    return 'Code Injection / RCE';
+  }
+  
+  // Template Injection
+  if (combinedText.includes('template injection') || combinedText.includes('ssti') ||
+      combinedText.includes('server-side template')) {
+    return 'Server-Side Template Injection (SSTI)';
+  }
+  
+  // File Upload
+  if (combinedText.includes('file upload') || combinedText.includes('unrestricted upload') ||
+      combinedText.includes('malicious file')) {
+    return 'Unrestricted File Upload';
+  }
+  
+  // Insecure Communication
+  if (combinedText.includes('insecure communication') || combinedText.includes('http instead of https') ||
+      combinedText.includes('mixed content') || combinedText.includes('ssl') ||
+      combinedText.includes('tls') && combinedText.includes('weak')) {
+    return 'Insecure Communication';
+  }
+  
+  // Weak Password Policy
+  if (combinedText.includes('weak password') || combinedText.includes('password policy') ||
+      combinedText.includes('password complexity')) {
+    return 'Weak Password Policy';
+  }
+  
+  // Missing Security Headers
+  if (combinedText.includes('security header') || combinedText.includes('csp') ||
+      combinedText.includes('x-frame-options') || combinedText.includes('hsts')) {
+    return 'Missing Security Headers';
+  }
+  
+  // Insecure API
+  if (combinedText.includes('api') && (combinedText.includes('insecure') ||
+      combinedText.includes('unauthenticated') || combinedText.includes('rate limit'))) {
+    return 'Insecure API';
+  }
+  
+  // Dependency Vulnerability
+  if (combinedText.includes('dependency') || combinedText.includes('vulnerable library') ||
+      combinedText.includes('outdated') || combinedText.includes('cve-')) {
+    return 'Vulnerable Dependency';
+  }
+  
+  // Log Injection
+  if (combinedText.includes('log injection') || combinedText.includes('log forging')) {
+    return 'Log Injection';
+  }
+  
+  // Time-based Attack
+  if (combinedText.includes('timing attack') || combinedText.includes('time-based')) {
+    return 'Timing Attack';
+  }
+  
+  // Return generic if no specific match found
+  return 'Security Issue';
 }
 
 // Team Collaboration System
@@ -3262,9 +4145,19 @@ function loadTeamData(context: vscode.ExtensionContext): TeamLead | null {
   if (!encrypted) {return null;}
   
   try {
-    return decryptData(encrypted, context);
+    const data = decryptData(encrypted, context);
+    if (!data) {
+      // Clear corrupted data
+      context.globalState.update(TEAM_DATA_KEY, '');
+    }
+    return data;
   } catch (e) {
-    console.error('Failed to load team data:', e);
+    // Clear corrupted data on error
+    try {
+      context.globalState.update(TEAM_DATA_KEY, '');
+    } catch (clearError) {
+      // Ignore errors when clearing
+    }
     return null;
   }
 }
@@ -3279,9 +4172,20 @@ function loadTeamReports(context: vscode.ExtensionContext): TeamVulnerabilityRep
   if (!encrypted) {return [];}
   
   try {
-    return decryptData(encrypted, context);
+    const data = decryptData(encrypted, context);
+    if (!data) {
+      // Clear corrupted data
+      context.globalState.update(TEAM_REPORTS_KEY, '');
+      return [];
+    }
+    return data || [];
   } catch (e) {
-    console.error('Failed to load team reports:', e);
+    // Clear corrupted data on error
+    try {
+      context.globalState.update(TEAM_REPORTS_KEY, '');
+    } catch (clearError) {
+      // Ignore errors when clearing
+    }
     return [];
   }
 }
@@ -3366,7 +4270,7 @@ function updateTeamMemberProgress(teamMemberId: string, vulnerabilityType: strin
 
 export function activate(context: vscode.ExtensionContext) {
   // Initialize Enterprise Infrastructure
-  const logger = new EnterpriseLogger();
+  logger = new EnterpriseLogger();
   const config = new EnterpriseConfiguration();
   const performanceMonitor = new PerformanceMonitor(logger);
   const errorHandler = new ErrorHandler(logger, config);
@@ -3590,14 +4494,23 @@ export function activate(context: vscode.ExtensionContext) {
       logger.info('Repository scan initiated', { workspacePath });
       
       lastScanResults = await intelligentRepositoryScan(workspacePath, context);
+      
+      logger?.info('Intelligent scan completed', { resultCount: lastScanResults.length });
+      
+      // Save to encrypted storage (legacy support)
       saveEncryptedData(lastScanResults, context);
       await saveVulnerabilityHistory(lastScanResults, 'Intelligent Scan', context);
-      postResultsToWebview();
+      
+      // Update webview with results (only if already open)
+      await postResultsToWebview();
+      
+      // Prompt user to review dashboard
+      const criticalCount = lastScanResults.filter(r => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
+      await promptReviewDashboard('Repository Scan', lastScanResults.length, criticalCount);
       
       if (lastScanResults.length > 0) {
-        const criticalCount = lastScanResults.filter(r => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
-      const highCount = lastScanResults.filter(r => r.severity === 'HIGH' || r.severity === 'WARNING').length;
-      showNotification(NotificationType.VULNERABILITY, `Repository scan: ${lastScanResults.length} issues detected (${criticalCount} critical, ${highCount} high severity)`);
+        const highCount = lastScanResults.filter(r => r.severity === 'HIGH' || r.severity === 'WARNING').length;
+        showNotification(NotificationType.VULNERABILITY, `Repository scan: ${lastScanResults.length} issues detected (${criticalCount} critical, ${highCount} high severity)`);
       } else {
         logger.info('Repository scan completed', { issuesFound: 0 });
       }
@@ -3642,9 +4555,12 @@ export function activate(context: vscode.ExtensionContext) {
       saveEncryptedData(lastScanResults, context);
       postResultsToWebview();
       
+      // Prompt user to review dashboard
+      const criticalCount = lastScanResults.filter(r => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
+      promptReviewDashboard('Semgrep Analysis', lastScanResults.length, criticalCount);
+      
       if (lastScanResults.length > 0) {
-        const criticalCount = lastScanResults.filter(r => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
-      showNotification(NotificationType.VULNERABILITY, `Semgrep analysis: ${lastScanResults.length} security issues detected (${criticalCount} critical)`);
+        showNotification(NotificationType.VULNERABILITY, `Semgrep analysis: ${lastScanResults.length} security issues detected (${criticalCount} critical)`);
       } else {
           logger.info('Semgrep scan completed', { issuesFound: 0 });
       }
@@ -3687,8 +4603,11 @@ export function activate(context: vscode.ExtensionContext) {
         saveEncryptedData(lastScanResults, context);
         postResultsToWebview();
         
+        // Prompt user to review dashboard
+        const criticalCount = lastScanResults.filter((r: any) => r.severity === 'HIGH' || r.severity === 'CRITICAL').length;
+        promptReviewDashboard('Bandit Analysis', lastScanResults.length, criticalCount);
+        
         if (lastScanResults.length > 0) {
-          const criticalCount = lastScanResults.filter((r: any) => r.severity === 'HIGH' || r.severity === 'CRITICAL').length;
           showNotification(NotificationType.VULNERABILITY, `Bandit analysis: ${lastScanResults.length} Python security issues detected (${criticalCount} high/critical)`);
         } else {
           logger.info('Bandit scan completed', { issuesFound: 0 });
@@ -3832,31 +4751,168 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // Command: Show Results Panel (modern webview)
-  let resultsDisposable = vscode.commands.registerCommand('ciphermate.showResults', () => {
+  let resultsDisposable = vscode.commands.registerCommand('ciphermate.showResults', async () => {
+    // If panel already exists, just reveal it and update with latest data
+    if (resultsPanel) {
+      resultsPanel.reveal(vscode.ViewColumn.One, false);
+      // Ensure it's updated with the latest data
+      await postResultsToWebview();
+      return;
+    }
+    
     resultsPanel = vscode.window.createWebviewPanel(
       'ciphermateResults',
       'CipherMate Results',
-      vscode.ViewColumn.One,
+      vscode.ViewColumn.One, // Open in full tab by default
       { 
         enableScripts: true,
-        retainContextWhenHidden: true
+        retainContextWhenHidden: true,
+        localResourceRoots: [context.extensionUri]
       }
     );
-    resultsPanel.webview.html = getResultsPanelHtml();
+    resultsPanel.webview.html = getResultsPanelHtml(context, resultsPanel);
+    
+    // Handle panel disposal
+    resultsPanel.onDidDispose(() => {
+      resultsPanel = null;
+    }, null, context.subscriptions);
+    
     resultsPanel.webview.onDidReceiveMessage(async (message) => {
-      if (message.command === 'refresh') {
+      if (message.command === 'webviewReady') {
+        // Webview is ready, send initial data
+        logger?.info('Results webview ready, sending initial data');
+        await postResultsToWebview();
+      } else if (message.command === 'refresh') {
         // Refresh the results by re-running the last scan or just updating the display
-        postResultsToWebview();
+        await postResultsToWebview();
         showNotification(NotificationType.INFO, 'Results refreshed');
       } else if (message.command === 'scanMe') {
         // Trigger a new scan
         vscode.commands.executeCommand('ciphermate.scan');
       } else if (message.command === 'exportResults') {
-        // Export current results
-        vscode.commands.executeCommand('ciphermate.exportResults');
+        // Export current results as professional security audit
+        await exportSecurityAudit(context);
+      } else if (message.command === 'clear') {
+        // Clear current scan results from display
+        lastScanResults = [];
+        await postResultsToWebview();
+        showNotification(NotificationType.INFO, 'Results cleared');
       } else if (message.command === 'openSettings') {
         // Open settings
         vscode.commands.executeCommand('ciphermate.settings');
+      } else if (message.command === 'loadScan') {
+        // Load a specific scan from database
+        if (scanDataService && message.scanId) {
+          try {
+            const vulns = scanDataService.getVulnerabilities(message.scanId);
+            const results = vulns.map(v => ({
+              tool: v.type || 'Unknown',
+              path: v.file,
+              start: { line: v.line || 0 },
+              severity: v.severity?.toUpperCase() || 'INFO',
+              extra: {
+                message: v.description || v.title,
+                severity: v.severity,
+                cwe: v.cwe,
+                cve: v.cve
+              },
+              title: v.title,
+              description: v.description,
+              fix: v.fix,
+              fixable: v.fixable,
+              cwe: v.cwe,
+              cve: v.cve,
+              metadata: v.metadata ? JSON.parse(v.metadata) : {}
+            }));
+            lastScanResults = results;
+            postResultsToWebview().catch(err => {
+              logger?.error('Failed to post scan results', err as Error);
+            });
+            showNotification(NotificationType.INFO, 'Scan loaded from history');
+          } catch (error) {
+            logger?.error('Failed to load scan', error as Error);
+            showNotification(NotificationType.ERROR, 'Failed to load scan from history');
+          }
+        }
+      } else if (message.command === 'openFile') {
+        // Open file at specific line and highlight it
+        // Split the view: move results panel to right side, open file on left side
+        const filePath = message.filePath?.trim();
+        const lineNumber = parseInt(message.lineNumber) || 1;
+        
+        // Validate file path before attempting to open
+        if (!filePath || filePath === '' || filePath === 'undefined' || filePath === 'null' || lineNumber < 1) {
+          logger?.warn('openFile: Invalid file path or line number', { filePath, lineNumber });
+          vscode.window.showWarningMessage('Invalid file path or line number');
+          return;
+        }
+        
+        if (filePath) {
+          try {
+            // Move results panel to column Two (right side) to create split view
+            if (resultsPanel) {
+              resultsPanel.reveal(vscode.ViewColumn.Two, false);
+            }
+            
+            const uri = vscode.Uri.file(filePath);
+            vscode.workspace.openTextDocument(uri).then(
+              (document) => {
+                const position = new vscode.Position(Math.max(0, lineNumber - 1), 0);
+                // Open file in column One (left side), creating split view with results panel on right
+                vscode.window.showTextDocument(document, {
+                  selection: new vscode.Range(position, position),
+                  viewColumn: vscode.ViewColumn.One,
+                  preview: false
+                }).then(
+                  (editor) => {
+                    // Highlight the line by revealing it in the center and selecting it
+                    const lineRange = new vscode.Range(
+                      Math.max(0, lineNumber - 1),
+                      0,
+                      Math.max(0, lineNumber - 1),
+                      Number.MAX_VALUE
+                    );
+                    editor.revealRange(lineRange, vscode.TextEditorRevealType.InCenter);
+                    editor.selection = new vscode.Selection(lineRange.start, lineRange.end);
+                    
+                    // Add a decoration to highlight the line
+                    const decorationType = vscode.window.createTextEditorDecorationType({
+                      backgroundColor: new vscode.ThemeColor('editor.selectionBackground'),
+                      isWholeLine: true
+                    });
+                    editor.setDecorations(decorationType, [lineRange]);
+                    
+                    // Remove decoration after 3 seconds
+                    setTimeout(() => {
+                      decorationType.dispose();
+                    }, 3000);
+                    
+                    // Ensure results panel stays visible on right side after opening file
+                    if (resultsPanel) {
+                      resultsPanel.reveal(vscode.ViewColumn.Two, false);
+                    }
+                    
+                    logger?.info('File opened and highlighted', { filePath, lineNumber });
+                  },
+                  (showError) => {
+                    logger?.error('Failed to display file', showError as Error);
+                    vscode.window.showErrorMessage(`Failed to display file: ${showError.message}`);
+                  }
+                );
+              },
+              (openError) => {
+                logger?.error('Could not open file', openError as Error);
+                vscode.window.showErrorMessage(`Could not open file "${filePath}": ${openError.message}`);
+              }
+            );
+          } catch (error: any) {
+            logger?.error('Error opening file', error as Error);
+            vscode.window.showErrorMessage(`Error opening file: ${error.message}`);
+          }
+        } else {
+          logger?.warn('openFile: No file path provided');
+          vscode.window.showWarningMessage('No file path provided');
+        }
       } else if (message.command === 'explainVulnerability') {
         const idx = message.index;
         const issue = lastScanResults[idx];
@@ -3911,8 +4967,9 @@ Keep the explanation clear and educational for developers.
         const issue = lastScanResults[idx];
         if (!issue) {return;}
         
-        // Get code context for better AI analysis
+        // Get code context for better AI analysis - this gets REAL code from the file
         const codeContext = getCodeContext(issue.path, issue.start?.line || issue.line_number || 0);
+        const vulnerableCode = issue.code || codeContext || '';
         
         // Detect vulnerability type for personalized learning
         const vulnerabilityType = detectVulnerabilityType(issue);
@@ -3920,16 +4977,30 @@ Keep the explanation clear and educational for developers.
         let basePrompt = '';
         if (message.command === 'fixIt') {
           basePrompt = `
-As a security expert, analyze this vulnerability and provide a detailed fix:
+As a security expert, analyze this vulnerability and provide a detailed fix using ONLY the actual code from the file:
 
 Vulnerability: ${issue.extra?.message || issue.issue_text || issue.check_id || 'Security issue'}
 File: ${issue.path}:${issue.start?.line || issue.line_number}
 Tool: ${issue.tool}
 Severity: ${issue.severity}
 
+ACTUAL CODE FROM FILE (DO NOT HALLUCINATE - USE ONLY THIS CODE):
+\`\`\`
+${vulnerableCode}
+\`\`\`
+
+${codeContext && codeContext !== vulnerableCode ? `SURROUNDING CONTEXT:\n\`\`\`\n${codeContext}\n\`\`\`\n` : ''}
+
+IMPORTANT: 
+- Use ONLY the actual code shown above
+- Do NOT invent or hallucinate code that doesn't exist
+- Provide a fix that modifies the REAL vulnerable code
+- Show the exact line(s) that need to be changed
+- Provide the complete fixed code block
+
 Please provide:
 1. A detailed explanation of why this is vulnerable
-2. A complete code fix with secure alternatives
+2. The EXACT code fix using the real code from the file (show before/after)
 3. Additional security considerations
 4. Best practices to prevent similar issues
 `;
@@ -3943,10 +5014,15 @@ File: ${issue.path}:${issue.start?.line || issue.line_number}
 Tool: ${issue.tool}
 Severity: ${issue.severity}
 
+ACTUAL CODE FROM FILE:
+\`\`\`
+${codeContext || issue.code || 'Code not available'}
+\`\`\`
+
 Please provide:
-1. A detailed explanation of the vulnerability
+1. A detailed explanation of the vulnerability based on the actual code shown
 2. The potential impact and risks
-3. How attackers could exploit this
+3. How attackers could exploit this specific code
 4. Why this is a security concern
 5. Related security concepts
 `;
@@ -3987,8 +5063,25 @@ Please provide:
     resultsPanel.onDidDispose(() => {
       resultsPanel = null;
     });
-    // Send current results to the webview
-    postResultsToWebview();
+    
+    // Send current results to the webview immediately
+    // Use multiple attempts to ensure webview receives the data
+    const sendData = () => {
+      postResultsToWebview().catch(err => {
+        logger?.error('Failed to post results to webview', err as Error);
+      });
+    };
+    
+    // Send immediately
+    sendData();
+    
+    // Send after short delay to ensure webview is ready
+    setTimeout(sendData, 100);
+    
+    // Send after longer delay as fallback
+    setTimeout(sendData, 500);
+    
+    // Also send when webview becomes ready (handled by webviewReady message)
   });
 
   // Command: Scan Me (manual scan)
@@ -4196,6 +5289,10 @@ Please provide:
       saveEncryptedData(lastScanResults, context);
       postResultsToWebview();
       
+      // Prompt user to review dashboard
+      const criticalCount = prioritizedVulns.filter((v: any) => v.severity === 'CRITICAL' || v.severity === 'ERROR').length;
+      promptReviewDashboard('RAG Analysis', prioritizedVulns.length, criticalCount);
+      
       showNotification(NotificationType.VULNERABILITY, 
         `RAG analysis complete: ${prioritizedVulns.length} vulnerabilities identified, ${patches.length} remediation patches generated`);
       
@@ -4221,8 +5318,11 @@ Please provide:
       saveEncryptedData(lastScanResults, context);
       postResultsToWebview();
       
+      // Prompt user to review dashboard
+      const criticalCount = lastScanResults.filter((r: any) => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
+      promptReviewDashboard('AI Analysis', lastScanResults.length, criticalCount);
+      
       if (lastScanResults.length > 0) {
-        const criticalCount = lastScanResults.filter((r: any) => r.severity === 'CRITICAL' || r.severity === 'ERROR').length;
         showNotification(NotificationType.VULNERABILITY, `AI analysis: ${lastScanResults.length} security issues detected (${criticalCount} critical)`);
       } else {
         logger.info('AI analysis completed', { issuesFound: 0 });
@@ -4365,8 +5465,11 @@ Identify specific attack vectors an attacker could use. Return in this format:
       saveEncryptedData(lastScanResults, context);
       postResultsToWebview();
       
+      // Prompt user to review dashboard
+      const criticalCount = lastScanResults.filter((r: any) => r.severity === 'CRITICAL' || r.severity === 'HIGH').length;
+      promptReviewDashboard('Red Team Analysis', lastScanResults.length, criticalCount);
+      
       if (lastScanResults.length > 0) {
-        const criticalCount = lastScanResults.filter((r: any) => r.severity === 'CRITICAL' || r.severity === 'HIGH').length;
         showNotification(NotificationType.VULNERABILITY, `Red team analysis: ${lastScanResults.length} attack vectors identified (${criticalCount} critical/high)`);
       } else {
         logger.info('Red team analysis completed', { attackVectors: 0 });
@@ -5580,6 +6683,22 @@ function getAdvancedSettingsHtml(settings: any) {
             }
             
             .section-icon {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 20px;
+                height: 20px;
+                margin-right: var(--spacing-sm);
+                color: var(--vscode-textLink-foreground);
+                opacity: 0.8;
+            }
+            
+            .section-icon svg {
+                width: 100%;
+                height: 100%;
+            }
+            
+            .section-icon-old {
                 width: 20px;
                 height: 20px;
                 display: flex;
@@ -5904,7 +7023,11 @@ function getAdvancedSettingsHtml(settings: any) {
                 
                 <div class="settings-section">
                     <h2 class="section-title">
-                        <span class="section-icon">💡</span>
+                        <span class="section-icon">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                            </svg>
+                        </span>
                         Inline Suggestions
                     </h2>
                     
@@ -5957,7 +7080,12 @@ function getAdvancedSettingsHtml(settings: any) {
                 
                 <div class="settings-section">
                     <h2 class="section-title">
-                        <span class="section-icon">🔔</span>
+                        <span class="section-icon">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path>
+                                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+                            </svg>
+                        </span>
                         Notifications
                     </h2>
                     
@@ -6395,6 +7523,23 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
                 gap: var(--spacing-sm);
             }
             
+            .logo img {
+                /* Use CSS filter that adapts based on background brightness */
+                /* Invert logo by default - will be overridden if light mode */
+                filter: brightness(0) invert(1);
+                transition: filter 0.3s ease, opacity 0.3s ease;
+                opacity: 0.95;
+            }
+            
+            /* If foreground color is dark (light theme), keep logo dark (no invert) */
+            /* This uses CSS custom properties to detect theme */
+            body:has([style*="color: rgb(0"]):not(:has([style*="color: rgb(255"])) .logo img,
+            body:has([style*="color: rgb(1"]):not(:has([style*="color: rgb(255"])) .logo img,
+            body:has([style*="color: rgb(2"]):not(:has([style*="color: rgb(255"])) .logo img {
+                filter: none !important;
+                opacity: 1 !important;
+            }
+            
             .subtitle {
                 font-size: var(--font-size-lg);
                 color: var(--vscode-descriptionForeground);
@@ -6790,7 +7935,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
         width: 100%;
                 height: 8px;
                 background: var(--vscode-progressBar-background);
-                border-radius: 4px;
+                border-radius: 0;
                 overflow: hidden;
                 position: relative;
             }
@@ -6798,7 +7943,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
             .progress-fill {
                 height: 100%;
                 background: var(--vscode-progressBar-background);
-                border-radius: 4px;
+                border-radius: 0;
                 transition: width 0.3s ease;
                 position: relative;
             }
@@ -6918,7 +8063,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
         <div class="container">
             <div class="header">
                 <div class="logo">
-                    <img src="${panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'images', 'icon.svg'))}" alt="CipherMate" width="24" height="24" style="margin-right: 8px; background: transparent !important; border-radius: 0 !important;">
+                    <img src="${panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'images', 'icon.svg'))}" alt="CipherMate" width="24" height="24" style="margin-right: 8px; background: transparent !important; border-radius: 0 !important;" id="home-logo">
                     CipherMate
                 </div>
                 <p class="subtitle">AI-Powered Security Analysis Platform</p>
@@ -7214,6 +8359,80 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
         <script>
             const vscode = acquireVsCodeApi();
             
+            // Detect theme and adapt logo - using getComputedStyle directly
+            function adaptLogoToTheme() {
+                const logoImgs = document.querySelectorAll('.logo img');
+                if (logoImgs.length === 0) {
+                    setTimeout(adaptLogoToTheme, 100);
+                    return;
+                }
+                
+                try {
+                    // Get foreground color as RGB string
+                    const fgColor = window.getComputedStyle(document.body).color;
+                    
+                    // Parse RGB - split by comma and extract numbers
+                    const parts = fgColor.replace(/[rgb()\\s]/g, '').split(',');
+                    
+                    if (parts.length >= 3) {
+                        const r = parseInt(parts[0]) || 0;
+                        const g = parseInt(parts[1]) || 0;
+                        const b = parseInt(parts[2]) || 0;
+                        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                        
+                        logoImgs.forEach(img => {
+                            if (brightness > 180) {
+                                // Light text = dark background - invert logo to white
+                                img.style.filter = 'brightness(0) invert(1)';
+                                img.style.opacity = '0.95';
+                            } else {
+                                // Dark text = light background - keep logo dark
+                                img.style.filter = 'none';
+                                img.style.opacity = '1';
+                            }
+                        });
+                    } else {
+                        // Fallback: check background
+                        const bgColor = window.getComputedStyle(document.body).backgroundColor;
+                        const bgParts = bgColor.replace(/[rgb()\\s]/g, '').split(',');
+                        
+                        if (bgParts.length >= 3) {
+                            const r = parseInt(bgParts[0]) || 0;
+                            const g = parseInt(bgParts[1]) || 0;
+                            const b = parseInt(bgParts[2]) || 0;
+                            const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                            
+                            logoImgs.forEach(img => {
+                                if (brightness < 128) {
+                                    img.style.filter = 'brightness(0) invert(1)';
+                                    img.style.opacity = '0.95';
+                                } else {
+                                    img.style.filter = 'none';
+                                    img.style.opacity = '1';
+                                }
+                            });
+                        }
+                    }
+                } catch (e) {
+                    // Silent fail - keep default inverted
+                }
+            }
+            
+            // Run multiple times to catch theme changes
+            adaptLogoToTheme();
+            window.addEventListener('load', adaptLogoToTheme);
+            setTimeout(adaptLogoToTheme, 100);
+            setTimeout(adaptLogoToTheme, 500);
+            
+            // Watch for any style changes
+            const observer = new MutationObserver(adaptLogoToTheme);
+            observer.observe(document.body, {
+                attributes: true,
+                attributeFilter: ['style', 'class'],
+                childList: true,
+                subtree: true
+            });
+            
             function navigateTo(command) {
                 vscode.postMessage({
                     command: 'navigateTo',
@@ -7286,7 +8505,14 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
   `;
 }
 
-function getResultsPanelHtml() {
+function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.WebviewPanel) {
+  // Get logo URI if context and panel are available
+  let logoUri = '';
+  if (context && panel) {
+    logoUri = panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(context.extensionUri, 'images', 'icon.svg')
+    ).toString();
+  }
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7295,8 +8521,8 @@ function getResultsPanelHtml() {
     <title>CipherMate Results</title>
     <style>
         :root {
-            --border-radius: 6px;
-            --border-radius-sm: 4px;
+            --border-radius: 0;
+            --border-radius-sm: 0;
             --spacing-xs: 4px;
             --spacing-sm: 8px;
             --spacing-md: 12px;
@@ -7320,41 +8546,116 @@ function getResultsPanelHtml() {
         }
         
         body {
-            font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             font-size: var(--font-size-md);
             font-weight: var(--font-weight-normal);
             color: var(--vscode-foreground);
-            background-color: var(--vscode-editor-background);
-        margin: 0;
+            background: var(--vscode-editor-background);
+            background-image: 
+                radial-gradient(circle at 1px 1px, rgba(0, 122, 204, 0.08) 1px, transparent 0);
+            background-size: 24px 24px;
+            margin: 0;
             padding: 0;
-            line-height: 1.5;
+            line-height: 1.6;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
+            position: relative;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(0, 122, 204, 0.3) 20%, 
+                rgba(0, 122, 204, 0.3) 80%, 
+                transparent 100%);
+            z-index: 1000;
+            pointer-events: none;
         }
         
         .container {
             padding: var(--spacing-xl);
             max-width: 100%;
+            overflow-x: visible;
+            overflow-y: visible;
         }
         
         .header {
             margin-bottom: var(--spacing-xxl);
-            padding-bottom: var(--spacing-lg);
-            border-bottom: 1px solid var(--vscode-panel-border);
+            padding-bottom: var(--spacing-xl);
+            border-bottom: 2px solid var(--vscode-panel-border);
+            position: relative;
+            background: linear-gradient(180deg, 
+                rgba(0, 122, 204, 0.05) 0%, 
+                transparent 100%);
+            padding-top: var(--spacing-lg);
+            padding-left: var(--spacing-xl);
+            padding-right: var(--spacing-xl);
+            margin-left: calc(-1 * var(--spacing-xl));
+            margin-right: calc(-1 * var(--spacing-xl));
+            border-radius: 0;
+            overflow: visible;
+        }
+        
+        .header::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(0, 122, 204, 0.4) 50%, 
+                transparent 100%);
         }
         
         .title {
-            font-size: var(--font-size-xxl);
-            font-weight: var(--font-weight-semibold);
+            font-size: 24px;
+            font-weight: 700;
             color: var(--vscode-foreground);
             margin: 0 0 var(--spacing-xs) 0;
-            letter-spacing: -0.01em;
+            letter-spacing: -0.02em;
+            text-transform: none;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            position: relative;
+            padding-left: var(--spacing-lg);
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-md);
+        }
+        
+        .title::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 4px;
+            height: 28px;
+            background: linear-gradient(180deg, 
+                var(--vscode-textLink-foreground) 0%, 
+                rgba(0, 122, 204, 0.6) 100%);
+            border-radius: 0;
+            box-shadow: 0 0 8px rgba(0, 122, 204, 0.3);
+        }
+        
+        .title-logo {
+            width: 24px;
+            height: 24px;
+            flex-shrink: 0;
         }
         
         .subtitle {
-            font-size: var(--font-size-sm);
+            font-size: var(--font-size-md);
             color: var(--vscode-descriptionForeground);
             margin: 0 0 var(--spacing-lg) 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
         }
         
         .scan-info {
@@ -7367,16 +8668,40 @@ function getResultsPanelHtml() {
         .scan-status {
             font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
-            padding: var(--spacing-xs) var(--spacing-sm);
-            background-color: var(--vscode-panel-background);
+            padding: var(--spacing-xs) var(--spacing-md);
+            background: linear-gradient(135deg, 
+                var(--vscode-panel-background) 0%, 
+                rgba(0, 122, 204, 0.05) 100%);
             border: 1px solid var(--vscode-panel-border);
-            border-radius: var(--border-radius-sm);
+            border-radius: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-weight: 500;
+            position: relative;
+            overflow: visible;
+        }
+        
+        .scan-status::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background: linear-gradient(180deg, 
+                var(--vscode-textLink-foreground) 0%, 
+                transparent 100%);
         }
         
         .scan-time {
-            font-size: var(--font-size-xs);
+            font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
-            font-family: var(--vscode-editor-font-family, 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--vscode-panel-background);
+            padding: var(--spacing-xs) var(--spacing-md);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 0;
+            font-weight: 500;
+            letter-spacing: 0.02em;
         }
         
         .stats-grid {
@@ -7387,48 +8712,140 @@ function getResultsPanelHtml() {
         }
         
         .stat-card {
-            background-color: var(--vscode-panel-background);
+            background: var(--vscode-panel-background);
             border: 1px solid var(--vscode-panel-border);
-            border-radius: var(--border-radius);
-            padding: var(--spacing-md);
+            border-radius: 0;
+            padding: var(--spacing-lg);
             text-align: center;
-            transition: all 0.2s ease;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+        
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(0, 122, 204, 0.3) 50%, 
+                transparent 100%);
+            opacity: 0;
+            transition: opacity 0.25s ease;
         }
         
         .stat-card:hover {
-            background-color: var(--vscode-list-hoverBackground);
+            background: var(--vscode-list-hoverBackground);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            border-color: rgba(0, 122, 204, 0.3);
+        }
+        
+        .stat-card:hover::before {
+            opacity: 1;
         }
         
         .stat-number {
-            font-size: var(--font-size-xl);
-            font-weight: var(--font-weight-bold);
+            font-size: 32px;
+            font-weight: 700;
             color: var(--vscode-foreground);
-        display: block;
+            display: block;
             margin-bottom: var(--spacing-xs);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            letter-spacing: -0.03em;
+            line-height: 1.1;
         }
         
         .stat-label {
-            font-size: var(--font-size-xs);
+            font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
+            text-transform: none;
+            letter-spacing: 0;
             font-weight: var(--font-weight-medium);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
         }
         
+        .stat-critical {
+            background: linear-gradient(135deg, 
+                rgba(211, 47, 47, 0.12) 0%, 
+                rgba(211, 47, 47, 0.06) 50%,
+                rgba(211, 47, 47, 0.02) 100%);
+            border: 1px solid rgba(211, 47, 47, 0.4);
+            border-top: 2px solid #d32f2f;
+        }
         .stat-critical .stat-number {
-            color: var(--vscode-inputValidation-errorForeground);
+            color: #d32f2f;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            text-shadow: 0 0 20px rgba(211, 47, 47, 0.2);
+        }
+        .stat-critical::before {
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(211, 47, 47, 0.4) 50%, 
+                transparent 100%);
         }
         
+        .stat-high {
+            background: linear-gradient(135deg, 
+                rgba(245, 124, 0, 0.12) 0%, 
+                rgba(245, 124, 0, 0.06) 50%,
+                rgba(245, 124, 0, 0.02) 100%);
+            border: 1px solid rgba(245, 124, 0, 0.4);
+            border-top: 2px solid #f57c00;
+        }
         .stat-high .stat-number {
-            color: var(--vscode-inputValidation-warningForeground);
+            color: #f57c00;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            text-shadow: 0 0 20px rgba(245, 124, 0, 0.2);
+        }
+        .stat-high::before {
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(245, 124, 0, 0.4) 50%, 
+                transparent 100%);
         }
         
+        .stat-medium {
+            background: linear-gradient(135deg, 
+                rgba(25, 118, 210, 0.12) 0%, 
+                rgba(25, 118, 210, 0.06) 50%,
+                rgba(25, 118, 210, 0.02) 100%);
+            border: 1px solid rgba(25, 118, 210, 0.4);
+            border-top: 2px solid #1976d2;
+        }
         .stat-medium .stat-number {
-            color: var(--vscode-inputValidation-infoForeground);
+            color: #1976d2;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            text-shadow: 0 0 20px rgba(25, 118, 210, 0.2);
+        }
+        .stat-medium::before {
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(25, 118, 210, 0.4) 50%, 
+                transparent 100%);
         }
         
+        .stat-low {
+            background: linear-gradient(135deg, 
+                rgba(117, 117, 117, 0.08) 0%, 
+                rgba(117, 117, 117, 0.04) 50%,
+                rgba(117, 117, 117, 0.01) 100%);
+            border: 1px solid rgba(117, 117, 117, 0.3);
+            border-top: 2px solid #757575;
+        }
         .stat-low .stat-number {
-            color: var(--vscode-descriptionForeground);
+            color: #757575;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+        .stat-low::before {
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(117, 117, 117, 0.3) 50%, 
+                transparent 100%);
         }
         
         .controls {
@@ -7440,18 +8857,43 @@ function getResultsPanelHtml() {
         
         .btn {
             display: inline-flex;
-        align-items: center;
+            align-items: center;
             justify-content: center;
             padding: var(--spacing-sm) var(--spacing-lg);
             border: 1px solid transparent;
-            border-radius: var(--border-radius-sm);
+            border-radius: 0;
             font-size: var(--font-size-sm);
-            font-weight: var(--font-weight-medium);
+            font-weight: 500;
             cursor: pointer;
-            transition: all 0.15s ease;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
             text-decoration: none;
             white-space: nowrap;
-            min-height: 32px;
+            min-height: 36px;
+            position: relative;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        }
+        
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 0;
+            background: rgba(255, 255, 255, 0.2);
+            transform: translate(-50%, -50%);
+            transition: width 0.3s ease, height 0.3s ease;
+        }
+        
+        .btn:hover::before {
+            width: 300px;
+            height: 300px;
+        }
+        
+        .btn:active {
+            transform: scale(0.98);
         }
         
         .btn:focus {
@@ -7460,13 +8902,20 @@ function getResultsPanelHtml() {
         }
         
         .btn-primary {
-            background-color: var(--vscode-button-background);
+            background: linear-gradient(135deg, 
+                var(--vscode-button-background) 0%, 
+                rgba(0, 122, 204, 0.9) 100%);
             color: var(--vscode-button-foreground);
-            border-color: var(--vscode-button-border);
+            border: 1px solid rgba(0, 122, 204, 0.3);
+            box-shadow: 0 2px 4px rgba(0, 122, 204, 0.2);
         }
         
         .btn-primary:hover {
-            background-color: var(--vscode-button-hoverBackground);
+            background: linear-gradient(135deg, 
+                var(--vscode-button-hoverBackground) 0%, 
+                rgba(0, 122, 204, 1) 100%);
+            box-shadow: 0 4px 8px rgba(0, 122, 204, 0.3);
+            transform: translateY(-1px);
         }
         
         .btn-secondary {
@@ -7504,20 +8953,69 @@ function getResultsPanelHtml() {
             cursor: not-allowed;
         }
         
+        .btn-history {
+            background-color: transparent;
+            color: var(--vscode-foreground);
+            border-color: var(--vscode-input-border);
+            display: inline-flex;
+            align-items: center;
+            gap: var(--spacing-xs);
+        }
+        
+        .btn-history:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        
+        .btn-history svg {
+            width: 16px;
+            height: 16px;
+        }
+        
         .results-section {
             background-color: var(--vscode-panel-background);
             border: 1px solid var(--vscode-panel-border);
-            border-radius: var(--border-radius);
-            overflow: hidden;
+            border-radius: 0;
+            overflow: visible;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            position: relative;
+        }
+        
+        .results-section::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, 
+                rgba(0, 122, 204, 0.4) 0%, 
+                rgba(0, 122, 204, 0.2) 50%, 
+                rgba(0, 122, 204, 0.4) 100%);
         }
         
         .results-header {
-            background-color: var(--vscode-panel-background);
+            background: linear-gradient(180deg, 
+                var(--vscode-panel-background) 0%, 
+                rgba(0, 122, 204, 0.03) 100%);
             padding: var(--spacing-lg);
             border-bottom: 1px solid var(--vscode-panel-border);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            position: relative;
+        }
+        
+        .results-header::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, 
+                transparent 0%, 
+                rgba(0, 122, 204, 0.3) 50%, 
+                transparent 100%);
         }
         
         .results-title {
@@ -7545,16 +9043,47 @@ function getResultsPanelHtml() {
             display: flex;
             align-items: flex-start;
             padding: var(--spacing-lg);
+            margin-bottom: var(--spacing-md);
             border-bottom: 1px solid var(--vscode-panel-border);
-            transition: background-color 0.15s ease;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            z-index: 1;
+            background: var(--vscode-panel-background);
+            border-left: 3px solid transparent;
+        }
+        
+        .result-item::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background: linear-gradient(180deg, 
+                transparent 0%, 
+                rgba(0, 122, 204, 0.3) 50%, 
+                transparent 100%);
+            opacity: 0;
+            transition: opacity 0.25s ease;
         }
         
         .result-item:last-child {
             border-bottom: none;
+            margin-bottom: 0;
         }
         
         .result-item:hover {
-            background-color: var(--vscode-list-hoverBackground);
+            background: linear-gradient(90deg, 
+                var(--vscode-list-hoverBackground) 0%, 
+                var(--vscode-panel-background) 100%);
+            transform: translateX(4px);
+            border-left-color: var(--vscode-textLink-foreground);
+            box-shadow: -4px 0 12px rgba(0, 122, 204, 0.15);
+            z-index: 10;
+        }
+        
+        .result-item:hover::before {
+            opacity: 1;
         }
         
         .result-severity {
@@ -7575,27 +9104,34 @@ function getResultsPanelHtml() {
         }
         
         .severity-critical {
-            background-color: var(--vscode-inputValidation-errorBackground);
-            color: var(--vscode-inputValidation-errorForeground);
-            border: 1px solid var(--vscode-inputValidation-errorBorder);
+            background: linear-gradient(135deg, #d32f2f 0%, #b71c1c 100%);
+            color: #ffffff;
+            border: 2px solid #d32f2f;
+            box-shadow: 0 0 10px rgba(211, 47, 47, 0.5);
+            font-weight: var(--font-weight-bold);
         }
         
         .severity-high {
-            background-color: var(--vscode-inputValidation-warningBackground);
-            color: var(--vscode-inputValidation-warningForeground);
-            border: 1px solid var(--vscode-inputValidation-warningBorder);
+            background: linear-gradient(135deg, #f57c00 0%, #e65100 100%);
+            color: #ffffff;
+            border: 2px solid #f57c00;
+            box-shadow: 0 0 10px rgba(245, 124, 0, 0.5);
+            font-weight: var(--font-weight-bold);
         }
         
         .severity-medium {
-            background-color: var(--vscode-inputValidation-infoBackground);
-            color: var(--vscode-inputValidation-infoForeground);
-            border: 1px solid var(--vscode-inputValidation-infoBorder);
+            background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%);
+            color: #ffffff;
+            border: 2px solid #1976d2;
+            box-shadow: 0 0 10px rgba(25, 118, 210, 0.5);
+            font-weight: var(--font-weight-semibold);
         }
         
         .severity-low {
-            background-color: var(--vscode-panel-background);
-            color: var(--vscode-descriptionForeground);
-            border: 1px solid var(--vscode-panel-border);
+            background: linear-gradient(135deg, #757575 0%, #616161 100%);
+            color: #ffffff;
+            border: 2px solid #757575;
+            font-weight: var(--font-weight-medium);
         }
         
         .result-content {
@@ -7614,9 +9150,12 @@ function getResultsPanelHtml() {
             font-size: var(--font-size-md);
             font-weight: var(--font-weight-medium);
             color: var(--vscode-foreground);
-            margin: 0;
+            margin: 0 0 var(--spacing-xs) 0;
             flex: 1;
             min-width: 0;
+            line-height: 1.4;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
         }
         
         .result-meta {
@@ -7635,13 +9174,23 @@ function getResultsPanelHtml() {
             border-radius: var(--border-radius-sm);
             font-size: var(--font-size-xs);
             font-weight: var(--font-weight-medium);
+            transition: all 0.15s ease;
+        }
+        
+        .tool-badge:hover {
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            transform: scale(1.05);
         }
         
         .result-description {
             font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
             margin-bottom: var(--spacing-md);
+            margin-top: var(--spacing-xs);
             line-height: 1.5;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
         }
         
         .result-file {
@@ -7653,16 +9202,23 @@ function getResultsPanelHtml() {
             display: inline-flex;
             align-items: center;
             gap: var(--spacing-xs);
+            user-select: none;
+            -webkit-user-select: none;
         }
         
         .result-file:hover {
             text-decoration: underline;
         }
         
+        .result-file:active {
+            outline: none;
+        }
+        
         .result-actions {
             display: flex;
             gap: var(--spacing-sm);
             margin-top: var(--spacing-md);
+            flex-wrap: wrap;
         }
         
         .action-btn {
@@ -7729,7 +9285,7 @@ function getResultsPanelHtml() {
             width: 20px;
             height: 20px;
             border: 2px solid var(--vscode-panel-border);
-            border-radius: 50%;
+            border-radius: 0;
             border-top-color: var(--vscode-foreground);
             animation: spin 1s ease-in-out infinite;
             margin-right: var(--spacing-sm);
@@ -7811,6 +9367,336 @@ function getResultsPanelHtml() {
             font-size: var(--font-size-sm);
         }
         
+        /* Filters and Analysis */
+        .filters-section {
+            background-color: var(--vscode-panel-background);
+            border: 1px solid var(--vscode-panel-border);
+            padding: var(--spacing-lg);
+            margin-bottom: var(--spacing-xl);
+        }
+        
+        .filters-row {
+            display: flex;
+            gap: var(--spacing-md);
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+        }
+        
+        .filter-label {
+            font-size: var(--font-size-sm);
+            color: var(--vscode-descriptionForeground);
+            font-weight: var(--font-weight-medium);
+        }
+        
+        .filter-select {
+            padding: var(--spacing-xs) var(--spacing-sm);
+            background-color: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            font-size: var(--font-size-sm);
+            cursor: pointer;
+        }
+        
+        .filter-select:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+            outline-offset: 2px;
+        }
+        
+        /* Vulnerability Analysis Section */
+        .analysis-section {
+            background-color: var(--vscode-panel-background);
+            border: 1px solid var(--vscode-panel-border);
+            padding: var(--spacing-lg);
+            margin-bottom: var(--spacing-xl);
+        }
+        
+        .analysis-title {
+            font-size: var(--font-size-lg);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-foreground);
+            margin: 0 0 var(--spacing-lg) 0;
+            padding-bottom: var(--spacing-sm);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: var(--spacing-lg);
+            margin-bottom: var(--spacing-lg);
+        }
+        
+        .analysis-card {
+            background-color: var(--vscode-input-background);
+            border: 1px solid var(--vscode-panel-border);
+            padding: var(--spacing-md);
+        }
+        
+        .analysis-card-title {
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-foreground);
+            margin: 0 0 var(--spacing-sm) 0;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        .analysis-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        
+        .analysis-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: var(--spacing-xs) 0;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        
+        .analysis-item:last-child {
+            border-bottom: none;
+        }
+        
+        .analysis-item-label {
+            font-size: var(--font-size-sm);
+            color: var(--vscode-foreground);
+            flex: 1;
+        }
+        
+        .analysis-item-count {
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-descriptionForeground);
+            background-color: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            padding: 2px 8px;
+        }
+        
+        /* Scan History */
+        .history-section {
+            background-color: var(--vscode-panel-background);
+            border: 1px solid var(--vscode-panel-border);
+            padding: var(--spacing-lg);
+            margin-bottom: var(--spacing-xl);
+        }
+        
+        .history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: var(--spacing-lg);
+            padding-bottom: var(--spacing-sm);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        
+        .history-title {
+            font-size: var(--font-size-lg);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-foreground);
+            margin: 0;
+        }
+        
+        .history-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        
+        .history-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: var(--spacing-md);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            cursor: pointer;
+            transition: background-color 0.15s ease;
+        }
+        
+        .history-item:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        
+        .history-item:last-child {
+            border-bottom: none;
+        }
+        
+        .history-info {
+            flex: 1;
+        }
+        
+        .history-scan-type {
+            font-size: var(--font-size-md);
+            font-weight: var(--font-weight-medium);
+            color: var(--vscode-foreground);
+            margin: 0 0 var(--spacing-xs) 0;
+        }
+        
+        .history-time {
+            font-size: var(--font-size-xs);
+            color: var(--vscode-descriptionForeground);
+            font-family: var(--vscode-editor-font-family, monospace);
+        }
+        
+        .history-stats {
+            display: flex;
+            gap: var(--spacing-sm);
+        }
+        
+        .history-stat {
+            font-size: var(--font-size-xs);
+            padding: 2px 6px;
+            background-color: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+        }
+        
+        /* Explanation Panel */
+        .explanation-panel {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 2000;
+            backdrop-filter: blur(2px);
+        }
+        
+        .explanation-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+            max-width: 700px;
+            max-height: 80vh;
+            width: 90%;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .explanation-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: var(--spacing-lg);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            background-color: var(--vscode-panel-background);
+        }
+        
+        .explanation-header h2 {
+            font-size: var(--font-size-lg);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-foreground);
+            margin: 0;
+        }
+        
+        .close-btn {
+            background: none;
+            border: none;
+            color: var(--vscode-foreground);
+            font-size: var(--font-size-xl);
+            cursor: pointer;
+            padding: var(--spacing-xs);
+            transition: background-color 0.15s ease;
+        }
+        
+        .close-btn:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        
+        .explanation-text {
+            padding: var(--spacing-lg);
+            overflow-y: auto;
+            color: var(--vscode-foreground);
+            line-height: 1.6;
+            white-space: pre-wrap;
+            font-size: var(--font-size-sm);
+        }
+        
+        /* Graphical Analysis Section */
+        .graphical-analysis-section {
+            background: var(--vscode-panel-background);
+            border: 1px solid var(--vscode-panel-border);
+            padding: var(--spacing-xl);
+            margin-bottom: var(--spacing-xl);
+            border-radius: 0;
+            overflow: visible;
+        }
+        
+        .section-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--vscode-foreground);
+            margin: 0 0 var(--spacing-xl) 0;
+            padding-bottom: var(--spacing-md);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            text-transform: none;
+            letter-spacing: -0.01em;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            position: relative;
+            padding-left: var(--spacing-md);
+        }
+        
+        .section-title::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            bottom: -1px;
+            width: 40px;
+            height: 2px;
+            background: linear-gradient(90deg, 
+                var(--vscode-textLink-foreground) 0%, 
+                transparent 100%);
+        }
+        
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: var(--spacing-xl);
+        }
+        
+        .chart-container {
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+            padding: var(--spacing-lg);
+            border-radius: 0;
+            overflow: visible;
+        }
+        
+        .chart-title {
+            font-size: var(--font-size-md);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-foreground);
+            margin: 0 0 var(--spacing-md) 0;
+            text-align: center;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            letter-spacing: 0.02em;
+            text-transform: none;
+        }
+        
+        .chart-wrapper {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 200px;
+        }
+        
+        canvas {
+            max-width: 100%;
+            height: auto;
+        }
+        
         @media (max-width: 768px) {
             .container {
                 padding: var(--spacing-lg);
@@ -7843,7 +9729,10 @@ function getResultsPanelHtml() {
   </head>
   <body>
     <div class="header">
-        <h1 class="title">Security Analysis</h1>
+        <h1 class="title">
+            ${logoUri ? `<img src="${logoUri}" alt="CipherMate" class="title-logo" style="background: transparent !important; border-radius: 0 !important;">` : ''}
+            Security Analysis
+        </h1>
         <p class="subtitle">Comprehensive security vulnerability assessment</p>
         <div class="scan-info">
             <span class="scan-status" id="scan-status">Ready to scan</span>
@@ -7874,14 +9763,106 @@ function getResultsPanelHtml() {
         </div>
     </div>
     
+    <!-- Graphical Analysis Section -->
+    <div class="graphical-analysis-section">
+        <h2 class="section-title">Graphical Analysis</h2>
+        <div class="charts-grid">
+            <div class="chart-container">
+                <h3 class="chart-title">Severity Distribution</h3>
+                <div class="chart-wrapper">
+                    <canvas id="severityChart" width="300" height="300"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Vulnerability Trends</h3>
+                <div class="chart-wrapper">
+                    <canvas id="trendChart" width="400" height="200"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Top Vulnerability Types</h3>
+                <div class="chart-wrapper">
+                    <canvas id="typeChart" width="500" height="220"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+    
     <div class="controls">
         <button class="btn btn-primary" onclick="startScan()">Start Scan</button>
         <button class="btn btn-refresh" onclick="refreshResults()" id="refresh-btn">Refresh</button>
         <button class="btn btn-secondary" onclick="exportResults()">Export Results</button>
+        <button class="btn btn-history" onclick="showScanHistory()" title="View Scan History">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+            History
+        </button>
         <button class="btn btn-ghost" onclick="clearResults()">Clear Results</button>
     </div>
     
-    <div class="results-section">
+    <!-- Filters Section -->
+    <div class="filters-section">
+        <div class="filters-row">
+            <div class="filter-group">
+                <label class="filter-label">Severity:</label>
+                <select class="filter-select" id="severity-filter" onchange="applyFilters()">
+                    <option value="all">All</option>
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">Sort by:</label>
+                <select class="filter-select" id="sort-filter" onchange="applyFilters()">
+                    <option value="severity">Severity</option>
+                    <option value="file">File</option>
+                    <option value="type">Type</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">View:</label>
+                <select class="filter-select" id="view-filter" onchange="switchView()">
+                    <option value="results">Current Results</option>
+                    <option value="analysis">Vulnerability Analysis</option>
+                    <option value="history">Scan History</option>
+                </select>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Vulnerability Analysis Section -->
+    <div class="analysis-section" id="analysis-section" style="display: none;">
+        <h2 class="analysis-title">Vulnerability Analysis</h2>
+        <div class="analysis-grid" id="analysis-grid">
+            <div class="analysis-card">
+                <h3 class="analysis-card-title">By Severity</h3>
+                <ul class="analysis-list" id="severity-analysis"></ul>
+            </div>
+            <div class="analysis-card">
+                <h3 class="analysis-card-title">By Type</h3>
+                <ul class="analysis-list" id="type-analysis"></ul>
+            </div>
+            <div class="analysis-card">
+                <h3 class="analysis-card-title">By File</h3>
+                <ul class="analysis-list" id="file-analysis"></ul>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Scan History Section -->
+    <div class="history-section" id="history-section" style="display: none;">
+        <div class="history-header">
+            <h2 class="history-title">Scan History</h2>
+            <button class="btn btn-ghost" onclick="hideScanHistory()" style="font-size: var(--font-size-sm);">Close</button>
+        </div>
+        <ul class="history-list" id="history-list"></ul>
+    </div>
+    
+    <div class="results-section" id="results-section">
         <div class="results-header">
             <h2 class="results-title">Vulnerabilities</h2>
             <span class="results-count" id="results-count">0 found</span>
@@ -7909,9 +9890,340 @@ function getResultsPanelHtml() {
     <script>
       const vscode = acquireVsCodeApi();
       let lastResults = [];
+      let vulnerabilityAnalysisData = null;
+      let recentScansData = [];
+      let currentFilter = 'all';
+      let currentSort = 'severity';
+      let currentView = 'results';
+      
+      // Notify extension that webview is ready
+      console.log('Webview script loaded, sending webviewReady message');
+      vscode.postMessage({ command: 'webviewReady' });
+      
+      // Also request data immediately
+      setTimeout(() => {
+        console.log('Requesting initial data from extension');
+        vscode.postMessage({ command: 'refresh' });
+      }, 100);
         
+      function renderCharts(results, stats) {
+        // Get theme colors for readable text
+        const getThemeColor = (cssVar) => {
+          const tempEl = document.createElement('div');
+          tempEl.style.color = \`var(\${cssVar})\`;
+          document.body.appendChild(tempEl);
+          const color = window.getComputedStyle(tempEl).color;
+          document.body.removeChild(tempEl);
+          return color || '#ffffff';
+        };
+        
+        const foregroundColor = getThemeColor('--vscode-foreground');
+        const descriptionColor = getThemeColor('--vscode-descriptionForeground');
+        const backgroundColor = getThemeColor('--vscode-panel-background');
+        
+        // Severity Distribution Pie Chart
+        const severityCtx = document.getElementById('severityChart');
+        if (severityCtx) {
+          const ctx = severityCtx.getContext('2d');
+          const total = stats.critical + stats.high + stats.medium + stats.low || 1;
+          const colors = ['#d32f2f', '#f57c00', '#1976d2', '#757575'];
+          const data = [stats.critical, stats.high, stats.medium, stats.low];
+          const labels = ['Critical', 'High', 'Medium', 'Low'];
+          
+          // Clear canvas
+          ctx.clearRect(0, 0, severityCtx.width, severityCtx.height);
+          
+          // Draw pie chart
+          let currentAngle = -Math.PI / 2;
+          const centerX = severityCtx.width / 2;
+          const centerY = severityCtx.height / 2;
+          const radius = Math.min(centerX, centerY) - 20;
+          
+          data.forEach((value, index) => {
+            if (value > 0) {
+              const sliceAngle = (value / total) * 2 * Math.PI;
+              ctx.beginPath();
+              ctx.moveTo(centerX, centerY);
+              ctx.arc(centerX, centerY, radius, currentAngle, currentAngle + sliceAngle);
+              ctx.closePath();
+              ctx.fillStyle = colors[index];
+              ctx.fill();
+              ctx.strokeStyle = backgroundColor;
+              ctx.lineWidth = 2;
+              ctx.stroke();
+              
+              // Label with professional styling - use white for contrast on colored slices
+              const labelAngle = currentAngle + sliceAngle / 2;
+              const labelX = centerX + Math.cos(labelAngle) * (radius * 0.7);
+              const labelY = centerY + Math.sin(labelAngle) * (radius * 0.7);
+              ctx.fillStyle = '#ffffff';
+              ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              // Add subtle text shadow for better readability
+              ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+              ctx.shadowBlur = 3;
+              ctx.shadowOffsetX = 1;
+              ctx.shadowOffsetY = 1;
+              ctx.fillText(value.toString(), labelX, labelY);
+              ctx.shadowBlur = 0;
+              ctx.shadowOffsetX = 0;
+              ctx.shadowOffsetY = 0;
+              
+              currentAngle += sliceAngle;
+            }
+          });
+          
+          // Legend with professional styling - use theme colors
+          let legendY = severityCtx.height - 85;
+          labels.forEach((label, index) => {
+            if (data[index] > 0) {
+              // Legend color box
+              ctx.fillStyle = colors[index];
+              ctx.fillRect(10, legendY, 16, 16);
+              ctx.strokeStyle = backgroundColor;
+              ctx.lineWidth = 1;
+              ctx.strokeRect(10, legendY, 16, 16);
+              
+              // Legend text - use theme foreground color
+              ctx.fillStyle = foregroundColor;
+              ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'left';
+              ctx.fillText(\`\${label}\`, 32, legendY + 7);
+              
+              // Count with emphasis - use theme foreground color
+              ctx.fillStyle = foregroundColor;
+              ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'right';
+              ctx.fillText(data[index].toString(), severityCtx.width - 10, legendY + 7);
+              
+              legendY += 22;
+            }
+          });
+        }
+        
+        // Trend Chart (Bar Chart) - Use real data from vulnerabilityAnalysis
+        const trendCtx = document.getElementById('trendChart');
+        if (trendCtx) {
+          const ctx = trendCtx.getContext('2d');
+          ctx.clearRect(0, 0, trendCtx.width, trendCtx.height);
+          
+          // Get theme colors for this chart context
+          const getThemeColor = (cssVar) => {
+            const tempEl = document.createElement('div');
+            tempEl.style.color = \`var(\${cssVar})\`;
+            document.body.appendChild(tempEl);
+            const color = window.getComputedStyle(tempEl).color;
+            document.body.removeChild(tempEl);
+            return color || '#ffffff';
+          };
+          const foregroundColor = getThemeColor('--vscode-foreground');
+          const descriptionColor = getThemeColor('--vscode-descriptionForeground');
+          const backgroundColor = getThemeColor('--vscode-panel-background');
+          
+          // Use real trend data from vulnerabilityAnalysis if available
+          let trendData = [];
+          if (vulnerabilityAnalysisData && vulnerabilityAnalysisData.trends && vulnerabilityAnalysisData.trends.length > 0) {
+            // Use real trends from database
+            trendData = vulnerabilityAnalysisData.trends
+              .slice(-7) // Last 7 data points
+              .map(trend => ({
+                date: new Date(trend.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+                count: trend.count || 0
+              }));
+          } else if (recentScansData && recentScansData.length > 0) {
+            // Fallback: Generate trends from recent scans
+            const scanMap = new Map();
+            recentScansData.forEach(scan => {
+              const date = new Date(scan.timestamp);
+              const dateKey = date.toISOString().split('T')[0];
+              scanMap.set(dateKey, (scanMap.get(dateKey) || 0) + (scan.totalVulnerabilities || 0));
+            });
+            
+            const today = new Date();
+            for (let i = 6; i >= 0; i--) {
+              const date = new Date(today);
+              date.setDate(date.getDate() - i);
+              const dateKey = date.toISOString().split('T')[0];
+              trendData.push({
+                date: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+                count: scanMap.get(dateKey) || 0
+              });
+            }
+          } else {
+            // No data available - show current total only
+            const today = new Date();
+            trendData = [{
+              date: today.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+              count: stats.total
+            }];
+          }
+          
+          if (trendData.length > 0) {
+            const maxCount = Math.max(...trendData.map(d => d.count), 1);
+            const barWidth = trendCtx.width / trendData.length - 10;
+            const maxBarHeight = trendCtx.height - 60;
+            
+            trendData.forEach((data, index) => {
+              const barHeight = (data.count / maxCount) * maxBarHeight;
+              const x = index * (trendCtx.width / trendData.length) + 5;
+              const y = trendCtx.height - barHeight - 40;
+              
+              // Draw bar with gradient effect
+              const gradient = ctx.createLinearGradient(x, y, x, y + barHeight);
+              gradient.addColorStop(0, '#1976d2');
+              gradient.addColorStop(1, '#1565c0');
+              ctx.fillStyle = gradient;
+              ctx.fillRect(x, y, barWidth, barHeight);
+              
+              // Add subtle border
+              ctx.strokeStyle = '#0d47a1';
+              ctx.lineWidth = 1;
+              ctx.strokeRect(x, y, barWidth, barHeight);
+              
+              // Count label on top of bar - use theme foreground color
+              ctx.fillStyle = foregroundColor;
+              ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'center';
+              ctx.fillText(data.count.toString(), x + barWidth / 2, y - 6);
+              
+              // Date label below bar - use theme description color
+              ctx.fillStyle = descriptionColor;
+              ctx.font = '10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'center';
+              ctx.fillText(data.date, x + barWidth / 2, trendCtx.height - 18);
+            });
+          } else {
+            // Show "No data" message with professional styling - use theme description color
+            ctx.fillStyle = descriptionColor;
+            ctx.font = '13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('No trend data available', trendCtx.width / 2, trendCtx.height / 2);
+          }
+        }
+        
+        // Type Chart (Horizontal Bar)
+        const typeCtx = document.getElementById('typeChart');
+        if (typeCtx) {
+          const ctx = typeCtx.getContext('2d');
+          ctx.clearRect(0, 0, typeCtx.width, typeCtx.height);
+          
+          // Get theme colors for this chart context
+          const getThemeColor = (cssVar) => {
+            const tempEl = document.createElement('div');
+            tempEl.style.color = \`var(\${cssVar})\`;
+            document.body.appendChild(tempEl);
+            const color = window.getComputedStyle(tempEl).color;
+            document.body.removeChild(tempEl);
+            return color || '#ffffff';
+          };
+          const foregroundColor = getThemeColor('--vscode-foreground');
+          const descriptionColor = getThemeColor('--vscode-descriptionForeground');
+          
+          // Group by detected vulnerability type (not scanner name)
+          const typeCounts = {};
+          results.forEach(r => {
+            // Use detected vulnerability type, fallback to type field, then tool name
+            const vulnType = r.vulnerabilityType || r.type || r.check_id || r.tool || 'Security Issue';
+            typeCounts[vulnType] = (typeCounts[vulnType] || 0) + 1;
+          });
+          
+          const sortedTypes = Object.entries(typeCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5);
+          
+          if (sortedTypes.length === 0) {
+            // Show "No data" message - use theme description color
+            ctx.fillStyle = descriptionColor;
+            ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('No vulnerability data available', typeCtx.width / 2, typeCtx.height / 2);
+            return;
+          }
+          
+          const maxCount = Math.max(...sortedTypes.map(([_, count]) => count), 1);
+          const barHeight = 28;
+          const spacing = 8;
+          const startY = 25;
+          const labelAreaWidth = 180; // Increased space for full labels
+          const barStartX = labelAreaWidth + 10;
+          
+          sortedTypes.forEach(([type, count], index) => {
+            const y = startY + index * (barHeight + spacing);
+            const barWidth = (count / maxCount) * (typeCtx.width - barStartX - 60);
+            
+            // Draw bar
+            ctx.fillStyle = '#1976d2';
+            ctx.fillRect(barStartX, y, barWidth, barHeight);
+            
+            // Draw count badge on bar - use white for contrast on blue bar
+            if (barWidth > 40) {
+              ctx.fillStyle = '#ffffff';
+              ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'left';
+              ctx.fillText(count.toString(), barStartX + 6, y + 19);
+            }
+            
+            // Draw full vulnerability type label (no truncation) - use theme foreground color
+            ctx.fillStyle = foregroundColor;
+            ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+            ctx.textAlign = 'left';
+            
+            // Handle long labels with word wrapping or ellipsis if needed
+            const maxLabelWidth = labelAreaWidth - 5;
+            let displayLabel = type;
+            
+            // Measure text width
+            const metrics = ctx.measureText(displayLabel);
+            if (metrics.width > maxLabelWidth) {
+              // Try to truncate intelligently at word boundaries
+              const words = displayLabel.split(' ');
+              displayLabel = '';
+              for (const word of words) {
+                const testLabel = displayLabel + (displayLabel ? ' ' : '') + word;
+                const testMetrics = ctx.measureText(testLabel);
+                if (testMetrics.width > maxLabelWidth) {
+                  displayLabel = displayLabel + (displayLabel ? '...' : '');
+                  break;
+                }
+                displayLabel = testLabel;
+              }
+            }
+            
+            ctx.fillText(displayLabel, 5, y + 19);
+            
+            // Draw count on right side if bar is too small - use theme foreground color
+            if (barWidth <= 40) {
+              ctx.fillStyle = foregroundColor;
+              ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+              ctx.textAlign = 'right';
+              ctx.fillText(count.toString(), typeCtx.width - 5, y + 19);
+            }
+          });
+        }
+      }
+      
       function renderResults(results) {
+            console.log('renderResults called with', results?.length || 0, 'results');
+            
+            // Ensure results is an array
+            if (!Array.isArray(results)) {
+              console.warn('renderResults: results is not an array', typeof results, results);
+              results = [];
+            }
+            
+            // Apply filters and sorting
+            let filtered = filterResults(results);
+            filtered = sortResults(filtered);
+            
             const container = document.getElementById('results-container');
+            if (!container) {
+              console.error('renderResults: results-container element not found');
+              return;
+            }
+            
+            console.log('renderResults: filtered results', filtered.length);
+            
             const stats = {
                 total: results.length,
                 critical: 0,
@@ -7920,10 +10232,11 @@ function getResultsPanelHtml() {
                 low: 0
             };
             
-            results.forEach(r => {
-                if (r.severity === 'CRITICAL' || r.severity === 'ERROR') stats.critical++;
-                else if (r.severity === 'HIGH') stats.high++;
-                else if (r.severity === 'MEDIUM' || r.severity === 'WARNING') stats.medium++;
+            filtered.forEach(r => {
+                const severity = (r.severity || '').toUpperCase();
+                if (severity === 'CRITICAL' || severity === 'ERROR' || severity === 'CRITICAL') stats.critical++;
+                else if (severity === 'HIGH' || severity === 'WARNING') stats.high++;
+                else if (severity === 'MEDIUM' || severity === 'INFO') stats.medium++;
                 else stats.low++;
             });
             
@@ -7938,12 +10251,20 @@ function getResultsPanelHtml() {
             const countText = stats.total === 1 ? '1 found' : \`\${stats.total} found\`;
             document.getElementById('results-count').textContent = countText;
             
-            if (results.length === 0) {
+            // Render charts
+            renderCharts(results, stats);
+            
+            if (filtered.length === 0) {
+                const emptyMessage = results.length === 0 
+                  ? 'No scan results available. Click "Start Scan" to begin security analysis.'
+                  : 'No vulnerabilities match the current filter. Try changing the severity filter.';
+                const emptyIcon = results.length === 0 ? '🔍' : '✓';
+                const emptyTitle = results.length === 0 ? 'No Scan Results' : 'No Security Issues Found';
                 container.innerHTML = \`
                     <div class="no-results">
-                        <div class="no-results-icon">✓</div>
-                        <div class="no-results-title">No Security Issues Found</div>
-                        <div class="no-results-description">Your code appears to be secure. Great job!</div>
+                        <div class="no-results-icon">\${emptyIcon}</div>
+                        <div class="no-results-title">\${emptyTitle}</div>
+                        <div class="no-results-description">\${emptyMessage}</div>
                     </div>
                 \`;
           return;
@@ -7951,8 +10272,8 @@ function getResultsPanelHtml() {
             
             let html = '';
             
-            for (let i = 0; i < results.length; i++) {
-                const r = results[i];
+            for (let i = 0; i < filtered.length; i++) {
+                const r = filtered[i];
                 let severityClass = 'severity-low';
                 let severityText = r.severity || 'INFO';
                 
@@ -7964,9 +10285,17 @@ function getResultsPanelHtml() {
                     severityClass = 'severity-medium';
                 }
                 
-                const fileLine = r.path ? r.path + ':' + (r.start && r.start.line ? r.start.line : '') : (r.filename ? r.filename + ':' + (r.line_number || '') : '');
+                const filePath = (r.path || r.filename || '').trim();
+                const lineNumber = r.start?.line || r.line_number || 0;
+                // Format file path with line number: /path/to/file.js:42
+                const fileLine = filePath ? \`\${filePath}\${lineNumber > 0 ? ':' + lineNumber : ''}\` : 'No file path';
                 const desc = (r.extra && r.extra.message) || r.issue_text || r.check_id || r.message || 'Security issue detected';
                 const tool = r.tool || 'Unknown';
+                
+                // Only make file path clickable if it's valid - use mousedown to prevent accidental triggers
+                const fileLinkHtml = filePath && filePath !== '' && filePath !== 'undefined' && filePath !== 'null'
+                  ? \`<a href="#" class="result-file" onmousedown="event.preventDefault(); openFile('\${filePath.replace(/'/g, "\\'")}', \${lineNumber || 1}); return false;" onclick="return false;">\${fileLine}</a>\`
+                  : \`<span class="result-file" style="color: var(--vscode-descriptionForeground);">\${fileLine}</span>\`;
                 
                 html += \`
                     <div class="result-item">
@@ -7981,13 +10310,11 @@ function getResultsPanelHtml() {
                                 </div>
                             </div>
                             <div class="result-description">
-                                <a href="#" class="result-file" onclick="openFile('\${r.path || r.filename}', \${r.start?.line || r.line_number || 1}); return false;">
-                                    \${fileLine}
-                                </a>
+                                \${fileLinkHtml}
                             </div>
                             <div class="result-actions">
-                                <button class="action-btn" onclick="explainVulnerability(\${i})">Explain</button>
-                                \${r.patch ? \`<button class="action-btn action-btn-primary" onclick="applyPatch(\${i})">Apply Fix</button>\` : ''}
+                                <button class="action-btn" onclick="event.stopPropagation(); explainVulnerability(\${i})">Explain</button>
+                                \${r.patch ? \`<button class="action-btn action-btn-primary" onclick="event.stopPropagation(); applyPatch(\${i})">Apply Fix</button>\` : ''}
                             </div>
                         </div>
                     </div>
@@ -8018,6 +10345,214 @@ function getResultsPanelHtml() {
                     const patchIndex = parseInt(this.getAttribute('data-patch'));
                     vscode.postMessage({ command: 'applyPatch', index: index, patchIndex: patchIndex });
           });
+        });
+      }
+      
+      function filterResults(results) {
+        if (currentFilter === 'all') return results;
+        return results.filter(r => {
+          const severity = (r.severity || '').toLowerCase();
+          if (currentFilter === 'critical') return severity === 'critical' || severity === 'error';
+          if (currentFilter === 'high') return severity === 'high' || severity === 'warning';
+          if (currentFilter === 'medium') return severity === 'medium' || severity === 'info';
+          if (currentFilter === 'low') return severity === 'low';
+          return true;
+        });
+      }
+      
+      function sortResults(results) {
+        return [...results].sort((a, b) => {
+          if (currentSort === 'severity') {
+            const severityOrder = { 'critical': 1, 'error': 1, 'high': 2, 'warning': 2, 'medium': 3, 'info': 3, 'low': 4 };
+            const aSev = severityOrder[(a.severity || '').toLowerCase()] || 5;
+            const bSev = severityOrder[(b.severity || '').toLowerCase()] || 5;
+            return aSev - bSev;
+          } else if (currentSort === 'file') {
+            const aFile = (a.path || a.filename || '').toLowerCase();
+            const bFile = (b.path || b.filename || '').toLowerCase();
+            return aFile.localeCompare(bFile);
+          } else if (currentSort === 'type') {
+            const aType = (a.tool || a.type || '').toLowerCase();
+            const bType = (b.tool || b.type || '').toLowerCase();
+            return aType.localeCompare(bType);
+          }
+          return 0;
+        });
+      }
+      
+      function applyFilters() {
+        currentFilter = document.getElementById('severity-filter').value;
+        currentSort = document.getElementById('sort-filter').value;
+        renderResults(lastResults);
+      }
+      
+      function switchView() {
+        currentView = document.getElementById('view-filter').value;
+        const resultsSection = document.getElementById('results-section');
+        const analysisSection = document.getElementById('analysis-section');
+        const historySection = document.getElementById('history-section');
+        
+        if (currentView === 'results') {
+          resultsSection.style.display = 'block';
+          analysisSection.style.display = 'none';
+          historySection.style.display = 'none';
+        } else if (currentView === 'analysis') {
+          resultsSection.style.display = 'none';
+          analysisSection.style.display = 'block';
+          historySection.style.display = 'none';
+        } else if (currentView === 'history') {
+          resultsSection.style.display = 'none';
+          analysisSection.style.display = 'none';
+          historySection.style.display = 'block';
+        }
+      }
+      
+      function showScanHistory() {
+        const resultsSection = document.getElementById('results-section');
+        const analysisSection = document.getElementById('analysis-section');
+        const historySection = document.getElementById('history-section');
+        
+        resultsSection.style.display = 'none';
+        analysisSection.style.display = 'none';
+        historySection.style.display = 'block';
+        
+        // Update view filter dropdown
+        const viewFilter = document.getElementById('view-filter');
+        if (viewFilter) {
+          viewFilter.value = 'history';
+        }
+      }
+      
+      function hideScanHistory() {
+        const resultsSection = document.getElementById('results-section');
+        const historySection = document.getElementById('history-section');
+        
+        resultsSection.style.display = 'block';
+        historySection.style.display = 'none';
+        
+        // Update view filter dropdown
+        const viewFilter = document.getElementById('view-filter');
+        if (viewFilter) {
+          viewFilter.value = 'results';
+        }
+      }
+      
+      function renderVulnerabilityAnalysis(analysis) {
+        if (!analysis) {
+          // If no analysis provided, generate from current results
+          const typeCounts = {};
+          lastResults.forEach(r => {
+            const vulnType = r.vulnerabilityType || r.type || r.check_id || r.tool || 'Security Issue';
+            typeCounts[vulnType] = (typeCounts[vulnType] || 0) + 1;
+          });
+          
+          // Render by type from current results
+          const typeList = document.getElementById('type-analysis');
+          if (typeList) {
+            typeList.innerHTML = '';
+            Object.entries(typeCounts)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 10)
+              .forEach(([type, count]) => {
+                const item = document.createElement('li');
+                item.className = 'analysis-item';
+                item.innerHTML = \`
+                  <span class="analysis-item-label">\${type}</span>
+                  <span class="analysis-item-count">\${count}</span>
+                \`;
+                typeList.appendChild(item);
+              });
+          }
+          return;
+        }
+        
+        // Render by severity
+        const severityList = document.getElementById('severity-analysis');
+        if (severityList && analysis.bySeverity) {
+          severityList.innerHTML = '';
+          Object.entries(analysis.bySeverity).forEach(([severity, count]) => {
+            const item = document.createElement('li');
+            item.className = 'analysis-item';
+            item.innerHTML = \`
+              <span class="analysis-item-label">\${severity.charAt(0).toUpperCase() + severity.slice(1)}</span>
+              <span class="analysis-item-count">\${count}</span>
+            \`;
+            severityList.appendChild(item);
+          });
+        }
+        
+        // Render by type - use database analysis if available, otherwise use current results
+        const typeList = document.getElementById('type-analysis');
+        if (typeList) {
+          typeList.innerHTML = '';
+          
+          // Prefer database analysis, but fallback to current results if needed
+          let typeData = analysis.byType;
+          if (!typeData || Object.keys(typeData).length === 0) {
+            // Generate from current results
+            const typeCounts = {};
+            lastResults.forEach(r => {
+              const vulnType = r.vulnerabilityType || r.type || r.check_id || r.tool || 'Security Issue';
+              typeCounts[vulnType] = (typeCounts[vulnType] || 0) + 1;
+            });
+            typeData = typeCounts;
+          }
+          
+          Object.entries(typeData)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .forEach(([type, count]) => {
+              const item = document.createElement('li');
+              item.className = 'analysis-item';
+              item.innerHTML = \`
+                <span class="analysis-item-label">\${type}</span>
+                <span class="analysis-item-count">\${count}</span>
+              \`;
+              typeList.appendChild(item);
+            });
+        }
+        
+        // Render by file
+        const fileList = document.getElementById('file-analysis');
+        if (fileList && analysis.byFile) {
+          fileList.innerHTML = '';
+          Object.entries(analysis.byFile).slice(0, 10).forEach(([file, count]) => {
+            const item = document.createElement('li');
+            item.className = 'analysis-item';
+            const fileName = file.split('/').pop() || file;
+            item.innerHTML = \`
+              <span class="analysis-item-label" title="\${file}">\${fileName}</span>
+              <span class="analysis-item-count">\${count}</span>
+            \`;
+            fileList.appendChild(item);
+          });
+        }
+      }
+      
+      function renderScanHistory(scans) {
+        const historyList = document.getElementById('history-list');
+        if (!historyList) return;
+        
+        historyList.innerHTML = '';
+        scans.forEach(scan => {
+          const item = document.createElement('li');
+          item.className = 'history-item';
+          const scanTime = new Date(scan.timestamp).toLocaleString();
+          item.innerHTML = \`
+            <div class="history-info">
+              <div class="history-scan-type">\${scan.scanType || 'Security Scan'}</div>
+              <div class="history-time">\${scanTime}</div>
+            </div>
+            <div class="history-stats">
+              <span class="history-stat" style="color: var(--vscode-inputValidation-errorForeground);">\${scan.criticalCount || 0} Critical</span>
+              <span class="history-stat" style="color: var(--vscode-inputValidation-warningForeground);">\${scan.highCount || 0} High</span>
+              <span class="history-stat">\${scan.totalVulnerabilities || 0} Total</span>
+            </div>
+          \`;
+          item.onclick = () => {
+            vscode.postMessage({ command: 'loadScan', scanId: scan.id });
+          };
+          historyList.appendChild(item);
         });
       }
         
@@ -8088,14 +10623,122 @@ function getResultsPanelHtml() {
             document.getElementById('explanationPanel').style.display = 'block';
         }
         
+        function openFile(filePath, lineNumber) {
+            // Validate file path - prevent auto-opening invalid paths
+            if (!filePath || filePath.trim() === '' || filePath === 'undefined' || filePath === 'null') {
+                console.warn('openFile: No valid file path provided', filePath);
+                return;
+            }
+            
+            // Ensure line number is valid
+            const line = parseInt(lineNumber) || 1;
+            if (line < 1) {
+                console.warn('openFile: Invalid line number', lineNumber);
+                return;
+            }
+            
+            console.log('openFile: Opening file', filePath, 'at line', line);
+            
+            // Send message to extension to open the file
+            vscode.postMessage({
+                command: 'openFile',
+                filePath: filePath.trim(),
+                lineNumber: line
+            });
+        }
+        
       window.addEventListener('message', function(event) {
             const message = event.data;
+            console.log('Webview received message:', message.command, {
+              resultCount: message.results?.length || 0,
+              hasStatistics: !!message.scanStatistics,
+              hasRecentScans: message.recentScans?.length || 0
+            });
+            
         if (message.command === 'updateResults') {
-          renderResults(message.results);
-                updateScanStatus('Scan complete');
-                updateRefreshButton(false);
-                const now = new Date();
-                document.getElementById('scan-time').textContent = now.toLocaleTimeString();
+          console.log('Processing updateResults command', {
+            resultsLength: message.results?.length || 0,
+            results: message.results
+          });
+          lastResults = message.results || [];
+          
+          // Store vulnerability analysis and recent scans for charts
+          if (message.vulnerabilityAnalysis) {
+            vulnerabilityAnalysisData = message.vulnerabilityAnalysis;
+          }
+          if (message.recentScans) {
+            recentScansData = message.recentScans;
+          }
+          
+          renderResults(lastResults);
+          
+          // Update with CURRENT scan statistics only (not aggregated)
+          if (message.scanStatistics) {
+            const stats = message.scanStatistics;
+            // Use current scan stats, not aggregated totals
+            document.getElementById('total-count').textContent = stats.totalVulnerabilities || lastResults.length;
+            document.getElementById('critical-count').textContent = stats.criticalCount || 0;
+            document.getElementById('high-count').textContent = stats.highCount || 0;
+            document.getElementById('medium-count').textContent = stats.mediumCount || 0;
+            document.getElementById('low-count').textContent = stats.lowCount || 0;
+          } else {
+            // Fallback: calculate from current results
+            const stats = {
+              total: lastResults.length,
+              critical: lastResults.filter((r) => {
+                const s = (r.severity || '').toUpperCase();
+                return s === 'CRITICAL' || s === 'ERROR';
+              }).length,
+              high: lastResults.filter((r) => {
+                const s = (r.severity || '').toUpperCase();
+                return s === 'HIGH' || s === 'WARNING';
+              }).length,
+              medium: lastResults.filter((r) => {
+                const s = (r.severity || '').toUpperCase();
+                return s === 'MEDIUM' || s === 'INFO';
+              }).length,
+              low: lastResults.filter((r) => {
+                const s = (r.severity || '').toUpperCase();
+                return s === 'LOW';
+              }).length
+            };
+            document.getElementById('total-count').textContent = stats.total;
+            document.getElementById('critical-count').textContent = stats.critical;
+            document.getElementById('high-count').textContent = stats.high;
+            document.getElementById('medium-count').textContent = stats.medium;
+            document.getElementById('low-count').textContent = stats.low;
+          }
+          
+          // Render vulnerability analysis if available
+          if (message.vulnerabilityAnalysis) {
+            renderVulnerabilityAnalysis(message.vulnerabilityAnalysis);
+          }
+          
+          // Render scan history if available
+          if (message.recentScans && message.recentScans.length > 0) {
+            renderScanHistory(message.recentScans);
+          }
+          
+          // Render charts with current results and stats
+          const chartStats = {
+            total: lastResults.length,
+            critical: parseInt(document.getElementById('critical-count').textContent) || 0,
+            high: parseInt(document.getElementById('high-count').textContent) || 0,
+            medium: parseInt(document.getElementById('medium-count').textContent) || 0,
+            low: parseInt(document.getElementById('low-count').textContent) || 0
+          };
+          renderCharts(lastResults, chartStats);
+          
+          // Update scan status based on whether we have results
+          if (lastResults.length === 0) {
+            updateScanStatus('Ready to scan');
+            document.getElementById('scan-time').textContent = '';
+          } else {
+            updateScanStatus('Scan complete');
+            updateRefreshButton(false);
+            const now = new Date();
+            document.getElementById('scan-time').textContent = now.toLocaleTimeString();
+          }
         }
         if (message.command === 'llmResponse') {
                 const title = message.action.toUpperCase() + ' Result for Issue #' + (message.index + 1);
@@ -8126,14 +10769,14 @@ function getTeamDashboardHtml(teamLead: TeamLead, reports: TeamVulnerabilityRepo
       body { font-family: var(--vscode-font-family); background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); }
       .header { background: var(--vscode-sideBar-background); padding: 1rem; border-bottom: 1px solid var(--vscode-editorWidget-border); }
       .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; padding: 1rem; }
-      .stat-card { background: var(--vscode-editorWidget-background); padding: 1rem; border-radius: 6px; }
+      .stat-card { background: var(--vscode-editorWidget-background); padding: 1rem; border-radius: 0; }
       .member-list { padding: 1rem; }
-      .member-item { background: var(--vscode-editorWidget-background); margin: 0.5rem 0; padding: 1rem; border-radius: 6px; }
+      .member-item { background: var(--vscode-editorWidget-background); margin: 0.5rem 0; padding: 1rem; border-radius: 0; }
       .reporting-settings { padding: 1rem; }
       .form-group { margin: 1rem 0; }
       label { display: block; margin-bottom: 0.5rem; }
-      input, select { width: 100%; padding: 0.5rem; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; }
-      button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; }
+      input, select { width: 100%; padding: 0.5rem; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 0; }
+      button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 0.5rem 1rem; border-radius: 0; cursor: pointer; }
     </style>
   </head>
   <body>
@@ -8708,7 +11351,7 @@ function getUserProfileHtml(user: UserProfile | null, history: VulnerabilityHist
             
             .severity-badge {
                 padding: 2px 6px;
-                border-radius: 3px;
+                border-radius: 0;
                 font-size: var(--font-size-xs);
                 font-weight: var(--font-weight-medium);
             }
@@ -9021,7 +11664,7 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             background: var(--vscode-input-background);
             color: var(--vscode-input-foreground);
             border: 1px solid var(--vscode-input-border);
-            border-radius: 4px;
+            border-radius: 0;
             font-family: inherit;
             font-size: 13px;
             min-width: 200px;
@@ -9050,7 +11693,7 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             bottom: 0;
             background-color: var(--vscode-input-background);
             border: 1px solid var(--vscode-input-border);
-            border-radius: 24px;
+            border-radius: 0;
             transition: 0.2s;
         }
         .checkbox-slider:before {
@@ -9061,7 +11704,7 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             left: 2px;
             bottom: 2px;
             background-color: var(--vscode-foreground);
-            border-radius: 50%;
+            border-radius: 0;
             transition: 0.2s;
         }
         input:checked + .checkbox-slider {
@@ -9078,7 +11721,7 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             background: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
-            border-radius: 6px;
+            border-radius: 0;
             cursor: pointer;
             font-weight: 500;
             font-size: 13px;

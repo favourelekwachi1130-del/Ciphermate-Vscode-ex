@@ -1453,24 +1453,35 @@ Return JSON:
 
   private async executeGenerateFix(vulnerability: any, codeContext?: string): Promise<any> {
     try {
-      const prompt = `Generate a secure fix for this vulnerability:
+      // Use REAL code from file - prioritize codeContext which comes from actual file reading
+      const realCode = codeContext || vulnerability.code || vulnerability.issue_text || '';
+      
+      const prompt = `Generate a secure fix for this vulnerability using ONLY the actual code from the file:
 
 Vulnerability Type: ${vulnerability.type || vulnerability.issue_type || 'Security Issue'}
 Severity: ${vulnerability.severity || 'UNKNOWN'}
 Description: ${vulnerability.description || vulnerability.extra?.message || 'Security vulnerability'}
 Location: ${vulnerability.path || vulnerability.file || 'Unknown'}:${vulnerability.start?.line || vulnerability.line_number || 'Unknown'}
 
-Vulnerable Code:
+CRITICAL: Use ONLY the actual code shown below. Do NOT invent or hallucinate code.
+
+ACTUAL VULNERABLE CODE FROM FILE:
 \`\`\`
-${vulnerability.code || vulnerability.issue_text || 'Code not provided'}
+${realCode}
 \`\`\`
 
-${codeContext ? `Surrounding Context:\n\`\`\`\n${codeContext}\n\`\`\`\n` : ''}
+${codeContext && codeContext !== realCode ? `SURROUNDING CONTEXT:\n\`\`\`\n${codeContext}\n\`\`\`\n` : ''}
+
+IMPORTANT REQUIREMENTS:
+- Use ONLY the code shown above - do NOT create fictional code
+- Show the exact vulnerable line(s) and their fixed version
+- Provide the complete fixed code block with real code
+- The fixedCode must be based on the actual code, not invented
 
 Generate a secure fix. Return JSON:
 {
-  "originalCode": "vulnerable code",
-  "fixedCode": "secure replacement code",
+  "originalCode": "actual vulnerable code from file",
+  "fixedCode": "secure replacement using real code",
   "explanation": "why this fix is secure",
   "securityImprovements": ["improvement1", "improvement2"],
   "testingNotes": "how to test the fix",

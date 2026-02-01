@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { AIAgentCore, AgentRequest, AgentResponse } from './core';
 import { AgenticCore } from './agentic-core';
 import { CyberAgentAdapter } from './cyber-agent-adapter';
+import { getScanDataService, setLastScanResults, postResultsToWebviewExported } from '../extension';
 
 /**
  * Conversational Chat Interface - The only UI users need
@@ -455,8 +456,69 @@ export class ChatInterface {
         
         // Get state for additional context
         const state = this.agenticCore.getState();
-        if (state.vulnerabilities.length > 0) {
-          // Don't add extra message, it's already in the response
+        
+        // Extract vulnerabilities from state - check both vulnerabilities array and scanResults
+        // state.vulnerabilities is populated by updateStateFromToolResult
+        // state.scanResults is set directly from scanResult.vulnerabilities
+        let vulnerabilitiesToSave: any[] = [];
+        
+        // Check if vulnerabilities are directly in state.vulnerabilities (preferred)
+        if (state.vulnerabilities && state.vulnerabilities.length > 0) {
+          vulnerabilitiesToSave = state.vulnerabilities;
+        } 
+        // Fallback to scanResults (set at line 563 in agentic-core.ts)
+        else if (state.scanResults && Array.isArray(state.scanResults) && state.scanResults.length > 0) {
+          vulnerabilitiesToSave = state.scanResults;
+        }
+        
+        // Save scan results to database and update dashboard if we have vulnerabilities
+        if (vulnerabilitiesToSave.length > 0) {
+          try {
+            const scanDataService = getScanDataService();
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            const workspacePath = workspaceFolders?.[0]?.uri.fsPath || '';
+            
+            if (scanDataService && workspacePath) {
+              // Convert vulnerabilities to the format expected by scanDataService
+              const vulnerabilities = vulnerabilitiesToSave.map((v: any) => ({
+                ...v,
+                tool: v.tool || v.scanner || 'AgenticCore',
+                path: v.path || v.file || v.location?.file || '',
+                line: v.line || v.start?.line || v.location?.line || 0,
+                severity: v.severity || 'medium',
+                title: v.title || v.message || 'Security Issue',
+                description: v.description || v.message || '',
+                type: v.type || v.check_id || v.rule || 'Unknown'
+              }));
+              
+              // Update lastScanResults
+              setLastScanResults(vulnerabilities);
+              
+              // Save to database
+              await scanDataService.saveScan({
+                scanType: 'AgenticCore Scan',
+                workspacePath,
+                vulnerabilities: vulnerabilities,
+                duration: state.scanDuration || 0,
+                timestamp: new Date(),
+                metadata: { 
+                  scanner: 'agentic-core',
+                  scanResult: state.scanResults ? JSON.stringify(state.scanResults) : undefined
+                }
+              });
+              
+              console.log('AgenticCore: Scan results saved to database', { 
+                vulnerabilityCount: vulnerabilities.length 
+              });
+              
+              // Update results dashboard
+              await postResultsToWebviewExported();
+              console.log('AgenticCore: Results dashboard updated');
+            }
+          } catch (error) {
+            console.error('AgenticCore: Failed to save scan results', error);
+            // Don't show error to user, just log it
+          }
         }
       } else {
         // Use CyberAgent for conversational responses (regular human communication)

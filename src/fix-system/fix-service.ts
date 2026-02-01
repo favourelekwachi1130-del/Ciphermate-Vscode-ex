@@ -867,20 +867,30 @@ export class FixService {
     securityImprovements: string[];
     testingNotes: string;
   }> {
-    // Simplified prompt for small models - avoid complex JSON with nested quotes
-    const codeSnippet = vulnerability.code || 'Code not provided';
+    // Get REAL code from the file - prioritize codeContext which comes from actual file reading
+    const realCode = codeContext || vulnerability.code || '';
+    
     const prompt = `Fix this ${vulnerability.type} security vulnerability.
 
-CODE TO FIX:
-${codeSnippet}
+CRITICAL: Use ONLY the actual code from the file. Do NOT invent or hallucinate code.
 
-CONTEXT:
-${codeContext}
+ACTUAL VULNERABLE CODE FROM FILE:
+\`\`\`
+${realCode}
+\`\`\`
+
+${codeContext && codeContext !== realCode ? `SURROUNDING CONTEXT:\n\`\`\`\n${codeContext}\n\`\`\`\n` : ''}
+
+IMPORTANT REQUIREMENTS:
+- Use ONLY the code shown above - do NOT create fictional code
+- Show the exact vulnerable line(s) and their fixed version
+- Provide the complete fixed code block with real code
+- Explain what changed and why it's secure
 
 Provide the fixed code inside a code block. Example format:
 
 \`\`\`javascript
-// your fixed code here
+// your fixed code here using the REAL code from above
 \`\`\`
 
 Then briefly explain what you changed and why it's more secure.`;
