@@ -88,9 +88,23 @@ export class RuleBasedFixer {
       return this.fixInsecureRandom(vulnerability);
     }
 
+    // Eval detection - improved matching without requiring 'deserialization' keyword
     if (vulnType.includes('eval') ||
-        (combinedText.includes('eval') && combinedText.includes('deserialization'))) {
+        vulnType === 'eval' ||
+        title.includes('eval') ||
+        title.includes('function constructor') ||
+        code.includes('eval(') ||
+        code.includes('new Function(')) {
       return this.fixEval(vulnerability);
+    }
+
+    // YAML injection handler
+    if (vulnType.includes('yaml') ||
+        vulnType === 'yaml-injection' ||
+        combinedText.includes('yaml') ||
+        code.includes('yaml.load') ||
+        code.includes('yaml.unsafe_load')) {
+      return this.fixYamlUnsafeLoad(vulnerability);
     }
 
     if (vulnType.includes('innerHTML') || vulnType.includes('innerhtml') ||
@@ -104,10 +118,17 @@ export class RuleBasedFixer {
       return this.fixWeakHash(vulnerability);
     }
 
-    // Add insecure-deserialization handler
+    // Add insecure-deserialization handler (includes pickle)
     if (vulnType.includes('deserialization') || vulnType.includes('deserialize') ||
-        combinedText.includes('deserialization') || combinedText.includes('pickle') || combinedText.includes('unserialize')) {
+        combinedText.includes('deserialization') || combinedText.includes('unserialize') ||
+        combinedText.includes('pickle') ||
+        code.includes('pickle.load') || code.includes('pickle.loads')) {
       return this.fixInsecureDeserialization(vulnerability);
+    }
+
+    // Python subprocess shell=True handler (treated as command injection)
+    if (code.includes('shell=True') || code.includes('shell = True')) {
+      return this.fixSubprocessShell(vulnerability);
     }
 
     // Add SSRF handler
@@ -435,6 +456,47 @@ ${code}`,
         'Avoid shell interpretation of user input'
       ],
       testingNotes: 'Test with: ; ls -la, | cat /etc/passwd, $(whoami)'
+    };
+  }
+
+  /**
+   * Fix Python subprocess shell=True vulnerability
+   */
+  private fixSubprocessShell(vulnerability: Vulnerability): RuleBasedFix {
+    const code = vulnerability.code || '';
+
+    // Replace shell=True with shell=False
+    let fixedCode = code.replace(/shell\s*=\s*True/gi, 'shell=False');
+
+    // If it looks like a string command is being passed, suggest using a list
+    if (code.match(/subprocess\.\w+\s*\(\s*["']/)) {
+      return {
+        originalCode: code,
+        fixedCode: `# Command Injection Prevention: Use list of arguments instead of shell string
+# Before: subprocess.run("command arg1 arg2", shell=True)
+# After:  subprocess.run(["command", "arg1", "arg2"], shell=False)
+# Fixed code with shell=False (requires converting string to list):
+${fixedCode}`,
+        explanation: 'Disabled shell execution and suggest using argument list to prevent command injection',
+        confidence: 0.85,
+        securityImprovements: [
+          'shell=False prevents shell interpretation of special characters',
+          'Using list of arguments prevents command injection'
+        ],
+        testingNotes: 'Convert command string to list format: ["cmd", "arg1", "arg2"]'
+      };
+    }
+
+    return {
+      originalCode: code,
+      fixedCode,
+      explanation: 'Changed shell=True to shell=False to prevent command injection',
+      confidence: 0.9,
+      securityImprovements: [
+        'Disables shell interpretation',
+        'Special characters not processed as shell commands'
+      ],
+      testingNotes: 'Verify command works without shell features. Pass arguments as list.'
     };
   }
 
@@ -846,6 +908,52 @@ ${code}`,
       confidence: 0.6,
       securityImprovements: ['Validate input before deserialization'],
       testingNotes: 'Implement proper input validation and type checking'
+    };
+  }
+
+  /**
+   * Fix YAML unsafe load vulnerabilities
+   */
+  private fixYamlUnsafeLoad(vulnerability: Vulnerability): RuleBasedFix {
+    const code = vulnerability.code || '';
+
+    // Pattern: yaml.load(x) → yaml.safe_load(x)
+    if (code.includes('yaml.load') || code.includes('yaml.unsafe_load')) {
+      const fixedCode = code
+        .replace(/yaml\.unsafe_load\s*\(/g, 'yaml.safe_load(')
+        .replace(/yaml\.load\s*\(\s*([^,)]+)\s*\)/g, 'yaml.safe_load($1)');
+
+      return {
+        originalCode: code,
+        fixedCode,
+        explanation: 'Replaced unsafe YAML load with safe_load to prevent code execution',
+        confidence: 0.95,
+        securityImprovements: [
+          'safe_load only parses safe YAML subsets',
+          'Prevents arbitrary code execution from YAML files'
+        ],
+        testingNotes: 'Verify YAML parsing still works correctly. safe_load does not support custom Python objects.'
+      };
+    }
+
+    // Generic fallback
+    return {
+      originalCode: code,
+      fixedCode: `# YAML Injection Prevention:
+# Always use yaml.safe_load() instead of yaml.load()
+# yaml.safe_load() only parses standard YAML types
+# Example:
+#   import yaml
+#   data = yaml.safe_load(file_content)
+# Original code:
+${code}`,
+      explanation: 'yaml.load can execute arbitrary Python code from YAML files',
+      confidence: 0.7,
+      securityImprovements: [
+        'Use yaml.safe_load() for untrusted input',
+        'Prevents arbitrary code execution'
+      ],
+      testingNotes: 'Ensure YAML content does not require custom Python objects'
     };
   }
 

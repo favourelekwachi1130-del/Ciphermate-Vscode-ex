@@ -27,16 +27,27 @@ const PATTERN_TO_TYPE: Record<string, string> = {
   'SQL Injection (Template Literal)': 'sql-injection',
   'SQL Injection (String Concatenation)': 'sql-injection',
   'SQL Injection (Raw Query)': 'sql-injection',
+  'SQL Injection (Variable Construction)': 'sql-injection',
+  'SQL Injection (Python f-string)': 'sql-injection',
   'XSS - innerHTML': 'xss',
   'XSS - dangerouslySetInnerHTML': 'xss',
+  'XSS - innerHTML Assignment': 'xss',
   'Command Injection': 'command-injection',
+  'Command Injection (String Concat)': 'command-injection',
+  'Command Injection (Template Literal)': 'command-injection',
+  'Python subprocess shell=True': 'command-injection',
   'Path Traversal': 'path-traversal',
   'Weak Hash Algorithm (MD5)': 'weak-hash',
   'Weak Hash Algorithm (SHA1)': 'weak-hash',
   'Insecure Random (Math.random)': 'insecure-random',
+  'Insecure Random (Python random)': 'insecure-random',
   'Hardcoded Password': 'hardcoded-secret',
   'Weak Password Validation': 'weak-password',
   'Insecure Deserialization': 'insecure-deserialization',
+  'eval Usage': 'eval',
+  'Function Constructor': 'eval',
+  'Pickle Deserialization': 'insecure-deserialization',
+  'YAML Unsafe Load': 'yaml-injection',
   'SSRF Vulnerability': 'ssrf',
   'Insecure Direct Object Reference': 'idor',
   'Debug Mode Enabled': 'debug-mode',
@@ -132,6 +143,28 @@ export class CodePatternScanner extends BaseScanner {
         fix: 'Use parameterized queries or ORM methods instead of raw SQL.',
         fileExtensions: ['.js', '.ts', '.py', '.java', '.php'],
       },
+      // NEW: SQL Injection - Variable construction with string concatenation
+      {
+        name: 'SQL Injection (Variable Construction)',
+        pattern: /(?:const|let|var|=)\s*["'`].*?(?:SELECT|INSERT|UPDATE|DELETE|DROP|FROM|WHERE).*?["'`]\s*\+/i,
+        severity: 'high',
+        description: 'SQL query constructed with string concatenation. Risk of SQL injection.',
+        cwe: ['CWE-89'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use parameterized queries instead of string concatenation.',
+        fileExtensions: ['.js', '.ts', '.py', '.java', '.php', '.cs'],
+      },
+      // NEW: SQL Injection - Python f-string
+      {
+        name: 'SQL Injection (Python f-string)',
+        pattern: /f["'].*?(?:SELECT|INSERT|UPDATE|DELETE|DROP|FROM|WHERE).*?\{/i,
+        severity: 'high',
+        description: 'SQL query constructed with Python f-string interpolation. Risk of SQL injection.',
+        cwe: ['CWE-89'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use parameterized queries with cursor.execute(sql, params).',
+        fileExtensions: ['.py'],
+      },
 
       // XSS - Cross-Site Scripting (OWASP A03:2021)
       {
@@ -154,6 +187,17 @@ export class CodePatternScanner extends BaseScanner {
         fix: 'Sanitize HTML content or use safer alternatives.',
         fileExtensions: ['.jsx', '.tsx'],
       },
+      // NEW: XSS - Broader innerHTML assignment detection
+      {
+        name: 'XSS - innerHTML Assignment',
+        pattern: /\.innerHTML\s*=\s*[^;]+/i,
+        severity: 'medium',
+        description: 'innerHTML assignment detected. Can lead to XSS if user data is included.',
+        cwe: ['CWE-79'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use textContent instead, or sanitize with DOMPurify before using innerHTML.',
+        fileExtensions: ['.js', '.ts', '.jsx', '.tsx'],
+      },
 
       // Command Injection (OWASP A03:2021)
       {
@@ -165,6 +209,39 @@ export class CodePatternScanner extends BaseScanner {
         owasp: 'A03:2021 - Injection',
         fix: 'Validate and sanitize user input, use parameterized command execution.',
         fileExtensions: ['.js', '.ts', '.py', '.php', '.sh'],
+      },
+      // NEW: Command Injection - String concatenation (any variable)
+      {
+        name: 'Command Injection (String Concat)',
+        pattern: /(exec|execSync|spawn|spawnSync|system|os\.system|os\.popen)\s*\(\s*["'`][^"'`]*["'`]\s*\+/i,
+        severity: 'critical',
+        description: 'Shell command constructed with string concatenation. Risk of command injection.',
+        cwe: ['CWE-78'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use execFile with argument array instead of shell command string.',
+        fileExtensions: ['.js', '.ts', '.py', '.php'],
+      },
+      // NEW: Command Injection - Template literal
+      {
+        name: 'Command Injection (Template Literal)',
+        pattern: /(exec|execSync|spawn|spawnSync)\s*\(\s*`[^`]*\$\{/i,
+        severity: 'critical',
+        description: 'Shell command constructed with template literal interpolation. Risk of command injection.',
+        cwe: ['CWE-78'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use execFile with argument array instead of shell command string.',
+        fileExtensions: ['.js', '.ts'],
+      },
+      // NEW: Python subprocess shell=True
+      {
+        name: 'Python subprocess shell=True',
+        pattern: /subprocess\.\w+\s*\([^)]*shell\s*=\s*True/i,
+        severity: 'high',
+        description: 'subprocess with shell=True allows command injection through shell interpretation.',
+        cwe: ['CWE-78'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use shell=False and pass command as a list of arguments.',
+        fileExtensions: ['.py'],
       },
 
       // Path Traversal (OWASP A01:2021)
@@ -247,6 +324,61 @@ export class CodePatternScanner extends BaseScanner {
         owasp: 'A08:2021 - Software and Data Integrity Failures',
         fix: 'Avoid deserializing untrusted data. Use safe serialization formats or validate input.',
         fileExtensions: ['.js', '.ts', '.py', '.java', '.php'],
+      },
+      // NEW: eval Usage - standalone detection
+      {
+        name: 'eval Usage',
+        pattern: /\beval\s*\(/i,
+        severity: 'critical',
+        description: 'eval() can execute arbitrary code. Dangerous if passed user input.',
+        cwe: ['CWE-95'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Use JSON.parse for data, or a safe expression parser for calculations.',
+        fileExtensions: ['.js', '.ts', '.py', '.php'],
+      },
+      // NEW: Function Constructor
+      {
+        name: 'Function Constructor',
+        pattern: /new\s+Function\s*\(/i,
+        severity: 'high',
+        description: 'Function constructor can execute arbitrary code like eval().',
+        cwe: ['CWE-95'],
+        owasp: 'A03:2021 - Injection',
+        fix: 'Avoid dynamic code generation. Use safe alternatives for the specific use case.',
+        fileExtensions: ['.js', '.ts'],
+      },
+      // NEW: Pickle Deserialization (Python)
+      {
+        name: 'Pickle Deserialization',
+        pattern: /pickle\.(loads?|load)\s*\(/i,
+        severity: 'critical',
+        description: 'Pickle deserialization can execute arbitrary code. Never use with untrusted data.',
+        cwe: ['CWE-502'],
+        owasp: 'A08:2021 - Software and Data Integrity Failures',
+        fix: 'Use JSON or other safe serialization formats instead of pickle.',
+        fileExtensions: ['.py'],
+      },
+      // NEW: YAML Unsafe Load (Python)
+      {
+        name: 'YAML Unsafe Load',
+        pattern: /yaml\.(load|unsafe_load)\s*\(/i,
+        severity: 'high',
+        description: 'yaml.load without Loader parameter can execute arbitrary code.',
+        cwe: ['CWE-502'],
+        owasp: 'A08:2021 - Software and Data Integrity Failures',
+        fix: 'Use yaml.safe_load() instead of yaml.load().',
+        fileExtensions: ['.py'],
+      },
+      // NEW: Python insecure random
+      {
+        name: 'Insecure Random (Python random)',
+        pattern: /\brandom\.(choice|randint|random|shuffle|sample)\s*\(/i,
+        severity: 'medium',
+        description: 'Python random module is not cryptographically secure. Use secrets module for security.',
+        cwe: ['CWE-330'],
+        owasp: 'A02:2021 - Cryptographic Failures',
+        fix: 'Use the secrets module for cryptographically secure random values.',
+        fileExtensions: ['.py'],
       },
 
       // SSRF - Server-Side Request Forgery
