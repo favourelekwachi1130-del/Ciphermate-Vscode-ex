@@ -13,6 +13,7 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import {
   FixProposal,
   FixDiff,
@@ -30,6 +31,10 @@ import { FixApplicator } from './fix-applicator';
 import { FixValidator } from './fix-validator';
 import { UndoManager } from './undo-manager';
 import { RuleBasedFixer, getRuleBasedFixer } from './rule-based-fixer';
+import { getDependencyFixer } from './dependency-fixer';
+import { getTaskGuard } from './task-guard';
+import { getReviewSubagent } from './review-subagent';
+import { getMultiAIFixPipeline } from './multi-ai-fix-pipeline';
 
 export class FixService {
   private context: vscode.ExtensionContext;
@@ -127,11 +132,64 @@ export class FixService {
    * Generate a fix proposal for a vulnerability
    */
   async generateFix(vulnerability: Vulnerability): Promise<FixProposal> {
-    // Get the surrounding code context
-    const codeContext = await this.getCodeContext(vulnerability);
+    // One-Click SCA AutoFix: dependency vulnerabilities (package.json, requirements.txt)
+    if (vulnerability.type === 'dependency-vulnerability') {
+      const depFixer = getDependencyFixer();
+      const depFix = depFixer.generateFix(vulnerability);
+      if (depFix) {
+        const proposal: FixProposal = {
+          id: `fix-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          vulnerabilityId: vulnerability.id,
+          vulnerability,
+          originalCode: depFix.originalCode,
+          fixedCode: depFix.fixedCode,
+          explanation: depFix.explanation,
+          confidence: depFix.confidence,
+          riskLevel: 'low',
+          complexity: 'simple',
+          securityImprovements: depFix.securityImprovements,
+          testingNotes: depFix.testingNotes,
+          startLine: vulnerability.line || 0,
+          endLine: vulnerability.line || 0,
+          createdAt: new Date()
+        };
+        this.pendingProposals.set(proposal.id, proposal);
+        return proposal;
+      }
+    }
 
-    // Generate fix using AI
-    const aiResponse = await this.callAIForFix(vulnerability, codeContext);
+    // SAST: Try rule-based fixer first (deterministic, produces actual edits)
+    const codeContext = await this.getCodeContext(vulnerability);
+    const vulnWithCode = { ...vulnerability, code: codeContext || vulnerability.code };
+    const ruleBasedFix = this.ruleBasedFixer.generateFix(vulnWithCode);
+
+    let aiResponse: {
+      originalCode: string;
+      fixedCode: string;
+      explanation: string;
+      confidence: number;
+      securityImprovements: string[];
+      testingNotes: string;
+      envVarsToCreate?: Array<{ name: string; value: string }>;
+    };
+
+    if (ruleBasedFix && !ruleBasedFix.fixedCode.includes('// Hardcoded Secret Prevention:') &&
+        !ruleBasedFix.fixedCode.includes('// XSS Prevention:') &&
+        !ruleBasedFix.fixedCode.includes('// SQL Injection Prevention:')) {
+      // Use rule-based fix - it produces real editable code, not comment-only advice
+      aiResponse = {
+        originalCode: ruleBasedFix.originalCode,
+        fixedCode: ruleBasedFix.fixedCode,
+        explanation: ruleBasedFix.explanation,
+        confidence: ruleBasedFix.confidence,
+        securityImprovements: ruleBasedFix.securityImprovements,
+        testingNotes: ruleBasedFix.testingNotes,
+        envVarsToCreate: ruleBasedFix.envVarsToCreate
+      };
+    } else {
+      // Fall back to AI for fixes we don't have solid rules for
+      aiResponse = await this.callAIForFix(vulnerability, codeContext);
+    }
 
     // Create fix proposal
     const proposal: FixProposal = {
@@ -147,8 +205,9 @@ export class FixService {
       securityImprovements: aiResponse.securityImprovements || [],
       testingNotes: aiResponse.testingNotes,
       startLine: vulnerability.line || 1,
-      endLine: (vulnerability.line || 1) + (vulnerability.code?.split('\n').length || 1) - 1,
-      createdAt: new Date()
+      endLine: (vulnerability.line || 1) + Math.max(0, (codeContext || aiResponse.originalCode || '').split('\n').length - 1),
+      createdAt: new Date(),
+      envVarsToCreate: aiResponse.envVarsToCreate
     };
 
     // Recalculate confidence using validator
@@ -174,9 +233,90 @@ export class FixService {
   }
 
   /**
+   * Check if a proposal is comment-only advice (not a real code fix).
+   * Public for use by batch fix / extension to filter proposals.
+   */
+  isProposalCommentOnly(proposal: FixProposal): boolean {
+    return this.isCommentOnlyFix(proposal?.fixedCode || '');
+  }
+
+  /**
+   * Detect generic comment-only "fixes" (advice blocks, not real code edits)
+   */
+  private isCommentOnlyFix(fixedCode: string): boolean {
+    return !fixedCode || (
+      fixedCode.includes('// Hardcoded Secret Prevention:') ||
+      fixedCode.includes('// XSS Prevention:') ||
+      fixedCode.includes('// SQL Injection Prevention:') ||
+      fixedCode.includes('// Command Injection Prevention:') ||
+      fixedCode.includes('// Path Traversal Prevention:')
+    );
+  }
+
+  /**
+   * Filter out comment-only proposals - only return proposals with real code edits
+   */
+  public filterApplyableProposals(proposals: FixProposal[]): FixProposal[] {
+    return proposals.filter(p => !this.isCommentOnlyFix(p.fixedCode));
+  }
+
+  /**
    * Apply a fix after user confirmation
    */
   async applyFix(proposal: FixProposal, confirmed: boolean = false): Promise<FixResult> {
+    if (this.isCommentOnlyFix(proposal.fixedCode)) {
+      return {
+        success: false,
+        fixId: proposal.id,
+        backupId: '',
+        validated: false,
+        error: 'This is advice only, not an executable fix. Configure AI provider for automatic fixes.',
+        status: 'failed',
+        appliedAt: new Date(),
+        filePath: proposal.vulnerability.file
+      };
+    }
+
+    // TaskGuard - validate fix before applying
+    const taskGuard = getTaskGuard();
+    const guardResult = taskGuard.validate(proposal);
+    if (!guardResult.passed) {
+      return {
+        success: false,
+        fixId: proposal.id,
+        backupId: '',
+        validated: false,
+        error: guardResult.reason || 'Fix failed pre-apply validation',
+        status: 'failed',
+        appliedAt: new Date(),
+        filePath: proposal.vulnerability.file
+      };
+    }
+
+    // ReviewSubagent - optional AI review when enabled
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    if (config.get('fixes.enableReviewSubagent', false)) {
+      const reviewSubagent = getReviewSubagent(this.context);
+      const reviewResult = await reviewSubagent.review(proposal);
+      if (!reviewResult.approved && reviewResult.confidence < 0.5) {
+        return {
+          success: false,
+          fixId: proposal.id,
+          backupId: '',
+          validated: false,
+          error: reviewResult.reason || 'Fix did not pass review',
+          status: 'failed',
+          appliedAt: new Date(),
+          filePath: proposal.vulnerability.file
+        };
+      }
+      if (reviewResult.suggestions?.length) {
+        vscode.window.showInformationMessage(
+          `Review: ${reviewResult.reason || 'OK'}. Suggestions: ${reviewResult.suggestions?.slice(0, 2).join('; ') || 'none'}`
+        );
+      }
+    }
+
     // Check if confirmation is required
     if (this.config.requireConfirmation && !confirmed) {
       return {
@@ -189,6 +329,77 @@ export class FixService {
         appliedAt: new Date(),
         filePath: proposal.vulnerability.file
       };
+    }
+
+    // Pre-apply syntax validation - prevent applying fixes that would break the file
+    const resultingContent = await this.fixApplicator.getResultingContent(proposal);
+    if (resultingContent) {
+      const syntaxResult = await this.fixValidator.validateSyntax(
+        resultingContent.content,
+        resultingContent.language,
+        true
+      );
+      if (!syntaxResult.valid) {
+        return {
+          success: false,
+          fixId: proposal.id,
+          backupId: '',
+          validated: false,
+          error: `Fix would introduce syntax errors: ${syntaxResult.errors.join('; ')}`,
+          status: 'failed',
+          appliedAt: new Date(),
+          filePath: proposal.vulnerability.file
+        };
+      }
+
+      // Multi-AI Pipeline Agent 2: Pre-Implementation Validator - AI validates before wrong code is written
+      if (this.config.enableMultiAIPipeline && config.get('fixes.multiAI.preImplementationValidator', true)) {
+        const pipeline = getMultiAIFixPipeline(this.context);
+        const preResult = await pipeline.preValidate(
+          proposal,
+          resultingContent.content,
+          resultingContent.language
+        );
+        if (!preResult.approved && preResult.confidence >= 0.5) {
+          const issues = preResult.issues?.length ? `: ${preResult.issues.join('; ')}` : '';
+          return {
+            success: false,
+            fixId: proposal.id,
+            backupId: '',
+            validated: false,
+            error: `Pre-implementation validator rejected fix${issues}. ${preResult.reason || ''}`,
+            status: 'failed',
+            appliedAt: new Date(),
+            filePath: proposal.vulnerability.file
+          };
+        }
+      }
+
+      // Multi-AI Pipeline Agent 4: Final Validator - comprehensive AI review when user requested apply
+      if (confirmed && this.config.enableMultiAIPipeline && config.get('fixes.multiAI.finalValidator', true)) {
+        const pipeline = getMultiAIFixPipeline(this.context);
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+        const projectContext = await this.getProjectContextForValidation(workspaceRoot);
+        const finalResult = await pipeline.finalValidate(
+          proposal,
+          projectContext,
+          resultingContent.content,
+          resultingContent.language
+        );
+        if (!finalResult.approved) {
+          const errs = finalResult.potentialErrors?.length ? ` Potential errors: ${finalResult.potentialErrors.join('; ')}` : '';
+          return {
+            success: false,
+            fixId: proposal.id,
+            backupId: '',
+            validated: false,
+            error: `Final validator rejected: ${finalResult.summary || 'Fix does not meet quality standards'}${errs}`,
+            status: 'failed',
+            appliedAt: new Date(),
+            filePath: proposal.vulnerability.file
+          };
+        }
+      }
     }
 
     // Check minimum confidence
@@ -217,6 +428,44 @@ export class FixService {
     const result = await this.fixApplicator.applyFix(proposal);
 
     if (result.success) {
+      // Agent 3: File/Data Handler - AI plans file creation (.env, .gitignore, etc.) when enabled
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const useFileDataHandler = this.config.enableMultiAIPipeline &&
+        vscode.workspace.getConfiguration('ciphermate').get('fixes.multiAI.fileDataHandler', true);
+
+      if (useFileDataHandler && workspaceRoot) {
+        const pipeline = getMultiAIFixPipeline(this.context);
+        const plan = await pipeline.planFileData(proposal, workspaceRoot);
+        if (plan) {
+          // Use AI plan: envVars take precedence, fallback to proposal.envVarsToCreate
+          const envVars = plan.envVars?.length ? plan.envVars : (proposal.envVarsToCreate || []);
+          if (plan.createEnv && envVars.length > 0) {
+            this.createOrAppendEnvFile(proposal.vulnerability.file, envVars);
+          }
+          if (plan.updateGitignore) {
+            this.ensureGitignoreHasEnv(workspaceRoot);
+          }
+          if (plan.otherFiles?.length) {
+            for (const relPath of plan.otherFiles) {
+              const fullPath = path.join(workspaceRoot, relPath);
+              if (!fs.existsSync(fullPath) && relPath === '.env.example') {
+                const vars = plan.envVars?.length ? plan.envVars : (proposal.envVarsToCreate || []);
+                fs.writeFileSync(
+                  fullPath,
+                  '# Copy to .env and fill in values\n' + vars.map(({ name }) => `${name}=`).join('\n') + '\n',
+                  'utf8'
+                );
+              }
+            }
+          }
+        } else if (proposal.envVarsToCreate && proposal.envVarsToCreate.length > 0) {
+          // Fallback: no AI plan, use proposal directly
+          this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
+        }
+      } else if (proposal.envVarsToCreate && proposal.envVarsToCreate.length > 0) {
+        // File/Data Handler disabled - use proposal.envVarsToCreate directly
+        this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
+      }
       // Get backup for undo manager
       const backup = await this.backupManager.getBackup(result.backupId);
       if (backup) {
@@ -354,8 +603,8 @@ export class FixService {
     }
 
     // Filter proposals by minimum confidence
-    const validProposals = proposals.filter(p => p.confidence >= this.config.minConfidence);
-    const rejectedCount = proposals.length - validProposals.length;
+    let validProposals = proposals.filter(p => p.confidence >= this.config.minConfidence);
+    let rejectedCount = proposals.length - validProposals.length;
 
     if (rejectedCount > 0) {
       vscode.window.showWarningMessage(
@@ -363,25 +612,68 @@ export class FixService {
       );
     }
 
+    // Pre-apply validation: TaskGuard + syntax check - filter out fixes that would introduce errors
+    const taskGuard = getTaskGuard();
+    const toApply: FixProposal[] = [];
+    for (const p of validProposals) {
+      if (this.isCommentOnlyFix(p.fixedCode)) continue;
+      const guardResult = taskGuard.validate(p);
+      if (!guardResult.passed) continue;
+      const resultingContent = await this.fixApplicator.getResultingContent(p);
+      if (resultingContent) {
+        const syntaxResult = await this.fixValidator.validateSyntax(
+          resultingContent.content,
+          resultingContent.language,
+          true
+        );
+        if (!syntaxResult.valid) continue;
+      }
+      toApply.push(p);
+    }
+    const syntaxRejected = validProposals.length - toApply.length;
+    if (syntaxRejected > 0) {
+      vscode.window.showWarningMessage(
+        `${syntaxRejected} fix(es) skipped - would introduce syntax errors.`
+      );
+    }
+    validProposals = toApply;
+
     // Apply all fixes
     const results = await this.fixApplicator.applyBatchFixes(validProposals);
 
-    // Track successful fixes in undo manager
+    // Track successful fixes in undo manager; Agent 3: File/Data Handler for .env when fixing secrets
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const useFileDataHandler = this.config.enableMultiAIPipeline &&
+      vscode.workspace.getConfiguration('ciphermate').get('fixes.multiAI.fileDataHandler', true);
+
     for (const result of results) {
       if (result.success) {
+        const proposal = validProposals.find(p => p.id === result.fixId);
+        if (proposal && (proposal.envVarsToCreate?.length || useFileDataHandler)) {
+          if (useFileDataHandler && workspaceRoot) {
+            const pipeline = getMultiAIFixPipeline(this.context);
+            const plan = await pipeline.planFileData(proposal, workspaceRoot);
+            if (plan?.createEnv && (plan.envVars?.length || proposal.envVarsToCreate?.length)) {
+              const envVars = plan.envVars?.length ? plan.envVars : (proposal.envVarsToCreate || []);
+              this.createOrAppendEnvFile(proposal.vulnerability.file, envVars);
+            } else if (proposal.envVarsToCreate?.length) {
+              this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
+            }
+            if (plan?.updateGitignore) this.ensureGitignoreHasEnv(workspaceRoot);
+          } else if (proposal.envVarsToCreate?.length) {
+            this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
+          }
+        }
         const backup = await this.backupManager.getBackup(result.backupId);
         if (backup) {
           await this.undoManager.pushFix(result, backup);
         }
 
         // Validate each fix
-        if (this.config.validateAfterFix) {
-          const proposal = validProposals.find(p => p.id === result.fixId);
-          if (proposal) {
-            const validation = await this.fixValidator.validateFix(proposal, proposal.vulnerability);
-            result.validated = validation.vulnerabilityResolved;
-            result.regressions = validation.newVulnerabilities;
-          }
+        if (this.config.validateAfterFix && proposal) {
+          const validation = await this.fixValidator.validateFix(proposal, proposal.vulnerability);
+          result.validated = validation.vulnerabilityResolved;
+          result.regressions = validation.newVulnerabilities;
         }
 
         // Remove from pending
@@ -794,6 +1086,29 @@ export class FixService {
   // Private helper methods
 
   /**
+   * Get project context for Final Validator (file structure, config, conventions)
+   */
+  private async getProjectContextForValidation(workspaceRoot: string): Promise<string> {
+    const lines: string[] = [];
+    try {
+      const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true });
+      const topLevel = entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join(', ');
+      lines.push(`Top-level: ${topLevel}`);
+      const pkgPath = path.join(workspaceRoot, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        lines.push(`Package: ${pkg.name || 'unknown'}, dependencies: ${Object.keys(pkg.dependencies || {}).join(', ') || 'none'}`);
+      }
+      if (fs.existsSync(path.join(workspaceRoot, 'tsconfig.json'))) lines.push('TypeScript project');
+      if (fs.existsSync(path.join(workspaceRoot, 'requirements.txt'))) lines.push('Python project');
+      if (fs.existsSync(path.join(workspaceRoot, 'composer.json'))) lines.push('PHP project');
+    } catch {
+      lines.push('Could not read project structure');
+    }
+    return lines.join('\n');
+  }
+
+  /**
    * Load configuration from VS Code settings
    */
   private loadConfig(): FixServiceConfig {
@@ -805,7 +1120,8 @@ export class FixService {
       validateAfterFix: config.get('fixes.validateAfterFix', true),
       minConfidence: config.get('fixes.minConfidence', 0.7),
       backupRetentionDays: config.get('fixes.backupRetentionDays', 7),
-      stopOnError: config.get('fixes.stopOnError', false)
+      stopOnError: config.get('fixes.stopOnError', false),
+      enableMultiAIPipeline: config.get('fixes.enableMultiAIPipeline', true)
     };
   }
 
@@ -831,15 +1147,20 @@ export class FixService {
       return vulnerability.code || '';
     }
 
-    const filePath = vulnerability.file;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const filePath = workspaceRoot && !path.isAbsolute(vulnerability.file)
+      ? path.join(workspaceRoot, vulnerability.file)
+      : vulnerability.file;
     const line = vulnerability.line || 1;
 
     try {
       const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-
-      // Get surrounding lines (5 lines before and after)
-      const startLine = Math.max(0, line - 6);
-      const endLine = Math.min(document.lineCount - 1, line + 5);
+      const isPhpConfig = filePath.toLowerCase().endsWith('.php');
+      // PHP config files often have multiple var assignments - use wider context
+      const contextBefore = isPhpConfig ? 15 : 5;
+      const contextAfter = isPhpConfig ? 10 : 5;
+      const startLine = Math.max(0, line - contextBefore - 1);
+      const endLine = Math.min(document.lineCount - 1, line + contextAfter - 1);
 
       const lines: string[] = [];
       for (let i = startLine; i <= endLine; i++) {
@@ -850,6 +1171,63 @@ export class FixService {
     } catch (error) {
       console.error('FixService: Failed to get code context:', error);
       return vulnerability.code || '';
+    }
+  }
+
+  /**
+   * Create or append to .env file when fixing hardcoded secrets
+   */
+  private createOrAppendEnvFile(sourceFilePath: string, envVars: Array<{ name: string; value: string }>): void {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) return;
+    const envPath = path.join(workspaceRoot, '.env');
+    const envExamplePath = path.join(workspaceRoot, '.env.example');
+    const existingVars = new Set<string>();
+    let existingContent = '';
+    if (fs.existsSync(envPath)) {
+      existingContent = fs.readFileSync(envPath, 'utf8');
+      existingContent.split('\n').forEach(line => {
+        const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)/);
+        if (m) existingVars.add(m[1]);
+      });
+    }
+    const toAdd: string[] = [];
+    for (const { name, value } of envVars) {
+      if (!existingVars.has(name)) {
+        toAdd.push(`${name}=${value}`);
+        existingVars.add(name);
+      }
+    }
+    if (toAdd.length > 0) {
+      const header = existingContent ? '\n# Added by CipherMate (add to .gitignore)\n' : '# Added by CipherMate - do not commit secrets (add to .gitignore)\n';
+      fs.writeFileSync(envPath, existingContent + header + toAdd.join('\n') + '\n', 'utf8');
+      if (!fs.existsSync(envExamplePath)) {
+        fs.writeFileSync(
+          envExamplePath,
+          '# Copy to .env and fill in values\n' + envVars.map(({ name }) => `${name}=`).join('\n') + '\n',
+          'utf8'
+        );
+      }
+      // Ensure .env is in .gitignore to prevent committing secrets
+      this.ensureGitignoreHasEnv(workspaceRoot);
+      vscode.window.showInformationMessage(
+        `Created/updated .env with ${toAdd.length} variable(s). .env added to .gitignore.`
+      );
+    }
+  }
+
+  /**
+   * Ensure .gitignore contains .env to prevent committing secrets
+   */
+  private ensureGitignoreHasEnv(workspaceRoot: string): void {
+    const gitignorePath = path.join(workspaceRoot, '.gitignore');
+    const envEntries = ['.env', '.env.local', '.env.*.local'];
+    let content = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, 'utf8') : '';
+    const lines = content.split('\n');
+    const hasEnv = lines.some(l => /^\s*\.env/.test(l.trim()));
+    if (!hasEnv) {
+      const toAdd = '\n# CipherMate: Do not commit secrets\n.env\n.env.local\n.env.*.local\n';
+      fs.writeFileSync(gitignorePath, content.trimEnd() + toAdd, 'utf8');
     }
   }
 
@@ -866,6 +1244,7 @@ export class FixService {
     confidence: number;
     securityImprovements: string[];
     testingNotes: string;
+    envVarsToCreate?: Array<{ name: string; value: string }>;
   }> {
     // Get REAL code from the file - prioritize codeContext which comes from actual file reading
     const realCode = codeContext || vulnerability.code || '';
@@ -895,6 +1274,23 @@ Provide the fixed code inside a code block. Example format:
 
 Then briefly explain what you changed and why it's more secure.`;
 
+    // Multi-AI Pipeline Agent 1: Fix Generator (when enabled)
+    if (this.config.enableMultiAIPipeline) {
+      const pipeline = getMultiAIFixPipeline(this.context);
+      const pipelineResult = await pipeline.generateFix(vulnerability, codeContext);
+      if (pipelineResult && pipelineResult.fixedCode && !this.isCommentOnlyFix(pipelineResult.fixedCode)) {
+        return {
+          originalCode: pipelineResult.originalCode || vulnerability.code || '',
+          fixedCode: pipelineResult.fixedCode,
+          explanation: pipelineResult.explanation,
+          confidence: pipelineResult.confidence ?? 0.8,
+          securityImprovements: pipelineResult.securityImprovements || [],
+          testingNotes: pipelineResult.testingNotes || '',
+          envVarsToCreate: pipelineResult.envVarsToCreate
+        };
+      }
+    }
+
     if (!this.aiService) {
       // Fallback if AI service not available
       return {
@@ -911,7 +1307,7 @@ Then briefly explain what you changed and why it's more secure.`;
       const response = await this.aiService.callAI({
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
-        max_tokens: 2000
+        max_tokens: 8192
       });
 
       // Robust JSON parsing with multiple fallback strategies
@@ -923,10 +1319,10 @@ Then briefly explain what you changed and why it's more secure.`;
       console.error('FixService: AI call failed:', error);
     }
 
-    // Try rule-based fixer as fallback
+    // Try rule-based fixer as fallback - but reject comment-only "fixes" (advice, not real edits)
     console.log('FixService: Attempting rule-based fix for:', vulnerability.type);
     const ruleBasedFix = this.ruleBasedFixer.generateFix(vulnerability);
-    if (ruleBasedFix) {
+    if (ruleBasedFix && !this.isCommentOnlyFix(ruleBasedFix.fixedCode)) {
       console.log('FixService: Rule-based fix generated successfully');
       return {
         originalCode: ruleBasedFix.originalCode,
@@ -934,20 +1330,27 @@ Then briefly explain what you changed and why it's more secure.`;
         explanation: ruleBasedFix.explanation + ' (Generated using rule-based patterns - no AI required)',
         confidence: ruleBasedFix.confidence,
         securityImprovements: ruleBasedFix.securityImprovements,
-        testingNotes: ruleBasedFix.testingNotes
+        testingNotes: ruleBasedFix.testingNotes,
+        envVarsToCreate: ruleBasedFix.envVarsToCreate
       };
     }
+    if (ruleBasedFix && this.isCommentOnlyFix(ruleBasedFix.fixedCode)) {
+      throw new Error('No automatic fix available for this pattern. Configure an AI provider in CipherMate Settings for AI-powered fixes, or fix manually.');
+    }
 
-    // Final fallback - use scanner-provided fix if available
-    console.log('FixService: No rule-based fix available, using scanner suggestion');
-    return {
-      originalCode: vulnerability.code || '',
-      fixedCode: vulnerability.fix || vulnerability.code || '',
-      explanation: 'Using suggested fix from scanner. Configure an AI provider for more accurate fixes.',
-      confidence: 0.5,
-      securityImprovements: ['Based on scanner recommendation'],
-      testingNotes: 'Manual review strongly recommended. Configure AI provider in CipherMate settings for better fixes.'
-    };
+    // Final fallback - use scanner-provided fix if available (and it's real code, not comments)
+    const scannerFix = vulnerability.fix || vulnerability.code || '';
+    if (scannerFix && scannerFix !== (vulnerability.code || '') && !this.isCommentOnlyFix(scannerFix)) {
+      return {
+        originalCode: vulnerability.code || '',
+        fixedCode: scannerFix,
+        explanation: 'Using suggested fix from scanner. Configure an AI provider for more accurate fixes.',
+        confidence: 0.5,
+        securityImprovements: ['Based on scanner recommendation'],
+        testingNotes: 'Manual review strongly recommended.'
+      };
+    }
+    throw new Error('No automatic fix available. Configure an AI provider in CipherMate Settings, or fix manually.');
   }
 
   /**

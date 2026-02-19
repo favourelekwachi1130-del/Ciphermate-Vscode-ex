@@ -20,11 +20,11 @@ CipherMate now supports **450+ AI models** through a unified multi-provider syst
 3. Search "CipherMate"
 4. Set `AI Provider` to `openrouter`
 5. Enter your OpenRouter API key in `AI > OpenRouter > API Key`
-6. Choose your model in `AI > OpenRouter > Model` (e.g., `openai/gpt-5`, `anthropic/claude-sonnet-4-20250514`)
+6. Choose your model in `AI > OpenRouter > Model` (e.g., `openai/gpt-5`, `anthropic/claude-sonnet-4`)
 
 **Popular Models on OpenRouter:**
 - `openai/gpt-5` - Latest GPT
-- `anthropic/claude-sonnet-4-20250514` - Claude Sonnet 4.5
+- `anthropic/claude-sonnet-4` - Claude Sonnet 4.5
 - `google/gemini-2.0-flash-exp` - Gemini 2.5 Pro
 - `meta-llama/llama-3.1-405b-instruct` - Llama 3.1
 - `mistralai/mistral-large` - Mistral Large
@@ -116,7 +116,7 @@ If OpenRouter fails, it will automatically try OpenAI, then Anthropic.
 ### Security Analysis (Recommended)
 
 **Best Overall:**
-- `anthropic/claude-sonnet-4-20250514` (via OpenRouter or Anthropic)
+- `anthropic/claude-sonnet-4` (via OpenRouter or Anthropic)
 - `openai/gpt-5` (via OpenRouter or OpenAI)
 - `google/gemini-2.0-flash-exp` (via OpenRouter or Gemini)
 

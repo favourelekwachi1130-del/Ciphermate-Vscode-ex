@@ -406,7 +406,7 @@ What should I do?`;
         model: 'local-model',
         messages: messages,
         temperature: 0.7,
-        max_tokens: 500
+        max_tokens: 4096
       }));
       req.end();
     });

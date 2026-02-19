@@ -20,7 +20,22 @@ const extensionConfig = {
     libraryTarget: 'commonjs2'
   },
   externals: {
-    vscode: 'commonjs vscode' // the vscode-module is created on-the-fly and must be excluded. Add other modules that cannot be webpack'ed, 📖 -> https://webpack.js.org/configuration/externals/
+    vscode: 'commonjs vscode', // the vscode-module is created on-the-fly and must be excluded. Add other modules that cannot be webpack'ed, 📖 -> https://webpack.js.org/configuration/externals/
+    // Exclude native SQLite modules that can't be bundled
+    '@mastra/libsql': 'commonjs @mastra/libsql',
+    '@libsql/client': 'commonjs @libsql/client',
+    '@libsql/core': 'commonjs @libsql/core',
+    'libsql': 'commonjs libsql',
+    'better-sqlite3': 'commonjs better-sqlite3',
+    // Mastra + AI SDK - resolve from node_modules at runtime (subpaths needed)
+    '@mastra/core': 'commonjs @mastra/core',
+    '@mastra/core/agent': 'commonjs @mastra/core/agent',
+    '@mastra/memory': 'commonjs @mastra/memory',
+    '@mastra/memory/processors': 'commonjs @mastra/memory/processors',
+    '@mastra/fastembed': 'commonjs @mastra/fastembed',
+    '@ai-sdk/openai': 'commonjs @ai-sdk/openai',
+    'openai': 'commonjs openai',
+    'zod': 'commonjs zod',
     // modules added here also need to be added in the .vscodeignore file
   },
   resolve: {
@@ -31,7 +46,7 @@ const extensionConfig = {
     rules: [
       {
         test: /\.ts$/,
-        exclude: /node_modules/,
+        exclude: /node_modules|__tests__/,
         use: [
           {
             loader: 'ts-loader'

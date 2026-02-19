@@ -1,27 +1,22 @@
 /**
  * Hardcoded Secrets Detection Scanner
  * Scans code files for exposed credentials, API keys, tokens, etc.
+ * 
+ * Uses CipherMate Core SecretDetectionService for all detection logic.
  */
 
 import * as vscode from 'vscode';
-import * as fs from 'fs';
 import { BaseScanner } from './base-scanner';
 import { ScanResult, Vulnerability, Severity } from './types';
-
-interface SecretPattern {
-  name: string;
-  pattern: RegExp;
-  severity: Severity;
-  description: string;
-  examples: string[];
-}
+import { getSecretDetectionService } from '../core/secret-detection-service';
+import { getFileOperationsService } from '../core/file-operations-service';
 
 export class SecretsScanner extends BaseScanner {
-  private secretPatterns: SecretPattern[] = [];
+  private secretDetectionService = getSecretDetectionService();
+  private fileOperationsService = getFileOperationsService();
 
   constructor(workspacePath: string) {
     super(workspacePath);
-    this.initializePatterns();
   }
 
   getName(): string {
@@ -33,7 +28,8 @@ export class SecretsScanner extends BaseScanner {
   }
 
   async isAvailable(): Promise<boolean> {
-    return true; // Always available, no external dependencies
+    // Check if scanner is enabled in settings
+    return this.config.get<boolean>('scanners.enableSecrets', true);
   }
 
   async scan(): Promise<ScanResult> {
@@ -41,12 +37,99 @@ export class SecretsScanner extends BaseScanner {
     const vulnerabilities: Vulnerability[] = [];
 
     try {
-      // Find all code files
+      // Find all code files using core service
       const codeFiles = await this.findCodeFiles();
 
-      for (const file of codeFiles) {
-        const fileVulns = await this.scanFile(file);
-        vulnerabilities.push(...fileVulns);
+      // Use core SecretDetectionService for all detection logic
+      // Process files in smaller batches with event loop yielding to prevent blocking
+      const BATCH_SIZE = 20; // Reduced batch size to prevent blocking
+      const MAX_FILES_TO_SCAN = 10000; // Increased limit - still prevents hanging but covers more repos
+      
+      const filesToScan = codeFiles.slice(0, MAX_FILES_TO_SCAN);
+      const filesSkipped = codeFiles.length > MAX_FILES_TO_SCAN ? codeFiles.length - MAX_FILES_TO_SCAN : 0;
+      
+      if (filesSkipped > 0) {
+        console.log(`⚠️ Large repository detected: Limiting scan to ${MAX_FILES_TO_SCAN} files (${filesSkipped} files skipped)`);
+        // Add warning to vulnerabilities so user knows
+        vulnerabilities.push({
+          id: this.generateVulnId('info', 'scan-limit', 0),
+          type: 'scan-limit-info',
+          severity: 'info',
+          title: `Large Repository: Scanned ${MAX_FILES_TO_SCAN} of ${codeFiles.length} files`,
+          description: `To ensure fast scanning, only the first ${MAX_FILES_TO_SCAN} files were scanned. ${filesSkipped} files were skipped. Consider scanning specific directories for more thorough analysis.`,
+          file: this.workspacePath,
+          line: 0,
+          column: 0,
+          code: '',
+          metadata: {
+            filesFound: codeFiles.length,
+            filesScanned: MAX_FILES_TO_SCAN,
+            filesSkipped: filesSkipped,
+          },
+        });
+      }
+
+      // Helper function to yield control to event loop
+      const yieldToEventLoop = (): Promise<void> => {
+        return new Promise(resolve => setTimeout(resolve, 0));
+      };
+
+      for (let i = 0; i < filesToScan.length; i += BATCH_SIZE) {
+        const batch = filesToScan.slice(i, i + BATCH_SIZE);
+        
+        // Process batch with timeout and memory limits
+        const batchPromises = batch.map(async (file) => {
+          try {
+            // Limit file size to 1MB for secrets scanning to prevent memory issues
+            const content = await Promise.race([
+              this.fileOperationsService.readFile(file, 1024 * 1024), // 1MB limit
+              new Promise<string>((_, reject) => 
+                setTimeout(() => reject(new Error('File read timeout')), 30000) // 30 second timeout per file
+              )
+            ]);
+            
+            const detectionResult = this.secretDetectionService.detectSecrets(content, file);
+
+            // Convert core service results to Vulnerability format
+            for (const secret of detectionResult.secrets) {
+              // Limit code snippet to prevent memory bloat (max 500 chars)
+              const codeSnippet = secret.context ? secret.context.trim().substring(0, 500) : '';
+              
+              vulnerabilities.push({
+                id: this.generateVulnId('secret', file, secret.line),
+                type: 'hardcoded-secret',
+                severity: secret.severity,
+                title: `${secret.patternName} found`,
+                description: `Confidence: ${(secret.confidence * 100).toFixed(0)}%. ${secret.maskedValue}`,
+                file: file,
+                line: secret.line,
+                column: secret.column,
+                code: codeSnippet,
+                metadata: {
+                  pattern: secret.patternName,
+                  entropy: secret.entropy,
+                  confidence: secret.confidence,
+                },
+              });
+            }
+          } catch (error: any) {
+            // Skip files we can't read or that timeout
+            if (!error.message?.includes('timeout')) {
+              console.error(`Error reading ${file}:`, error);
+            }
+          }
+        });
+
+        // Wait for batch to complete, but don't fail entire scan if some files fail
+        await Promise.allSettled(batchPromises);
+        
+        // Yield control to event loop after each batch to prevent blocking
+        await yieldToEventLoop();
+        
+        // Log progress for large scans
+        if (filesToScan.length > 100 && (i + BATCH_SIZE) % 200 === 0) {
+          console.log(`Secrets scanner progress: ${Math.min(i + BATCH_SIZE, filesToScan.length)}/${filesToScan.length} files`);
+        }
       }
 
       return {
@@ -70,108 +153,9 @@ export class SecretsScanner extends BaseScanner {
     }
   }
 
-  private initializePatterns(): void {
-    this.secretPatterns = [
-      // AWS Keys
-      {
-        name: 'AWS Access Key',
-        pattern: /AKIA[0-9A-Z]{16}/i,
-        severity: 'critical',
-        description: 'AWS Access Key ID found in code',
-        examples: ['AKIAIOSFODNN7EXAMPLE'],
-      },
-      {
-        name: 'AWS Secret Key',
-        pattern: /aws.{0,20}['"]([A-Za-z0-9/+=]{40})['"]/i,
-        severity: 'critical',
-        description: 'AWS Secret Access Key found in code',
-        examples: ['wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
-      },
-      // API Keys
-      {
-        name: 'Generic API Key',
-        pattern: /(api[_-]?key|apikey|api_key)\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,})['"]/i,
-        severity: 'high',
-        description: 'API key found in code',
-        examples: ['api_key: "sk_live_1234567890abcdef"'],
-      },
-      {
-        name: 'GitHub Token',
-        pattern: /ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|ghu_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|ghr_[A-Za-z0-9]{36}/,
-        severity: 'critical',
-        description: 'GitHub Personal Access Token found',
-        examples: ['ghp_1234567890abcdefghijklmnopqrstuvwxyz'],
-      },
-      {
-        name: 'GitHub App Token',
-        pattern: /ghu_[A-Za-z0-9]{36}/,
-        severity: 'critical',
-        description: 'GitHub App Token found',
-        examples: ['ghu_1234567890abcdefghijklmnopqrstuvwxyz'],
-      },
-      // Passwords
-      {
-        name: 'Password in Code',
-        pattern: /(password|passwd|pwd)\s*[:=]\s*['"]([^'"]{8,})['"]/i,
-        severity: 'high',
-        description: 'Password found in code',
-        examples: ['password: "mypassword123"'],
-      },
-      // Database Credentials
-      {
-        name: 'Database Connection String',
-        pattern: /(mongodb|postgres|mysql|redis):\/\/[^:]+:[^@]+@/i,
-        severity: 'critical',
-        description: 'Database connection string with credentials found',
-        examples: ['mongodb://user:password@host:27017/db'],
-      },
-      // Private Keys
-      {
-        name: 'Private Key',
-        pattern: /-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/i,
-        severity: 'critical',
-        description: 'Private key found in code',
-        examples: ['-----BEGIN RSA PRIVATE KEY-----'],
-      },
-      // OAuth Tokens
-      {
-        name: 'OAuth Token',
-        pattern: /(oauth[_-]?token|access[_-]?token)\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,})['"]/i,
-        severity: 'high',
-        description: 'OAuth or access token found',
-        examples: ['oauth_token: "ya29.a0AfH6SMC..."'],
-      },
-      // JWT Tokens (long base64 strings)
-      {
-        name: 'JWT Token',
-        pattern: /eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*/,
-        severity: 'medium',
-        description: 'JWT token found (may be sensitive)',
-        examples: ['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'],
-      },
-      // Slack Tokens
-      {
-        name: 'Slack Token',
-        pattern: /xox[baprs]-[0-9a-zA-Z\-]{10,48}/,
-        severity: 'high',
-        description: 'Slack API token found',
-        examples: ['xoxb-1234567890-1234567890123-abcdefghijklmnopqrstuvwx'],
-      },
-      // Stripe Keys
-      {
-        name: 'Stripe Key',
-        pattern: /sk_live_[0-9a-zA-Z]{24,}|pk_live_[0-9a-zA-Z]{24,}/,
-        severity: 'critical',
-        description: 'Stripe live API key found',
-        examples: ['sk_live_1234567890abcdefghijklmnopqrstuvwxyz'],
-      },
-    ];
-  }
-
   private async findCodeFiles(): Promise<string[]> {
-    const files: string[] = [];
-
-    // Common code file extensions
+    // Use core FileOperationsService to find files
+    // Limit to most common file types to improve performance
     const codeExtensions = [
       '**/*.js',
       '**/*.ts',
@@ -198,65 +182,65 @@ export class SecretsScanner extends BaseScanner {
       '**/*.config.*',
     ];
 
-    for (const pattern of codeExtensions) {
-      const found = await vscode.workspace.findFiles(
-        pattern,
-        '**/{node_modules,dist,build,target,.git,vendor,venv,.venv,coverage,__pycache__,.next,.nuxt,out,.output}/**'
-      );
-      files.push(...found.map(f => f.fsPath));
-    }
+    const excludePattern = '**/{node_modules,dist,build,target,.git,vendor,venv,.venv,coverage,__pycache__,.next,.nuxt,out,.output}/**';
+    const MAX_FILES = 15000; // Increased limit - covers very large repos while still preventing hangs
+    
+    const files: string[] = [];
+    
+    // Use Promise.all with timeout to prevent hanging
+    const findFilesWithTimeout = async (pattern: string): Promise<vscode.Uri[]> => {
+      return Promise.race([
+        vscode.workspace.findFiles(pattern, excludePattern, MAX_FILES),
+        new Promise<vscode.Uri[]>((_, reject) => 
+          setTimeout(() => reject(new Error(`File search timed out for pattern: ${pattern}`)), 30000) // 30 second timeout per pattern
+        )
+      ]);
+    };
 
-    return [...new Set(files)]; // Remove duplicates
-  }
-
-  private async scanFile(filePath: string): Promise<Vulnerability[]> {
-    const vulnerabilities: Vulnerability[] = [];
+    // Helper function to yield control to event loop
+    const yieldToEventLoop = (): Promise<void> => {
+      return new Promise(resolve => setTimeout(resolve, 0));
+    };
 
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const lines = content.split('\n');
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const lineNumber = i + 1;
-
-        for (const pattern of this.secretPatterns) {
-          const matches = line.match(pattern.pattern);
-          if (matches) {
-            // Extract the secret (try to get the actual value)
-            const secretMatch = matches[0];
-            const maskedSecret = this.maskSecret(secretMatch);
-
-            vulnerabilities.push({
-              id: this.generateVulnId('secret', filePath, lineNumber),
-              type: 'hardcoded-secret',
-              severity: pattern.severity,
-              title: `${pattern.name} found`,
-              description: `${pattern.description}. Found: ${maskedSecret}`,
-              file: filePath,
-              line: lineNumber,
-              code: line.trim(),
-              metadata: {
-                pattern: pattern.name,
-                examples: pattern.examples,
-              },
-            });
+      // Process patterns in smaller batches to avoid overwhelming the system
+      const batchSize = 3; // Reduced batch size
+      for (let i = 0; i < codeExtensions.length; i += batchSize) {
+        const batch = codeExtensions.slice(i, i + batchSize);
+        const batchResults = await Promise.allSettled(
+          batch.map(pattern => findFilesWithTimeout(pattern))
+        );
+        
+        for (const result of batchResults) {
+          if (result.status === 'fulfilled') {
+            files.push(...result.value.map(f => f.fsPath));
+          } else {
+            console.warn(`Failed to find files for pattern: ${result.reason}`);
           }
         }
+        
+        // Yield control to event loop after each batch to prevent blocking
+        await yieldToEventLoop();
+        
+        // If we've found enough files, stop searching
+        if (files.length >= MAX_FILES) {
+          console.log(`Reached file limit (${MAX_FILES}), stopping search`);
+          break;
+        }
       }
-    } catch (error: any) {
-      // Skip files we can't read
-      console.error(`Error reading ${filePath}:`, error);
+    } catch (error) {
+      console.error('Error finding code files:', error);
     }
 
-    return vulnerabilities;
-  }
-
-  private maskSecret(secret: string): string {
-    if (secret.length <= 8) {
-      return '***';
+    const uniqueFiles = [...new Set(files)]; // Remove duplicates
+    
+    // Limit total files to prevent processing too many
+    if (uniqueFiles.length > MAX_FILES) {
+      console.log(`Limiting files from ${uniqueFiles.length} to ${MAX_FILES}`);
+      return uniqueFiles.slice(0, MAX_FILES);
     }
-    return secret.substring(0, 4) + '***' + secret.substring(secret.length - 4);
+    
+    return uniqueFiles;
   }
 }
 

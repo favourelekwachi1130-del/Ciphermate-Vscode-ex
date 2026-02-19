@@ -17,7 +17,7 @@
    - `AI > OpenRouter > API Key`  †  Paste your key
    - `AI > OpenRouter > Model`  †  Choose one:
      - `openai/gpt-5` (GPT-5)
-     - `anthropic/claude-sonnet-4-20250514` (Claude Sonnet 4.5)
+     - `anthropic/claude-sonnet-4` (Claude Sonnet 4.5)
      - `google/gemini-2.0-flash-exp` (Gemini 2.5 Pro)
      - Or any of 450+ models from [openrouter.ai/models](https://openrouter.ai/models)
 

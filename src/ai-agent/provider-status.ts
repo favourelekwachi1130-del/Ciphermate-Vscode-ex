@@ -105,11 +105,13 @@ export async function testProvider(providerType: string): Promise<{ success: boo
     const config = vscode.workspace.getConfiguration('ciphermate');
     
     // Temporarily set provider
-    const originalProvider = config.get('ai.provider', 'ollama');
+    const originalProvider = config.get('ai.provider', 'openrouter');
     await config.update('ai.provider', providerType, vscode.ConfigurationTarget.Global);
     
     try {
-      const agent = createCyberAgentFromSettings(vscode.extensions.getExtension('ciphermate.ciphermate')?.exports?.context || {} as any, 'base');
+      const extContext = vscode.extensions.getExtension('ciphermate.ciphermate')?.exports?.context;
+      const context = extContext || ({} as vscode.ExtensionContext);
+      const agent = await createCyberAgentFromSettings(context, 'base');
       const response = await agent.chat('Hello');
       const latency = Date.now() - startTime;
       
@@ -137,7 +139,7 @@ export async function testProvider(providerType: string): Promise<{ success: boo
  */
 export async function getCurrentProviderStatus(): Promise<ProviderStatus | null> {
   const config = vscode.workspace.getConfiguration('ciphermate');
-  const provider = config.get('ai.provider', 'ollama') as string;
+  const provider = config.get('ai.provider', 'openrouter') as string;
   
   const allStatuses = await checkAllProviders();
   return allStatuses.find(s => s.provider.toLowerCase().includes(provider.toLowerCase())) || null;

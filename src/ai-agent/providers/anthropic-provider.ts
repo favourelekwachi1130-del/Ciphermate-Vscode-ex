@@ -98,7 +98,7 @@ export class AnthropicProvider extends BaseAIProvider {
 
       const requestBody: any = {
         model: this.config.model || 'claude-3-5-sonnet-20241022',
-        max_tokens: request.max_tokens || 2000,
+        max_tokens: request.max_tokens || 8192,
         messages: anthropicMessages
       };
 

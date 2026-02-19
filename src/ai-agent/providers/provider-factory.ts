@@ -1,12 +1,11 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
 import { BaseAIProvider, ProviderConfig } from './base-provider';
 import { OpenAIProvider } from './openai-provider';
 import { AnthropicProvider } from './anthropic-provider';
 import { GeminiProvider } from './gemini-provider';
 import { OpenRouterProvider } from './openrouter-provider';
 import { OllamaProvider } from './ollama-provider-adapter';
+import { ApiKeyStorage } from '../../core/api-key-storage';
 
 export type ProviderType = 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'ollama' | 'custom';
 
@@ -19,12 +18,16 @@ export type ProviderType = 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'o
  * - Google Gemini (Gemini 2.5 Pro, etc.)
  * - OpenRouter (450+ models unified)
  * - Custom providers (via API URL)
+ * 
+ * API keys are read from SecretStorage (OS keychain) first, with fallback/migration from settings.
  */
 export class ProviderFactory {
   /**
-   * Create a provider instance based on configuration
+   * Create a provider instance based on configuration.
+   * API keys are resolved from SecretStorage (secure) or config (fallback with migration).
+   * @param forCoding When true, use ai.codingModel for coding tasks (scans, fixes, code explain). Otherwise use primary model.
    */
-  static createProvider(context: vscode.ExtensionContext, providerType?: ProviderType): BaseAIProvider {
+  static async createProvider(context: vscode.ExtensionContext, providerType?: ProviderType, forCoding = true): Promise<BaseAIProvider> {
     const config = vscode.workspace.getConfiguration('ciphermate');
     
     // If provider type not specified, try to auto-detect from config
@@ -43,8 +46,9 @@ export class ProviderFactory {
       console.log(`ProviderFactory: Creating ${providerType.toUpperCase()} provider (NOT Ollama)`);
     }
 
-    // Get provider-specific configuration
-    const apiKey = config.get(`ai.${providerType}.apiKey`, '') as string;
+    // Get API key from SecretStorage (secure) or config (fallback with migration)
+    const apiKeyStorage = new ApiKeyStorage(context, config);
+    const apiKey = providerType === 'ollama' ? '' : (await apiKeyStorage.getForProvider(providerType));
     // For Ollama, default URL is localhost:11434, for others use empty string
     const defaultApiUrl = providerType === 'ollama' ? 'http://localhost:11434' : '';
     
@@ -95,38 +99,6 @@ export class ProviderFactory {
         }
       }
       
-      // CRITICAL FIX: If we still have localhost, read settings.json file directly
-      if (apiUrl === 'http://localhost:11434' || apiUrl === defaultApiUrl) {
-        console.log(`ProviderFactory: WARNING - Still using localhost, reading .vscode/settings.json directly...`);
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (workspaceFolders && workspaceFolders.length > 0) {
-          try {
-            const settingsPath = path.join(workspaceFolders[0].uri.fsPath, '.vscode', 'settings.json');
-            if (fs.existsSync(settingsPath)) {
-              const settingsContent = fs.readFileSync(settingsPath, 'utf8');
-              const settings = JSON.parse(settingsContent);
-              
-              // Try to find the Ollama URL in settings
-              const ollamaUrl = settings['ciphermate.ai.ollama.apiUrl'] || 
-                               settings['ciphermate']?.ai?.ollama?.apiUrl ||
-                               settings['ciphermate']?.['ai.ollama']?.apiUrl;
-              
-              if (ollamaUrl && typeof ollamaUrl === 'string' && ollamaUrl.trim() !== '') {
-                apiUrl = ollamaUrl.trim();
-                console.log(`ProviderFactory: SUCCESS - Read Ollama URL directly from settings.json: ${apiUrl}`);
-                // Also show in VS Code output
-                vscode.window.showInformationMessage(`Using Ollama at: ${apiUrl}`);
-              } else {
-                console.log(`ProviderFactory: Could not find Ollama URL in settings.json`);
-              }
-            } else {
-              console.log(`ProviderFactory: settings.json not found at: ${settingsPath}`);
-            }
-          } catch (error) {
-            console.error(`ProviderFactory: Error reading settings.json:`, error);
-          }
-        }
-      }
     } else {
       apiUrl = config.get(`ai.${providerType}.apiUrl`, defaultApiUrl) as string;
     }
@@ -160,34 +132,31 @@ export class ProviderFactory {
         }
       }
       
-      // If still empty, try reading from settings.json directly (like URL)
-      if (!model || model === '') {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (workspaceFolders && workspaceFolders.length > 0) {
-          try {
-            const settingsPath = path.join(workspaceFolders[0].uri.fsPath, '.vscode', 'settings.json');
-            if (fs.existsSync(settingsPath)) {
-              const settingsContent = fs.readFileSync(settingsPath, 'utf8');
-              const settings = JSON.parse(settingsContent);
-              
-              const ollamaModel = settings['ciphermate.ai.ollama.model'] || 
-                                 settings['ciphermate']?.ai?.ollama?.model ||
-                                 settings['ciphermate']?.['ai.ollama']?.model;
-              
-              if (ollamaModel && typeof ollamaModel === 'string' && ollamaModel.trim() !== '') {
-                model = ollamaModel.trim();
-                console.log(`ProviderFactory: SUCCESS - Read Ollama model directly from settings.json: ${model}`);
-              }
-            }
-          } catch (error) {
-            console.error(`ProviderFactory: Error reading model from settings.json:`, error);
-          }
-        }
-      }
     } else {
-      model = config.get(`ai.${providerType}.model`, '') as string;
+      // For coding tasks (scans, fixes), prefer ai.codingModel; for conversation use ai.conversationModel
+      const codingModel = config.get<string>('ai.codingModel', '');
+      const conversationModel = config.get<string>('ai.conversationModel', '');
+      const primaryModel = config.get(`ai.${providerType}.model`, '') as string;
+      if (forCoding && codingModel && codingModel.trim() !== '') {
+        model = codingModel.trim();
+        console.log(`ProviderFactory: Using coding model: ${model}`);
+      } else if (!forCoding && conversationModel && conversationModel.trim() !== '') {
+        model = conversationModel.trim();
+        console.log(`ProviderFactory: Using conversation model: ${model}`);
+      } else {
+        model = primaryModel;
+      }
     }
     
+    // Redirect invalid/deprecated OpenRouter model IDs to valid ones
+    const MODEL_ALIASES: Record<string, string> = {
+      'anthropic/claude-sonnet-4-20250514': 'anthropic/claude-sonnet-4'  // Invalid ID, was 400 from OpenRouter
+    };
+    if (model && MODEL_ALIASES[model]) {
+      console.log(`ProviderFactory: Redirecting deprecated model ${model} -> ${MODEL_ALIASES[model]}`);
+      model = MODEL_ALIASES[model];
+    }
+
     // For Ollama, use model EXACTLY as configured (no normalization) - matches CLI behavior
     // The CLI doesn't normalize model names, so we don't either
     if (providerType === 'ollama' && !model) {
@@ -261,14 +230,37 @@ export class ProviderFactory {
   }
 
   /**
-   * Get supported models for a provider
+   * Get supported models for a provider. Uses sync creation with empty API key (models list is static).
    */
   static getProviderModels(providerType: ProviderType): string[] {
-    const tempProvider = ProviderFactory.createProvider(
-      {} as vscode.ExtensionContext,
-      providerType
-    );
-    return tempProvider.getSupportedModels();
+    return ProviderFactory.createProviderForModelsOnly(providerType).getSupportedModels();
+  }
+
+  /**
+   * Create a minimal provider instance for model listing only (no API key needed).
+   */
+  private static createProviderForModelsOnly(providerType: ProviderType): BaseAIProvider {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    const defaultApiUrl = providerType === 'ollama' ? 'http://localhost:11434' : '';
+    const apiUrl = providerType === 'ollama'
+      ? (config.get('ai.ollama.apiUrl', '') || 'http://localhost:11434')
+      : config.get(`ai.${providerType}.apiUrl`, defaultApiUrl) as string;
+    const model = providerType === 'ollama'
+      ? (config.get('ai.ollama.model', '') || 'deepseek-coder:6.7b')
+      : config.get(`ai.${providerType}.model`, '') as string;
+    const defaultTimeout = providerType === 'ollama' ? 900000 : 30000;
+    const timeout = config.get(`ai.${providerType}.timeout`, defaultTimeout) as number;
+    const providerConfig: ProviderConfig = { apiKey: '', apiUrl, model, timeout, maxRetries: 3 };
+
+    switch (providerType) {
+      case 'openai': return new OpenAIProvider(providerConfig);
+      case 'anthropic': return new AnthropicProvider(providerConfig);
+      case 'gemini': return new GeminiProvider(providerConfig);
+      case 'openrouter': return new OpenRouterProvider(providerConfig);
+      case 'ollama': return new OllamaProvider(providerConfig);
+      case 'custom': return new OpenRouterProvider({ ...providerConfig, apiUrl: apiUrl || providerConfig.apiUrl });
+      default: return new OpenRouterProvider(providerConfig);
+    }
   }
 }
 

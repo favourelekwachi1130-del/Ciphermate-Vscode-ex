@@ -306,6 +306,31 @@ export class FixApplicator {
   }
 
   /**
+   * Compute the document content that would result from applying the fix.
+   * Used for pre-apply syntax validation.
+   */
+  async getResultingContent(proposal: FixProposal): Promise<{ content: string; language: string } | null> {
+    const filePath = proposal.vulnerability.file;
+    const uri = vscode.Uri.file(this.resolveAbsolutePath(filePath));
+    try {
+      const document = await vscode.workspace.openTextDocument(uri);
+      const range = this.calculateRange(document, proposal);
+      const before = document.getText(new vscode.Range(new vscode.Position(0, 0), range.start));
+      const after = document.getText(new vscode.Range(range.end, new vscode.Position(document.lineCount, 0)));
+      const content = before + proposal.fixedCode + after;
+      const ext = filePath.toLowerCase().slice(filePath.lastIndexOf('.'));
+      const langMap: Record<string, string> = {
+        '.js': 'javascript', '.ts': 'typescript', '.jsx': 'javascript', '.tsx': 'typescript',
+        '.mjs': 'javascript', '.cjs': 'javascript', '.py': 'python', '.php': 'php',
+        '.php3': 'php', '.phtml': 'php', '.json': 'json', '.java': 'java', '.go': 'go', '.rs': 'rust'
+      };
+      return { content, language: langMap[ext] || 'text' };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Run pre-flight checks before applying a fix
    */
   private async runPreflightChecks(

@@ -104,7 +104,7 @@ export class GeminiProvider extends BaseAIProvider {
       // Add generation config
       requestBody.generationConfig = {
         temperature: request.temperature || 0.7,
-        maxOutputTokens: request.max_tokens || 2000
+        maxOutputTokens: request.max_tokens || 8192
       };
 
       req.write(JSON.stringify(requestBody));

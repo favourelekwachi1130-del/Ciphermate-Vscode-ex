@@ -67,6 +67,9 @@ export interface FixProposal {
 
   /** When this proposal was created */
   createdAt: Date;
+
+  /** Optional: environment variables to add to .env when fixing secrets */
+  envVarsToCreate?: Array<{ name: string; value: string }>;
 }
 
 /**
@@ -223,6 +226,9 @@ export interface FixServiceConfig {
 
   /** Whether to stop batch operations on first error */
   stopOnError: boolean;
+
+  /** Use multi-AI pipeline (Generator, Pre-Validator, File Handler, Final Validator) */
+  enableMultiAIPipeline?: boolean;
 }
 
 /**

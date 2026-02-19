@@ -10,14 +10,17 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { BackupSnapshot } from './types';
+import { DiskStorageService } from '../storage/disk-storage-service';
 
 export class BackupManager {
   private context: vscode.ExtensionContext;
+  private diskStorage: DiskStorageService;
   private readonly BACKUP_KEY = 'ciphermate.fixBackups';
   private readonly MAX_BACKUPS = 100;
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
+    this.diskStorage = new DiskStorageService(context);
   }
 
   /**
@@ -126,7 +129,19 @@ export class BackupManager {
    * Get all stored backups
    */
   async getAllBackups(): Promise<BackupSnapshot[]> {
-    const stored = this.context.globalState.get<BackupSnapshot[]>(this.BACKUP_KEY, []);
+    // Try disk storage first, fallback to globalState for migration
+    let stored: BackupSnapshot[] = [];
+    if (this.diskStorage.exists(this.BACKUP_KEY)) {
+      stored = this.diskStorage.get<BackupSnapshot[]>(this.BACKUP_KEY, []);
+    } else {
+      // Migrate from globalState if exists
+      stored = this.context.globalState.get<BackupSnapshot[]>(this.BACKUP_KEY, []);
+      if (stored.length > 0) {
+        this.diskStorage.update(this.BACKUP_KEY, stored);
+        // Clear from globalState after migration
+        this.context.globalState.update(this.BACKUP_KEY, undefined);
+      }
+    }
 
     // Convert date strings back to Date objects
     return stored.map(b => ({
@@ -210,7 +225,7 @@ export class BackupManager {
     const removedCount = backups.length - validBackups.length;
 
     if (removedCount > 0) {
-      await this.context.globalState.update(this.BACKUP_KEY, validBackups);
+      this.diskStorage.update(this.BACKUP_KEY, validBackups);
       console.log(`BackupManager: Cleaned up ${removedCount} old backups`);
     }
 
@@ -229,7 +244,7 @@ export class BackupManager {
     }
 
     backups.splice(index, 1);
-    await this.context.globalState.update(this.BACKUP_KEY, backups);
+    this.diskStorage.update(this.BACKUP_KEY, backups);
     console.log(`BackupManager: Deleted backup ${backupId}`);
     return true;
   }
@@ -289,7 +304,7 @@ export class BackupManager {
       }
     }
 
-    await this.context.globalState.update(this.BACKUP_KEY, backups);
+    this.diskStorage.update(this.BACKUP_KEY, backups);
   }
 
   /**
@@ -301,7 +316,7 @@ export class BackupManager {
 
     if (index !== -1) {
       backups[index] = backup;
-      await this.context.globalState.update(this.BACKUP_KEY, backups);
+      this.diskStorage.update(this.BACKUP_KEY, backups);
     }
   }
 

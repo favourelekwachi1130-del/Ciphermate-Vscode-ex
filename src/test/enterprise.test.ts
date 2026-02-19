@@ -66,16 +66,18 @@ suite('Enterprise Architecture Tests', () => {
     });
   });
 
-  test('Performance monitor should track metrics', () => {
+  test('Performance monitor should track metrics', (done) => {
     const stopTimer = performanceMonitor.startTimer('test_operation');
     
-    // Simulate some work
+    // Simulate some work - must use done() so Mocha waits for async callback
     setTimeout(() => {
       stopTimer();
-      
       const metrics = performanceMonitor.getMetrics();
-      assert.strictEqual(metrics['test_operation'].count, 1);
-      assert.ok(metrics['test_operation'].average > 0);
+      const op = metrics['test_operation'];
+      assert.ok(op, 'test_operation should be recorded');
+      assert.strictEqual(op.count, 1);
+      assert.ok(op.average > 0);
+      done();
     }, 10);
   });
 
@@ -92,10 +94,12 @@ suite('Enterprise Architecture Tests', () => {
 suite('Integration Tests', () => {
   test('Extension should activate without errors', async () => {
     const extension = vscode.extensions.getExtension('ciphermate.ciphermate');
-    if (extension) {
-      await extension.activate();
-      assert.ok(true, 'Extension activated successfully');
+    if (!extension) {
+      // Extension may not be found in test environment - skip is OK
+      return;
     }
+    await extension.activate();
+    assert.ok(true, 'Extension activated successfully');
   });
 
   test('Commands should be registered', async () => {

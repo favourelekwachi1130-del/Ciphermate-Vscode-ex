@@ -21,6 +21,7 @@ export class MultiProviderAIService {
   private primaryProvider!: BaseAIProvider;
   private fallbackProviders: BaseAIProvider[] = [];
   private currentProviderType!: ProviderType;
+  private initPromise: Promise<void>;
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
@@ -33,13 +34,20 @@ export class MultiProviderAIService {
     console.log(`MultiProviderAIService: Raw provider setting value:`, providerSetting);
     console.log(`MultiProviderAIService: Provider setting type:`, typeof providerSetting);
     
-    this.initializeProviders();
+    this.initPromise = this.initializeProviders();
   }
 
   /**
-   * Initialize primary and fallback providers
+   * Ensure providers are initialized (waits if async init still in progress)
    */
-  private initializeProviders(): void {
+  private async ensureInitialized(): Promise<void> {
+    await this.initPromise;
+  }
+
+  /**
+   * Initialize primary and fallback providers (async - resolves API keys from SecretStorage)
+   */
+  private async initializeProviders(): Promise<void> {
     // Use inspect to see where settings come from (workspace vs global vs default)
     const config = vscode.workspace.getConfiguration('ciphermate');
     
@@ -78,54 +86,54 @@ export class MultiProviderAIService {
       console.log(`MultiProviderAIService: Using default value: ${providerType}`);
     }
     
-    // Check for Ollama configuration from environment variable or VS Code settings
-    // Use Ollama if:
-    // 1. OLLAMA_BASE_URL environment variable is set, OR
-    // 2. ai.ollama.apiUrl is explicitly configured in settings (workspace or global)
+    // Respect user's explicit ai.provider choice. Do NOT override with Ollama when
+    // user has set ai.provider to openrouter, openai, anthropic, etc.
+    // Only use Ollama when ai.provider is explicitly 'ollama' (or when no provider is set and
+    // user has OLLAMA_BASE_URL env or explicitly configured ai.ollama.apiUrl as their intent).
     const envOllamaUrl = process.env.OLLAMA_BASE_URL;
-    const configuredOllamaUrl = config.get('ai.ollama.apiUrl') as string | undefined;
     const ollamaUrlInspect = config.inspect('ai.ollama.apiUrl');
-
-    console.log(`MultiProviderAIService: Ollama detection check:`, {
-      envOllamaUrl: envOllamaUrl,
-      configuredOllamaUrl: configuredOllamaUrl,
-      workspaceValue: ollamaUrlInspect?.workspaceValue,
-      globalValue: ollamaUrlInspect?.globalValue,
-    });
-
-    // Detect Ollama from environment variable OR explicit VS Code configuration
     const hasEnvOllama = envOllamaUrl && envOllamaUrl.trim() !== '';
-    const hasConfiguredOllama = ollamaUrlInspect?.workspaceValue !== undefined ||
-                                 ollamaUrlInspect?.globalValue !== undefined;
+    const hasExplicitOllamaConfig = ollamaUrlInspect?.workspaceValue !== undefined ||
+                                   ollamaUrlInspect?.globalValue !== undefined;
 
-    if (hasEnvOllama || hasConfiguredOllama) {
-      const source = hasEnvOllama ? `env (${envOllamaUrl})` : `config (${configuredOllamaUrl})`;
-      console.log(`MultiProviderAIService: Ollama detected via ${source}, using Ollama provider`);
+    // Only switch to Ollama if user has NOT explicitly chosen another provider.
+    // workspaceValue/globalValue on ai.provider means user made a deliberate choice.
+    const userChoseNonOllama = providerInspect?.workspaceValue !== undefined ||
+                               providerInspect?.globalValue !== undefined;
+    const explicitProviderIsOllama = (providerInspect?.workspaceValue ?? providerInspect?.globalValue ?? providerInspect?.defaultValue) === 'ollama';
+
+    if (!explicitProviderIsOllama && userChoseNonOllama) {
+      // User chose openrouter, openai, etc. - respect it, do not override with Ollama
+      console.log(`MultiProviderAIService: User chose ${providerType}, not overriding with Ollama`);
+    } else if ((hasEnvOllama || hasExplicitOllamaConfig) && !userChoseNonOllama) {
+      // No explicit provider choice - use Ollama if configured
       providerType = 'ollama';
+      console.log(`MultiProviderAIService: Using Ollama (env or config), providerType: ${providerType}`);
     } else {
-      console.log(`MultiProviderAIService: No Ollama configuration detected, using providerType: ${providerType}`);
+      console.log(`MultiProviderAIService: Using providerType: ${providerType}`);
     }
     
     this.currentProviderType = providerType;
     console.log(`MultiProviderAIService: Final provider type: ${this.currentProviderType}`);
     console.log(`MultiProviderAIService: About to create provider with type: ${this.currentProviderType}`);
     
-    this.primaryProvider = ProviderFactory.createProvider(this.context, this.currentProviderType);
+    this.primaryProvider = await ProviderFactory.createProvider(this.context, this.currentProviderType);
     console.log(`MultiProviderAIService: Primary provider created: ${this.primaryProvider.getName()}`);
 
     // Fallback providers (if configured)
     const fallbackProviders = config.get('ai.fallbackProviders', []) as ProviderType[];
     console.log(`MultiProviderAIService: Fallback providers: ${fallbackProviders.length}`);
-    this.fallbackProviders = fallbackProviders.map(type => 
-      ProviderFactory.createProvider(this.context, type)
+    this.fallbackProviders = await Promise.all(
+      fallbackProviders.map(type => ProviderFactory.createProvider(this.context, type))
     );
   }
 
   /**
-   * Call AI with automatic failover
+   * Call AI with automatic failover and seamless provider switching
    * Matches Core's error handling behavior
    */
   async callAI(request: AIRequest): Promise<AIResponse> {
+    await this.ensureInitialized();
     // Try primary provider first
     try {
       return await this.primaryProvider.callAI(request);
@@ -156,9 +164,11 @@ export class MultiProviderAIService {
   /**
    * Switch to a different provider
    */
-  switchProvider(providerType: ProviderType): void {
+  async switchProvider(providerType: ProviderType): Promise<void> {
+    console.log(`MultiProviderAIService: Switching provider to ${providerType}`);
     this.currentProviderType = providerType;
-    this.primaryProvider = ProviderFactory.createProvider(this.context, providerType);
+    this.primaryProvider = await ProviderFactory.createProvider(this.context, providerType);
+    console.log(`MultiProviderAIService: Provider switched to ${this.primaryProvider.getName()}`);
     
     // Save preference
     const config = vscode.workspace.getConfiguration('ciphermate');
@@ -168,7 +178,8 @@ export class MultiProviderAIService {
   /**
    * Get current provider
    */
-  getCurrentProvider(): BaseAIProvider {
+  async getCurrentProvider(): Promise<BaseAIProvider> {
+    await this.ensureInitialized();
     return this.primaryProvider;
   }
 
@@ -183,6 +194,7 @@ export class MultiProviderAIService {
    * Test connection to current provider
    */
   async testConnection(): Promise<{ success: boolean; error?: string; latency?: number }> {
+    await this.ensureInitialized();
     return await this.primaryProvider.testConnection();
   }
 
@@ -196,7 +208,8 @@ export class MultiProviderAIService {
   /**
    * Get supported models for current provider
    */
-  getSupportedModels(): string[] {
+  async getSupportedModels(): Promise<string[]> {
+    await this.ensureInitialized();
     return this.primaryProvider.getSupportedModels();
   }
 

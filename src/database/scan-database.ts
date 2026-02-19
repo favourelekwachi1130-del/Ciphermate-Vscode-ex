@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { DiskStorageService } from '../storage/disk-storage-service';
 
 // Use Node.js built-in SQLite3 or better-sqlite3 if available
 // Dynamic require to prevent webpack from trying to resolve it at build time
@@ -14,10 +15,9 @@ let Database: any = null;
 
 function tryLoadBetterSqlite3(): any {
   try {
-    // Use Function constructor to make require truly dynamic
-    // This prevents webpack from analyzing and trying to resolve the module
-    const requireFunc = new Function('moduleName', 'return require(moduleName)');
-    return requireFunc('better-sqlite3');
+    // better-sqlite3 is in webpack externals - direct require works at runtime
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require('better-sqlite3');
   } catch {
     return null;
   }
@@ -130,10 +130,12 @@ export class ScanDatabase {
   private jwt: SimpleJWT;
   private context: vscode.ExtensionContext;
   private logger: any;
+  private diskStorage: DiskStorageService;
 
   constructor(context: vscode.ExtensionContext, logger?: any) {
     this.context = context;
     this.logger = logger;
+    this.diskStorage = new DiskStorageService(context);
     
     // Initialize database path
     const storagePath = context.globalStorageUri.fsPath;
@@ -594,36 +596,37 @@ export class ScanDatabase {
   }
 
   // Fallback methods for when SQLite is not available
+  // These now use disk storage instead of globalState
   private saveUserFallback(user: UserRecord): string {
     const token = this.generateToken(user.id);
-    // Store in encrypted workspace state
-    const users = this.context.globalState.get<UserRecord[]>('ciphermate.db.users', []);
+    // Store in disk storage
+    const users = this.diskStorage.get<UserRecord[]>('ciphermate.db.users', []);
     const index = users.findIndex(u => u.id === user.id);
     if (index >= 0) {
       users[index] = user;
     } else {
       users.push(user);
     }
-    this.context.globalState.update('ciphermate.db.users', users);
+    this.diskStorage.update('ciphermate.db.users', users);
     return token;
   }
 
   private async saveScanFallback(scan: ScanRecord, vulnerabilities: VulnerabilityRecord[]): Promise<string> {
     const token = this.generateToken(scan.userId);
-    // Store in encrypted workspace state
-    const scans = this.context.globalState.get<ScanRecord[]>('ciphermate.db.scans', []);
+    // Store in disk storage
+    const scans = this.diskStorage.get<ScanRecord[]>('ciphermate.db.scans', []);
     scans.push(scan);
-    this.context.globalState.update('ciphermate.db.scans', scans);
+    this.diskStorage.update('ciphermate.db.scans', scans);
     
-    const vulns = this.context.globalState.get<VulnerabilityRecord[]>('ciphermate.db.vulnerabilities', []);
+    const vulns = this.diskStorage.get<VulnerabilityRecord[]>('ciphermate.db.vulnerabilities', []);
     vulnerabilities.forEach(v => vulns.push(v));
-    this.context.globalState.update('ciphermate.db.vulnerabilities', vulns);
+    this.diskStorage.update('ciphermate.db.vulnerabilities', vulns);
     
     return token;
   }
 
   private getScansFallback(userId: string, limit: number): ScanRecord[] {
-    const scans = this.context.globalState.get<ScanRecord[]>('ciphermate.db.scans', []);
+    const scans = this.diskStorage.get<ScanRecord[]>('ciphermate.db.scans', []);
     return scans
       .filter(s => s.userId === userId)
       .map(s => ({
@@ -639,7 +642,7 @@ export class ScanDatabase {
   }
 
   private getVulnerabilitiesFallback(scanId: string): VulnerabilityRecord[] {
-    const vulns = this.context.globalState.get<VulnerabilityRecord[]>('ciphermate.db.vulnerabilities', []);
+    const vulns = this.diskStorage.get<VulnerabilityRecord[]>('ciphermate.db.vulnerabilities', []);
     return vulns.filter(v => v.scanId === scanId);
   }
 
@@ -669,7 +672,7 @@ export class ScanDatabase {
       const timestamp = s.timestamp instanceof Date ? s.timestamp : new Date(s.timestamp);
       return timestamp.getTime() >= cutoffDate;
     });
-    const vulns = this.context.globalState.get<VulnerabilityRecord[]>('ciphermate.db.vulnerabilities', []);
+    const vulns = this.diskStorage.get<VulnerabilityRecord[]>('ciphermate.db.vulnerabilities', []);
     const recentVulns = vulns.filter(v => {
       const scan = recentScans.find(s => s.id === v.scanId);
       return scan !== undefined;

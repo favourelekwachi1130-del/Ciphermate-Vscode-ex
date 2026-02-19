@@ -36,7 +36,7 @@ Your CipherMate extension now supports **450+ AI models** including:
 1. Get API key from [openrouter.ai](https://openrouter.ai)
 2. VS Code Settings  †  CipherMate  †  AI Provider  †  `openrouter`
 3. Enter API key in `AI > OpenRouter > API Key`
-4. Choose model: `openai/gpt-5`, `anthropic/claude-sonnet-4-20250514`, etc.
+4. Choose model: `openai/gpt-5`, `anthropic/claude-sonnet-4`, etc.
 
 **Option B: Direct Provider**
 - OpenAI: `openai`

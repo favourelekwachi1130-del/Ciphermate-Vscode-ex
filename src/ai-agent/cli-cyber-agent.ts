@@ -30,10 +30,14 @@ export interface AgentConfig {
   mode: AgentMode;
   apiKey?: string;  // Anthropic API key (for Claude)
   googleApiKey?: string;  // Google API key (for Gemini)
-  openaiApiKey?: string;  // OpenAI API key (for ChatGPT)
+  openaiApiKey?: string;  // OpenAI API key (for ChatGPT) or OpenRouter API key when openrouterBaseUrl set
   model?: string;
   maxTokens?: number;
   safeMode?: boolean;
+  /** When set, use OpenRouter API (OpenAI-compatible with custom base URL) */
+  openrouterBaseUrl?: string;
+  /** When set, fallback providers resolve API keys from SecretStorage */
+  extensionContext?: vscode.ExtensionContext;
 }
 
 export class CyberAgent {
@@ -43,8 +47,10 @@ export class CyberAgent {
   private systemPrompt: string;
   private model: string;
   private providerType: ProviderType;
+  private extensionContext?: vscode.ExtensionContext;
 
   constructor(agentConfig: AgentConfig) {
+    this.extensionContext = agentConfig.extensionContext;
     this.mode = agentConfig.mode;
     this.model = agentConfig.model || 'claude-sonnet-4-5'; // fallback
     this.systemPrompt = this.getSystemPrompt(agentConfig.mode);
@@ -79,16 +85,19 @@ export class CyberAgent {
       }
       this.provider = new GeminiProvider(agentConfig.googleApiKey, agentConfig.model || 'gemini-2.5-flash');
       console.log(`CyberAgent initialized with Gemini (${agentConfig.model}) in ${agentConfig.mode} mode`);
-    } else if (providerType === 'openai') {
+    } else if (providerType === 'openai' || agentConfig.openrouterBaseUrl) {
       if (!agentConfig.openaiApiKey) {
-        throw new Error('OpenAI API key required for GPT models. Set OPENAI_API_KEY in .env or use --model with Claude/Gemini/Ollama.');
+        throw new Error('API key required. Set your key in CipherMate settings (stored securely in system keychain).');
       }
+      const baseURL = agentConfig.openrouterBaseUrl || undefined;
       this.provider = new OpenAIProvider(
         agentConfig.openaiApiKey,
-        agentConfig.model || 'gpt-5.1',
-        agentConfig.maxTokens || 4096
+        agentConfig.model || (baseURL ? 'openai/gpt-4' : 'gpt-5.1'),
+        agentConfig.maxTokens || 8192,
+        baseURL
       );
-      console.log(`CyberAgent initialized with OpenAI (${agentConfig.model}) in ${agentConfig.mode} mode`);
+      this.providerType = baseURL ? 'openai' as ProviderType : providerType as ProviderType;
+      console.log(`CyberAgent initialized with ${baseURL ? 'OpenRouter' : 'OpenAI'} (${agentConfig.model}) in ${agentConfig.mode} mode`);
     } else if (providerType === 'ollama') {
       // Ollama (local models) - EXACT match to CLI
       const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
@@ -102,7 +111,7 @@ export class CyberAgent {
       this.provider = new ClaudeProvider(
         agentConfig.apiKey,
         agentConfig.model || 'claude-sonnet-4-5',
-        agentConfig.maxTokens || 4096
+        agentConfig.maxTokens || 8192
       );
       console.log(`CyberAgent initialized with Claude (${agentConfig.model}) in ${agentConfig.mode} mode`);
     }
@@ -196,37 +205,43 @@ export class CyberAgent {
     console.log(`CyberAgent: Primary provider failed, trying fallback provider: ${nextProvider.provider}...`);
     
     try {
-      // Get provider configuration
+      // Get provider configuration (use SecretStorage when extensionContext available)
       let agentConfig: AgentConfig | null = null;
+      const apiKeyStorage = this.extensionContext
+        ? new (await import('../core/api-key-storage')).ApiKeyStorage(this.extensionContext, config)
+        : null;
       
       if (nextProvider.provider === 'claude') {
-        const apiKey = config.get('ai.anthropic.apiKey', '') as string;
+        const apiKey = apiKeyStorage ? await apiKeyStorage.get('anthropic') : (config.get('ai.anthropic.apiKey', '') as string);
         if (apiKey) {
           agentConfig = {
             mode: this.mode,
             model: nextProvider.model,
             apiKey,
-            maxTokens: 4096,
+            maxTokens: 8192,
+            extensionContext: this.extensionContext,
           };
         }
       } else if (nextProvider.provider === 'openai') {
-        const apiKey = config.get('ai.openai.apiKey', '') as string;
+        const apiKey = apiKeyStorage ? await apiKeyStorage.get('openai') : (config.get('ai.openai.apiKey', '') as string);
         if (apiKey) {
           agentConfig = {
             mode: this.mode,
             model: nextProvider.model,
             openaiApiKey: apiKey,
-            maxTokens: 4096,
+            maxTokens: 8192,
+            extensionContext: this.extensionContext,
           };
         }
       } else if (nextProvider.provider === 'gemini') {
-        const apiKey = config.get('ai.gemini.apiKey', '') as string;
+        const apiKey = apiKeyStorage ? await apiKeyStorage.get('gemini') : (config.get('ai.gemini.apiKey', '') as string);
         if (apiKey) {
           agentConfig = {
             mode: this.mode,
             model: nextProvider.model,
             googleApiKey: apiKey,
-            maxTokens: 4096,
+            maxTokens: 8192,
+            extensionContext: this.extensionContext,
           };
         }
       } else if (nextProvider.provider === 'ollama') {
@@ -235,7 +250,7 @@ export class CyberAgent {
         agentConfig = {
           mode: this.mode,
           model: nextProvider.model,
-          maxTokens: 4096,
+          maxTokens: 8192,
         };
       }
       
@@ -322,6 +337,13 @@ export class CyberAgent {
   }
 
   /**
+   * Restore conversation history (used when recreating agent to preserve context)
+   */
+  setHistory(history: ConversationMessage[]): void {
+    this.conversationHistory = [...history];
+  }
+
+  /**
    * Get current model
    * EXACT match to CLI implementation
    */
@@ -339,15 +361,20 @@ export class CyberAgent {
 }
 
 /**
- * Create CyberAgent from VS Code settings
+ * Create CyberAgent from VS Code settings (async - resolves API keys from SecretStorage)
  * Reads settings and creates config matching CLI's AgentConfig
- * EXACTLY matches how CLI determines provider and model
+ * useConversationModel: when true, use ai.conversationModel/provider for chat-friendly responses
  */
-export function createCyberAgentFromSettings(context: vscode.ExtensionContext, mode: AgentMode = 'base'): CyberAgent {
+export async function createCyberAgentFromSettings(context: vscode.ExtensionContext, mode: AgentMode = 'base', useConversationModel = false): Promise<CyberAgent> {
   const config = vscode.workspace.getConfiguration('ciphermate');
+  const { ApiKeyStorage } = await import('../core/api-key-storage');
+  const apiKeyStorage = new ApiKeyStorage(context, config);
   
-  // Read provider from settings
-  const provider = config.get('ai.provider', 'ollama') as string;
+  let provider = config.get('ai.provider', 'openrouter') as string;
+  if (useConversationModel) {
+    const convProvider = config.get('ai.conversationProvider', '') as string;
+    if (convProvider) provider = convProvider;
+  }
   
   // Read model and API keys based on provider
   let model: string;
@@ -357,8 +384,12 @@ export function createCyberAgentFromSettings(context: vscode.ExtensionContext, m
   let ollamaBaseUrl: string | undefined;
   
   if (provider === 'ollama') {
-    // Ollama - read model and URL
-    model = config.get('ai.ollama.model', 'deepseek-r1:14b') as string;
+    if (useConversationModel) {
+      const convModel = config.get('ai.conversationModel', '') as string;
+      model = convModel || config.get('ai.ollama.model', 'deepseek-r1:14b') as string;
+    } else {
+      model = config.get('ai.ollama.model', 'deepseek-r1:14b') as string;
+    }
     ollamaBaseUrl = config.get('ai.ollama.apiUrl', 'http://localhost:11434') as string;
     
     // Set OLLAMA_BASE_URL environment variable (CLI uses this)
@@ -377,14 +408,18 @@ export function createCyberAgentFromSettings(context: vscode.ExtensionContext, m
     const agentConfig: AgentConfig = {
       mode,
       model: model, // Use model as-is (e.g., 'deepseek-coder:latest')
-      maxTokens: 4096,
+      maxTokens: 8192,
     };
     
     return new CyberAgent(agentConfig);
   } else if (provider === 'anthropic' || provider === 'claude') {
-    // Claude - read model and API key
-    model = config.get('ai.anthropic.model', 'claude-sonnet-4-5') as string;
-    anthropicApiKey = config.get('ai.anthropic.apiKey', '') as string;
+    if (useConversationModel) {
+      const convModel = config.get('ai.conversationModel', '') as string;
+      model = convModel || config.get('ai.anthropic.model', 'claude-sonnet-4-5') as string;
+    } else {
+      model = config.get('ai.anthropic.model', 'claude-sonnet-4-5') as string;
+    }
+    anthropicApiKey = await apiKeyStorage.get('anthropic');
     
     // Convert model key to ID if needed
     const modelByKey = getModelById(model);
@@ -392,19 +427,49 @@ export function createCyberAgentFromSettings(context: vscode.ExtensionContext, m
       model = modelByKey.model.id;
     }
   } else if (provider === 'gemini') {
-    // Gemini - read model and API key
-    model = config.get('ai.gemini.model', 'gemini-2.5-flash') as string;
-    googleApiKey = config.get('ai.gemini.apiKey', '') as string;
+    if (useConversationModel) {
+      const convModel = config.get('ai.conversationModel', '') as string;
+      model = convModel || config.get('ai.gemini.model', 'gemini-2.5-flash') as string;
+    } else {
+      model = config.get('ai.gemini.model', 'gemini-2.5-flash') as string;
+    }
+    googleApiKey = await apiKeyStorage.get('gemini');
     
     // Convert model key to ID if needed
     const modelByKey = getModelById(model);
     if (modelByKey) {
       model = modelByKey.model.id;
     }
+  } else if (provider === 'openrouter') {
+    if (useConversationModel) {
+      let convModel = config.get('ai.conversationModel', '') as string;
+      model = convModel || config.get('ai.openrouter.model', 'openrouter/free') as string;
+    } else {
+      model = config.get('ai.openrouter.model', 'openrouter/free') as string;
+    }
+    // Migration: OpenRouter deprecated google/gemini-2.0-flash-exp* (404). Use openrouter/free instead.
+    if (model === 'google/gemini-2.0-flash-exp' || model === 'google/gemini-2.0-flash-exp:free') {
+      model = 'openrouter/free';
+    }
+    openaiApiKey = await apiKeyStorage.get('openrouter');
+    const modelByKeyOpenRouter = getModelById(model);
+    if (modelByKeyOpenRouter) model = modelByKeyOpenRouter.model.id;
+    return new CyberAgent({
+      mode,
+      model,
+      openaiApiKey,
+      maxTokens: 8192,
+      openrouterBaseUrl: 'https://openrouter.ai/api/v1',
+      extensionContext: context,
+    });
   } else if (provider === 'openai') {
-    // OpenAI - read model and API key
-    model = config.get('ai.openai.model', 'gpt-5.1') as string;
-    openaiApiKey = config.get('ai.openai.apiKey', '') as string;
+    if (useConversationModel) {
+      const convModel = config.get('ai.conversationModel', '') as string;
+      model = convModel || config.get('ai.openai.model', 'gpt-5.1') as string;
+    } else {
+      model = config.get('ai.openai.model', 'gpt-5.1') as string;
+    }
+    openaiApiKey = await apiKeyStorage.get('openai');
     
     // Convert model key to ID if needed
     const modelByKey = getModelById(model);
@@ -426,7 +491,7 @@ export function createCyberAgentFromSettings(context: vscode.ExtensionContext, m
     const agentConfig: AgentConfig = {
       mode,
       model: model,
-      maxTokens: 4096,
+      maxTokens: 8192,
     };
     
     const agent = new CyberAgent(agentConfig);
@@ -444,7 +509,8 @@ export function createCyberAgentFromSettings(context: vscode.ExtensionContext, m
     apiKey: anthropicApiKey,
     googleApiKey: googleApiKey,
     openaiApiKey: openaiApiKey,
-    maxTokens: 4096,
+    maxTokens: 8192,
+    extensionContext: context,
   };
   
   return new CyberAgent(agentConfig);

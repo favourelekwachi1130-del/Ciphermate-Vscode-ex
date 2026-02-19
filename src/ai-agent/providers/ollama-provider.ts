@@ -45,7 +45,8 @@ export class OllamaProvider implements AIProvider {
         stream: false,
         options: {
               temperature: 0.7,
-              num_ctx: 8192, // Context window
+              num_ctx: 8192,
+              num_predict: 8192
             }
           }),
           signal: controller.signal,
@@ -90,7 +91,8 @@ export class OllamaProvider implements AIProvider {
             `  3. Ensure your system has enough RAM`
           );
         }
-        if (error.message.includes('fetch') || error.message.includes('ECONNREFUSED')) {
+        const msg = (error.message || String(error)).toLowerCase();
+        if (msg.includes('fetch') || msg.includes('econnrefused') || msg.includes('enotfound') || msg.includes('failed')) {
           throw new Error(
             `Failed to connect to Ollama at ${this.baseUrl}. ` +
             `Make sure Ollama is running (ollama serve) and the model is pulled (ollama pull ${this.model})`

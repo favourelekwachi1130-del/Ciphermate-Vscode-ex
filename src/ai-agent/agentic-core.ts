@@ -6,7 +6,13 @@ import * as fs from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { RepositoryScanner } from '../scanners';
+import { getIntentRecognizer } from './intent-recognizer';
 import { FixService, FixProposal } from '../fix-system';
+import { getProjectGenerationService } from '../core/project-generation-service';
+import { getCitationService } from '../core/citation-service';
+import { getFileOperationsService } from '../core/file-operations-service';
+import { DastScanner } from '../dast';
+import { AgentOrchestrator } from '../dast/agent-orchestrator';
 
 const execAsync = promisify(exec);
 
@@ -36,7 +42,8 @@ export interface AgentTool {
 
 export interface AgentMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  /** Text or multimodal content (OpenAI format: string | Array<{type:'text'|'image_url', text?, image_url?}> */
+  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
   tool_calls?: Array<{
     id: string;
     type: 'function';
@@ -76,6 +83,10 @@ export class AgenticCore {
   private externalFixService: any = null; // External fix service for result listening
   private fixResultDisposable: vscode.Disposable | null = null;
   private chatInterface: any = null; // Reference to chat interface for sending messages
+  private citationService = getCitationService();
+  private projectGenService = getProjectGenerationService();
+  private fileService = getFileOperationsService();
+  private currentMessageId: string = '';
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
@@ -129,6 +140,23 @@ export class AgenticCore {
 
     this.tools = new Map();
     this.registerCoreTools();
+  }
+
+  /**
+   * Update the coding model for security scans and fixes (called when user changes model in chat)
+   */
+  async updateCodingModel(model: string): Promise<void> {
+    if (this.aiService === 'cloud' && this.multiProviderService) {
+      try {
+        const provider = await this.multiProviderService.getCurrentProvider();
+        if (provider && typeof provider.updateConfig === 'function') {
+          provider.updateConfig({ model });
+          console.log(`AgenticCore: Coding model updated to ${model}`);
+        }
+      } catch (e) {
+        console.warn('AgenticCore: Failed to update coding model:', e);
+      }
+    }
   }
 
   /**
@@ -336,6 +364,143 @@ export class AgenticCore {
         return await this.executeExplainVulnerability(params.vulnerability);
       }
     });
+
+    // Tool 9: Generate Project
+    this.tools.set('generate_project', {
+      name: 'generate_project',
+      description: 'Generate a complete project structure with files. Works without repository open. Creates secure project templates.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Project name'
+          },
+          type: {
+            type: 'string',
+            enum: ['web', 'api', 'library', 'cli', 'fullstack'],
+            description: 'Project type'
+          },
+          language: {
+            type: 'string',
+            enum: ['javascript', 'typescript', 'python', 'java', 'go', 'rust'],
+            description: 'Programming language'
+          },
+          basePath: {
+            type: 'string',
+            description: 'Base path for project (optional, defaults to temp directory)'
+          }
+        },
+        required: ['name', 'type', 'language']
+      },
+      execute: async (params: any) => {
+        return await this.executeGenerateProject(params.name, params.type, params.language, params.basePath);
+      }
+    });
+
+    // Tool 10: Create File
+    this.tools.set('create_file', {
+      name: 'create_file',
+      description: 'Create a new file with content. Can create files anywhere, even without repository open.',
+      parameters: {
+        type: 'object',
+        properties: {
+          filePath: {
+            type: 'string',
+            description: 'Path to file to create'
+          },
+          content: {
+            type: 'string',
+            description: 'File content'
+          }
+        },
+        required: ['filePath', 'content']
+      },
+      execute: async (params: any) => {
+        return await this.executeCreateFile(params.filePath, params.content);
+      }
+    });
+
+    // Tool 11: Edit File
+    this.tools.set('edit_file', {
+      name: 'edit_file',
+      description: 'Edit an existing file by replacing content or appending. Can hash files for integrity.',
+      parameters: {
+        type: 'object',
+        properties: {
+          filePath: {
+            type: 'string',
+            description: 'Path to file to edit'
+          },
+          content: {
+            type: 'string',
+            description: 'New file content (replaces entire file)'
+          },
+          append: {
+            type: 'boolean',
+            description: 'If true, append to file instead of replacing'
+          },
+          hashForIntegrity: {
+            type: 'boolean',
+            description: 'If true, generate hash for file integrity verification'
+          }
+        },
+        required: ['filePath', 'content']
+      },
+      execute: async (params: any) => {
+        return await this.executeEditFile(params.filePath, params.content, params.append, params.hashForIntegrity);
+      }
+    });
+
+    // Tool 12: DAST - Surface Monitoring (replaces StackHawk/Intruder)
+    this.tools.set('scan_dast', {
+      name: 'scan_dast',
+      description: 'Run dynamic application security testing (DAST) / surface monitoring on a running web app or API. Simulates attacks (SQL injection, XSS, SSRF, path traversal, etc.), checks security headers, uses AI to analyze responses. Replaces StackHawk and Intruder. Requires a URL to a running application.',
+      parameters: {
+        type: 'object',
+        properties: {
+          targetUrl: {
+            type: 'string',
+            description: 'Base URL of the web app or API to test (e.g. https://api.example.com or http://localhost:3000)'
+          },
+          discoverEndpoints: {
+            type: 'boolean',
+            description: 'Discover endpoints from OpenAPI/Swagger and workspace code. Default true.'
+          },
+          useAIAnalysis: {
+            type: 'boolean',
+            description: 'Use AI to analyze responses for vulnerability evidence. Default true.'
+          },
+          maxEndpoints: {
+            type: 'number',
+            description: 'Max endpoints to test (default 20)'
+          }
+        },
+        required: ['targetUrl']
+      },
+      execute: async (params: any) => {
+        return await this.executeDastScan(params);
+      }
+    });
+
+    // Tool 13: Pentest - 200+ agents, replaces Cobalt/XBOW. No High+? Money back.
+    this.tools.set('scan_pentest', {
+      name: 'scan_pentest',
+      description: 'Run full penetration test with 200+ attack agents. Use when user asks for pentest, penetration test, or wants maximum coverage. Replaces Cobalt and XBOW. Brutal payloads, timing blind SQLi, 30 deep-dive agents. No High+ finding? Money back.',
+      parameters: {
+        type: 'object',
+        properties: {
+          targetUrl: {
+            type: 'string',
+            description: 'Base URL to pentest (e.g. https://api.example.com or http://localhost:3000)'
+          },
+        },
+        required: ['targetUrl']
+      },
+      execute: async (params: any) => {
+        return await this.executePentestScan(params);
+      }
+    });
   }
 
   /**
@@ -376,23 +541,48 @@ export class AgenticCore {
     }
   }
 
+  /** Build user message content - supports text + image attachments for vision models */
+  private buildUserMessageContent(
+    userRequest: string,
+    attachments?: Array<{ type: string; data: string; mimeType?: string; name?: string }>
+  ): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
+    if (!attachments?.length) return userRequest;
+    const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
+      { type: 'text', text: userRequest || 'Analyze the attached image(s).' },
+      ...attachments.map(a => ({ type: 'image_url' as const, image_url: { url: a.data } })),
+    ];
+    return parts;
+  }
+
   /**
    * Main agent execution - processes user request autonomously
    */
-  async processRequest(userRequest: string, workspacePath?: string): Promise<string> {
+  async processRequest(
+    userRequest: string,
+    workspacePath?: string,
+    opts?: { attachments?: Array<{ type: string; data: string; mimeType?: string; name?: string }> }
+  ): Promise<string> {
+    const attachments = opts?.attachments;
+    // Generate message ID for citation tracking
+    this.currentMessageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
     // Check if workspace is open
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const hasWorkspace = workspaceFolders && workspaceFolders.length > 0;
     
-    // Check if this is a security-related request that needs a workspace
-    const securityCommands = [
-      /scan.*repositor|scan.*codebase|scan.*code|analyze.*repositor|check.*vulnerabilit|find.*vulnerabilit|security.*scan/i,
-      /find.*secret|detect.*secret|scan.*secret|hardcoded.*secret|find.*key|find.*password|find.*token|find.*credential/i,
-      /check.*dependenc|scan.*dependenc|find.*vulnerable.*package|check.*package/i,
-      /analyze.*code|security.*audit|code.*review/i
-    ];
+    // Check if this is a project generation request (doesn't need workspace)
+    const isProjectGeneration = /generate.*project|create.*project|new.*project|scaffold|init.*project/i.test(userRequest);
     
-    const isSecurityRequest = securityCommands.some(pattern => pattern.test(userRequest));
+    // Dynamic intent recognition - understands security requests across many phrasings
+    const intentRecognizer = getIntentRecognizer();
+    const recognizedIntent = intentRecognizer.recognize(userRequest);
+    const isSecurityRequest = intentRecognizer.isSecurityRequest(userRequest);
+    
+    // Project generation doesn't need workspace - handle it immediately
+    if (isProjectGeneration && !hasWorkspace) {
+      // Extract project details from request using AI
+      return await this.handleProjectGeneration(userRequest);
+    }
     
     // If security request but no workspace, guide user to open one with varied human response
     if (isSecurityRequest && !hasWorkspace) {
@@ -405,8 +595,8 @@ export class AgenticCore {
                         process.cwd();
     this.state.context.workspacePath = detectedPath;
 
-    // Check for "fix vulnerabilities" request with priority detection
-    const isFixRequest = /fix.*vulnerabilit|fix.*issue|fix.*finding|apply.*fix|generate.*fix|auto.*fix/i.test(userRequest);
+    // Check for fix request using intent recognizer (consistent with natural language routing)
+    const isFixRequest = recognizedIntent.intent === 'FIX_VULNERABILITIES';
     const isHighPriorityOnly = /fix.*(high|critical)\s*(priority|issues?|vulns?)|high\s*priority.*fix|(critical|high)\s+only/i.test(userRequest);
     const isCriticalOnly = /fix.*critical\s*only|only.*critical|critical\s+issues?\s+only/i.test(userRequest);
 
@@ -417,7 +607,7 @@ export class AgenticCore {
       // Add user message to conversation for context
       this.state.conversation.push({
         role: 'user',
-        content: userRequest
+        content: this.buildUserMessageContent(userRequest, attachments)
       });
 
       // Check if we have scan results to fix
@@ -530,28 +720,88 @@ export class AgenticCore {
       // This ensures security requests always work, regardless of AI model capabilities
       console.log('AgenticCore: Detected security request, immediately executing');
       
-      // Detect specific request type for filtering
-      const isSecretsRequest = /find.*secret|detect.*secret|scan.*secret|hardcoded.*secret|find.*key|find.*password|find.*token|find.*credential/i.test(userRequest);
-      const isDependencyRequest = /dependenc|package|vulnerable.*package/i.test(userRequest);
+      // Use intent recognizer for sub-intent (secrets, dependencies, smart contracts, full)
+      const scanSubIntent = intentRecognizer.getScanSubIntent(userRequest);
+      const isSecretsRequest = scanSubIntent === 'secrets';
+      const isDependencyRequest = scanSubIntent === 'dependencies';
+      const isIacRequest = scanSubIntent === 'iac';
+      const isContainersRequest = scanSubIntent === 'containers';
       
       // Add user message to conversation for context
       this.state.conversation.push({
         role: 'user',
-        content: userRequest
+        content: this.buildUserMessageContent(userRequest, attachments)
       });
+      
+      // Clean up conversation history periodically to prevent memory issues
+      this.cleanupConversationHistory(50);
       
       try {
         console.log('AgenticCore: Starting scan execution...');
-        const scanResult = await Promise.race([
-          this.executeScanRepository(this.state.context.workspacePath || '.', undefined, undefined, {
-            filterSecrets: isSecretsRequest,
-            filterDependencies: isDependencyRequest
-          }),
-          new Promise<any>((_, reject) => {
-            // Scans can take a while for large repositories - use 3 minute timeout
-            setTimeout(() => reject(new Error('Scan timed out after 180 seconds')), 180000);
-          })
-        ]);
+        
+        // First message: acknowledge request and let user know scan is starting
+        let firstMessage = 'I\'m scanning your repository. Results will follow shortly.';
+        if (isSecretsRequest) firstMessage = 'I\'m scanning your repository for hardcoded secrets. Results will follow shortly.';
+        else if (isDependencyRequest) firstMessage = 'I\'m scanning your repository for dependency vulnerabilities. Results will follow shortly.';
+        else if (isIacRequest) firstMessage = 'I\'m scanning your Terraform, CloudFormation & Kubernetes for misconfigurations. Results will follow shortly.';
+        else if (isContainersRequest) firstMessage = 'I\'m scanning your Dockerfiles and container images. Results will follow shortly.';
+        else firstMessage = 'I\'m running a full security scan of your repository. Results will follow shortly.';
+        if (this.chatInterface && typeof this.chatInterface.addMessage === 'function') {
+          this.chatInterface.addMessage('assistant', firstMessage);
+        }
+        this.state.conversation.push({ role: 'assistant', content: firstMessage });
+        
+        // Wrap scan in progress dialog to show status and prevent UI blocking
+        const scanResult = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: 'CipherMate: Scanning Repository',
+            cancellable: false
+          },
+          async (progress) => {
+            progress.report({ increment: 0, message: 'Initializing...' });
+            if (this.chatInterface) this.chatInterface.showThinkingAction('Initializing scanners', 'Preparing workspace and loading scan configuration');
+            await new Promise(resolve => setTimeout(resolve, 150));
+            
+            progress.report({ increment: 5, message: 'Detecting repository structure...' });
+            if (this.chatInterface) this.chatInterface.showThinkingAction('Detecting repository structure', 'Identifying project type and manifest files');
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Execute scan with timeout - RepositoryScanner will report per-scanner progress
+            const result = await Promise.race([
+              (async () => {
+                const scanResult = await this.executeScanRepository(
+                  this.state.context.workspacePath || '.', 
+                  undefined, 
+                  undefined, 
+                  {
+                    filterSecrets: isSecretsRequest,
+                    filterDependencies: isDependencyRequest,
+                    scanners: isIacRequest ? ['iac-scanner'] : isContainersRequest ? ['container-scanner'] : undefined,
+                  }
+                );
+                
+                progress.report({ increment: 85, message: 'Aggregating results...' });
+                if (this.chatInterface) this.chatInterface.showThinkingAction('Aggregating results', 'Combining findings from all scanners');
+                await new Promise(resolve => setTimeout(resolve, 80));
+                
+                progress.report({ increment: 92, message: 'Building report...' });
+                if (this.chatInterface) this.chatInterface.showThinkingAction('Building report', 'Formatting results and preparing recommendations');
+                await new Promise(resolve => setTimeout(resolve, 50));
+                
+                progress.report({ increment: 98, message: 'Scan complete!' });
+                if (this.chatInterface) this.chatInterface.showThinkingAction('Scan complete', 'Results ready');
+                return scanResult;
+              })(),
+              new Promise<any>((_, reject) => {
+                // Scans can take a while for large repositories - use 3 minute timeout
+                setTimeout(() => reject(new Error('Scan timed out after 180 seconds')), 180000);
+              })
+            ]);
+            
+            return result;
+          }
+        );
         
         console.log('AgenticCore: Scan completed, result:', scanResult);
         
@@ -569,61 +819,40 @@ export class AgenticCore {
           const medium = scanResult.summary?.medium || 0;
           const low = scanResult.summary?.low || 0;
           
-          // Human assessment based on findings and request type
-          const isSecretsRequest = /find.*secret|detect.*secret|scan.*secret|hardcoded.*secret|find.*key|find.*password|find.*token|find.*credential/i.test(userRequest);
-          const isDependencyRequest = /dependenc|package|vulnerable.*package/i.test(userRequest);
-          
+          // Assessment and report title based on request type (understands user context)
           let assessment = '';
           let overallStatus = '';
+          let reportTitle = 'Security Scan Results';
+          if (isSecretsRequest) reportTitle = 'Hardcoded Secrets Scan Results';
+          else if (isDependencyRequest) reportTitle = 'Dependency Vulnerability Scan Results';
           
           if (isSecretsRequest) {
-            // Secrets-specific assessment
-            if (totalVulns === 0) {
-              assessment = 'Great news! I scanned your repository for hardcoded secrets and didn\'t find any. Your credentials appear to be properly secured.';
-            } else if (critical > 0) {
-              assessment = `I found ${critical} critical secret${critical > 1 ? 's' : ''} exposed in your code. These need to be removed immediately - they could be a serious security risk.`;
-            } else if (high > 0) {
-              assessment = `I found ${high} hardcoded secret${high > 1 ? 's' : ''} in your repository. You should move these to environment variables or a secure secrets manager.`;
-            } else {
-              assessment = `I found ${totalVulns} potential secret${totalVulns > 1 ? 's' : ''} in your code. Consider reviewing these and moving sensitive data to secure storage.`;
-            }
+            if (totalVulns === 0) assessment = 'Secrets scan complete. No hardcoded secrets detected.';
+            else if (critical > 0) assessment = `${critical} critical secret${critical > 1 ? 's' : ''} detected. Remove immediately. Rotate any exposed credentials.`;
+            else if (high > 0) assessment = `${high} hardcoded secret${high > 1 ? 's' : ''} found. Migrate to env vars or secrets manager (e.g. AWS Secrets Manager, Vault).`;
+            else assessment = `${totalVulns} potential secret${totalVulns > 1 ? 's' : ''} identified. Review and relocate to secure storage.`;
           } else if (isDependencyRequest) {
-            // Dependency-specific assessment
-            if (totalVulns === 0) {
-              assessment = 'Your dependencies look good! I didn\'t find any known vulnerabilities in your packages.';
-            } else if (critical > 0) {
-              assessment = `I found ${critical} critical vulnerability${critical > 1 ? 'ies' : ''} in your dependencies. These packages should be updated immediately.`;
-            } else if (high > 0) {
-              assessment = `I found ${high} high-severity vulnerability${high > 1 ? 'ies' : ''} in your dependencies. Consider updating these packages soon.`;
-            } else {
-              assessment = `I found ${totalVulns} vulnerability${totalVulns > 1 ? 'ies' : ''} in your dependencies. Review these when you have a chance.`;
-            }
+            if (totalVulns === 0) assessment = 'Dependency scan complete. No CVEs found.';
+            else if (critical > 0) assessment = `${critical} critical CVE${critical > 1 ? 's' : ''} in dependencies. Update packages immediately.`;
+            else if (high > 0) assessment = `${high} high-severity CVE${high > 1 ? 's' : ''} in dependencies. Run npm update / pip install -U.`;
+            else assessment = `${totalVulns} vulnerability${totalVulns > 1 ? 'ies' : ''} in dependencies. Address in next maintenance window.`;
           } else {
-            // General security assessment
             if (totalVulns === 0) {
-              assessment = 'Your repository appears to be in good shape security-wise. I ran a comprehensive scan and found no vulnerabilities. That\'s excellent!';
+              assessment = 'Scan complete. No vulnerabilities detected.';
               overallStatus = 'SECURE';
             } else if (critical > 0) {
-              assessment = `Your repository needs immediate attention. I found ${critical} critical vulnerability${critical > 1 ? 'ies' : ''} that should be fixed right away.`;
+              assessment = `${critical} critical vulnerability${critical > 1 ? 'ies' : ''} found. Remediate immediately.`;
               overallStatus = 'CRITICAL_ISSUES';
             } else if (high > 0) {
-              assessment = `Your repository has some security concerns. I found ${high} high-severity issue${high > 1 ? 's' : ''} that should be addressed soon.`;
+              assessment = `${high} high-severity finding${high > 1 ? 's' : ''}. Prioritize remediation.`;
               overallStatus = 'NEEDS_ATTENTION';
             } else if (medium > 0 || low > 0) {
-              assessment = `Your repository is generally secure, but there are ${medium + low} minor issue${medium + low > 1 ? 's' : ''} worth reviewing when you have time.`;
+              assessment = `${medium + low} medium/low finding${medium + low > 1 ? 's' : ''}. Review when feasible.`;
               overallStatus = 'MINOR_ISSUES';
             } else {
-              assessment = 'Your repository looks secure. No major issues found.';
+              assessment = 'Scan complete. No major issues.';
               overallStatus = 'SECURE';
             }
-          }
-          
-          // Determine report title based on request type
-          let reportTitle = 'Security Scan Results';
-          if (isSecretsRequest) {
-            reportTitle = 'Hardcoded Secrets Scan Results';
-          } else if (isDependencyRequest) {
-            reportTitle = 'Dependency Vulnerability Scan Results';
           }
           
           let resultMessage = `## ${reportTitle}\n\n`;
@@ -631,7 +860,6 @@ export class AgenticCore {
           
           resultMessage += `**Scan Location**: ${this.state.context.workspacePath || 'Current workspace'}\n\n`;
           
-          // Overall Summary
           const summaryLabel = isSecretsRequest ? 'secrets found' : isDependencyRequest ? 'vulnerable packages found' : 'vulnerabilities found';
           resultMessage += `### Overall Summary\n\n`;
           resultMessage += `Total ${summaryLabel}: **${totalVulns}**\n`;
@@ -665,14 +893,8 @@ export class AgenticCore {
             // Report for each scanner that ran (filter if needed)
             let scannerIndex = 0;
             scanResult.scanners.forEach((scanner: any) => {
-              // Skip scanners that don't match the filter
-              if (isSecretsRequest && scanner.name !== 'secrets-scanner') {
-                return; // Skip non-secrets scanners when filtering for secrets
-              }
-              if (isDependencyRequest && scanner.name !== 'dependency-scanner') {
-                return; // Skip non-dependency scanners when filtering for dependencies
-              }
-              
+              if (isSecretsRequest && scanner.name !== 'secrets-scanner') return;
+              if (isDependencyRequest && scanner.name !== 'dependency-scanner') return;
               scannerIndex++;
               const scannerName = scanner.name.replace(/-/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
               const scannerVulns = scanner.vulnerabilities || vulnerabilitiesByScanner.get(scanner.name) || [];
@@ -718,7 +940,7 @@ export class AgenticCore {
                   if (inf > 0) resultMessage += `- Informational: ${inf}\n`;
                   resultMessage += `\n`;
                   
-                  // Show all vulnerabilities from this scanner (or top 10 if too many)
+                  // Show all vulnerabilities from this scanner (no truncation)
                   const displayVulns = scannerVulns
                     .sort((a: any, b: any) => {
                       const severityOrder: Record<string, number> = {
@@ -727,8 +949,7 @@ export class AgenticCore {
                       const aSev = severityOrder[(a.severity || '').toLowerCase()] || 99;
                       const bSev = severityOrder[(b.severity || '').toLowerCase()] || 99;
                       return aSev - bSev;
-                    })
-                    .slice(0, 10);
+                    });
                   
                   if (displayVulns.length > 0) {
                     resultMessage += `Findings:\n`;
@@ -744,9 +965,6 @@ export class AgenticCore {
                       const message = vuln.message || vuln.description || vuln.title || vuln.type || 'Vulnerability detected';
                       resultMessage += `${message}\n`;
                     });
-                    if (scannerVulns.length > 10) {
-                      resultMessage += `\n... and ${scannerVulns.length - 10} more findings. Use "show all [scanner name] results" to see everything.\n`;
-                    }
                   }
                 } else {
                   resultMessage += `Result: No vulnerabilities found. This scanner completed successfully with no security issues detected.\n`;
@@ -779,22 +997,18 @@ export class AgenticCore {
           // Next steps based on findings
           if (critical > 0 || high > 0) {
             resultMessage += `### Recommended Actions\n\n`;
-            resultMessage += `I recommend addressing the critical and high-severity issues first. Here's what you can do:\n\n`;
-            resultMessage += `- Say "fix vulnerabilities" to generate automatic fixes for the issues I found\n`;
-            resultMessage += `- Say "show critical vulnerabilities" to see all critical issues in detail\n`;
-            resultMessage += `- Say "show [scanner name] results" to see detailed findings from a specific scanner\n`;
-            resultMessage += `- Say "explain [vulnerability type]" to learn more about a specific vulnerability type\n`;
+            resultMessage += `- fix vulnerabilities — generate patches\n`;
+            resultMessage += `- show critical vulnerabilities — list critical findings\n`;
+            resultMessage += `- show [scanner] results — filter by scanner\n`;
           } else if (medium > 0 || low > 0) {
             resultMessage += `### Recommended Actions\n\n`;
-            resultMessage += `While your repository is generally secure, you may want to review the minor issues when convenient:\n\n`;
-            resultMessage += `- Say "fix vulnerabilities" to generate fixes for the issues found\n`;
-            resultMessage += `- Say "show all vulnerabilities" to review everything\n`;
+            resultMessage += `- fix vulnerabilities — apply patches\n`;
+            resultMessage += `- show all vulnerabilities — full listing\n`;
           } else {
             resultMessage += `### Next Steps\n\n`;
-            resultMessage += `Your repository looks secure! To maintain this:\n\n`;
-            resultMessage += `- Run regular scans to catch new vulnerabilities early\n`;
+            resultMessage += `- Schedule regular scans\n`;
             resultMessage += `- Keep dependencies updated\n`;
-            resultMessage += `- Review code changes for security best practices\n`;
+            resultMessage += `- Review PRs for security issues\n`;
           }
           
           console.log('AgenticCore: Returning comprehensive scan report');
@@ -804,6 +1018,16 @@ export class AgenticCore {
             role: 'assistant',
             content: resultMessage
           });
+          
+          // Third message (deferred so it appears after the report): how to trigger automatic fixes
+          if (totalVulns > 0 && (critical > 0 || high > 0 || medium > 0 || low > 0)) {
+            const fixMessage = '**To have CipherMate apply fixes automatically:** Say **fix vulnerabilities** in this chat, or click **Fix it** on individual findings in the View Results panel.';
+            setTimeout(() => {
+              if (this.chatInterface && typeof this.chatInterface.addMessage === 'function') {
+                this.chatInterface.addMessage('assistant', fixMessage);
+              }
+            }, 100);
+          }
           
           return resultMessage;
         } else {
@@ -882,10 +1106,10 @@ export class AgenticCore {
     }
     
     // For non-scan requests, proceed with normal AI processing
-    // Add user message
+    // Add user message (with image attachments for vision processing)
     this.state.conversation.push({
       role: 'user',
-      content: userRequest
+      content: this.buildUserMessageContent(userRequest, attachments)
     });
 
     // System prompt with tool definitions
@@ -936,8 +1160,58 @@ export class AgenticCore {
               throw new Error(`Tool ${toolName} not found`);
             }
 
+            // Add citation for tool usage
+            this.citationService.addToolCitation(
+              this.currentMessageId,
+              toolName,
+              tool.description
+            );
+
+            // Show action during thinking
+            if (this.chatInterface) {
+              this.chatInterface.showThinkingAction(`Using tool: ${toolName}`, tool.description);
+              const citations = this.citationService.getCitations(this.currentMessageId);
+              if (citations.length > 0) {
+                const citationTexts = citations.map(c => {
+                  if (c.type === 'file') return `File: ${c.source}`;
+                  if (c.type === 'tool') return `Tool: ${c.source}`;
+                  if (c.type === 'service') return `Service: ${c.source}`;
+                  return c.source;
+                });
+                this.chatInterface.showThinkingCitations(citationTexts);
+              }
+            }
+
             // Execute tool
             const toolResult = await tool.execute(toolParams);
+            
+            // Add file citations if tool accessed files
+            if (toolResult.filePath || toolResult.files) {
+              const files = toolResult.files || [toolResult.filePath];
+              for (const file of files) {
+                if (file) {
+                  this.citationService.addFileCitation(
+                    this.currentMessageId,
+                    file,
+                    toolResult.line
+                  );
+                  // Show file reference during thinking
+                  if (this.chatInterface) {
+                    this.chatInterface.showThinkingAction(`Accessed file: ${file}`, toolResult.line ? `Line ${toolResult.line}` : undefined);
+                    const citations = this.citationService.getCitations(this.currentMessageId);
+                    if (citations.length > 0) {
+                      const citationTexts = citations.map(c => {
+                        if (c.type === 'file') return `File: ${c.source}`;
+                        if (c.type === 'tool') return `Tool: ${c.source}`;
+                        if (c.type === 'service') return `Service: ${c.source}`;
+                        return c.source;
+                      });
+                      this.chatInterface.showThinkingCitations(citationTexts);
+                    }
+                  }
+                }
+              }
+            }
             
             // Add tool result to conversation
             this.state.conversation.push({
@@ -961,7 +1235,8 @@ export class AgenticCore {
         }
       } else {
         // No tool calls - check if we should auto-trigger based on response content
-        const responseLower = response.content.toLowerCase();
+        const contentStr = typeof response.content === 'string' ? response.content : '';
+        const responseLower = contentStr.toLowerCase();
         const shouldAutoScan = isSecurityRequest && 
           (responseLower.includes("don't have access") || 
            responseLower.includes("can't access") ||
@@ -977,7 +1252,7 @@ export class AgenticCore {
             const scanResult = await this.executeScanRepository(this.state.context.workspacePath);
             
             if (scanResult.success) {
-              return `I'll scan your repository now.\n\n${scanResult.message}\n\nFound ${scanResult.count} vulnerabilities (${scanResult.critical} critical, ${scanResult.high} high).\n\n[Use "fix vulnerabilities" to generate fixes for these issues.]`;
+              return `Scan initiated.\n\n${scanResult.message}\n\nResult: ${scanResult.count} findings (${scanResult.critical} critical, ${scanResult.high} high). Use "fix vulnerabilities" for remediation.`;
             } else {
               return `Failed to scan repository: ${scanResult.error || 'Unknown error'}`;
             }
@@ -987,11 +1262,38 @@ export class AgenticCore {
         }
         
         // No more tools to call - agent is done
-        lastResponse = response.content;
+        lastResponse = contentStr;
+        
+        // Get citations and append to response
+        const citations = this.citationService.getCitations(this.currentMessageId);
+        if (citations && citations.length > 0 && this.chatInterface) {
+          // updateCitations expects an array of citation objects
+          this.chatInterface.updateCitations(this.currentMessageId, citations);
+          
+          // Append citations to response using summary string
+          const citationSummary = this.citationService.getCitationSummary(this.currentMessageId);
+          if (citationSummary) {
+            lastResponse += `\n\n---\n**Sources:** ${citationSummary}`;
+          }
+        }
+        
         break;
       }
 
       iteration++;
+    }
+
+    // Final citations check
+    const finalCitations = this.citationService.getCitations(this.currentMessageId);
+    if (finalCitations && finalCitations.length > 0 && !lastResponse.includes('Sources:')) {
+      if (this.chatInterface) {
+        // updateCitations expects an array of citation objects
+        this.chatInterface.updateCitations(this.currentMessageId, finalCitations);
+      }
+      const citationSummary = this.citationService.getCitationSummary(this.currentMessageId);
+      if (citationSummary) {
+        lastResponse += `\n\n---\n**Sources:** ${citationSummary}`;
+      }
     }
 
     return lastResponse || 'Agent completed processing.';
@@ -1025,13 +1327,13 @@ ${toolsDescription}
 
 Instructions:
 - When asked to scan a repository, use scan_repository tool with the workspace path (auto-detected)
-- When vulnerabilities are found, analyze them and generate fixes
-- Apply fixes automatically when appropriate
-- Explain your actions clearly in natural language
+- When vulnerabilities are found, analyze and generate fixes
+- Apply fixes when appropriate
+- Use technical, concise language. Report findings with severity, location, remediation.
 - Plan multi-step operations (e.g., scan → analyze → fix → verify)
 - Be thorough and security-focused
 - NEVER mention API endpoints or JSON configurations to users
-- Users should just say things like "scan my repository" - you handle the rest
+- Users can say "scan my repository" - you handle the rest
 
 Always think step by step and use tools to accomplish tasks.`;
   }
@@ -1075,7 +1377,7 @@ Always think step by step and use tools to accomplish tasks.`;
         messages: apiMessages,
         tools: tools.length > 0 ? tools : undefined,
         temperature: 0.7,
-        max_tokens: 2000
+        max_tokens: 8192
       });
 
       return {
@@ -1120,7 +1422,7 @@ Always think step by step and use tools to accomplish tasks.`;
         messages: apiMessages,
         tools: tools.length > 0 ? tools : undefined,
         temperature: 0.7,
-        max_tokens: 2000
+        max_tokens: 8192
       });
 
       return {
@@ -1201,7 +1503,7 @@ Always think step by step and use tools to accomplish tasks.`;
         tools: tools,
         tool_choice: 'auto',
         temperature: 0.7,
-        max_tokens: 2000
+        max_tokens: 8192
       }));
       req.end();
     });
@@ -1226,7 +1528,7 @@ Always think step by step and use tools to accomplish tasks.`;
     path: string, 
     includePatterns?: string[], 
     excludePatterns?: string[],
-    options?: { filterSecrets?: boolean; filterDependencies?: boolean }
+    options?: { filterSecrets?: boolean; filterDependencies?: boolean; scanners?: string[] }
   ): Promise<any> {
     try {
       // Use provided path, or fall back to workspace, or current directory
@@ -1253,9 +1555,19 @@ Always think step by step and use tools to accomplish tasks.`;
 
       console.log(`AgenticCore: Scanning repository at: ${workspacePath}`);
 
+      // Progress callback for detailed thinking steps during scan
+      const onProgress = (step: string, detail: string) => {
+        if (this.chatInterface?.showThinkingAction) {
+          this.chatInterface.showThinkingAction(step, detail);
+        }
+      };
+
       // Use new unified RepositoryScanner (primary scanner) - this is fast and reliable
       const scanner = new RepositoryScanner(workspacePath);
-      const scanResult = await scanner.scan();
+      const scanResult = await scanner.scan({
+        onProgress,
+        scanners: options?.scanners,
+      });
 
       // Convert to format expected by agent
       const allVulnerabilities = scanner.getAllVulnerabilities(scanResult.results);
@@ -1264,8 +1576,12 @@ Always think step by step and use tools to accomplish tasks.`;
       // Tag each vulnerability with its scanner name
       let allResults = allVulnerabilities.map((v: any) => {
         // Determine scanner name from vulnerability metadata or type
-        let scannerName = (v as any).scanner || 'code-pattern-scanner'; // Default fallback
-        if (v.type?.includes('dependency') || v.type?.includes('cve') || v.type?.includes('package')) {
+        let scannerName = (v as any).scanner || (v.metadata?.scanner as string) || 'code-pattern-scanner'; // Default fallback
+        if (v.type?.startsWith('IAC-')) {
+          scannerName = 'iac-scanner';
+        } else if (v.type?.startsWith('CONT-') || v.type === 'container-cve' || v.metadata?.scanner === 'trivy') {
+          scannerName = 'container-scanner';
+        } else if (v.type?.includes('dependency') || v.type?.includes('cve') || v.type?.includes('package')) {
           scannerName = 'dependency-scanner';
         } else if (v.type?.includes('secret') || v.type?.includes('credential') || v.type?.includes('key') || 
                    v.type?.includes('password') || v.type?.includes('token')) {
@@ -1752,7 +2068,7 @@ Be detailed and educational.`;
       const response = await this.multiProviderService.callAI({
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.7,
-        max_tokens: 2000
+        max_tokens: 8192
       });
       return response.content;
     }
@@ -1762,7 +2078,7 @@ Be detailed and educational.`;
       const response = await this.cloudAIService.callAI({
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.7,
-        max_tokens: 2000
+        max_tokens: 8192
       });
       return response.content;
     }
@@ -1796,7 +2112,7 @@ Be detailed and educational.`;
         model: 'local-model',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.7,
-        max_tokens: 2000
+        max_tokens: 8192
       }));
       req.end();
     });
@@ -1881,10 +2197,11 @@ Return JSON with issues array.`;
     this.state.context.pendingRequest = originalRequest;
     
     // Check if we've already asked about this (to vary responses)
+    const getMsgText = (c: AgentMessage['content']) => typeof c === 'string' ? c : (Array.isArray(c) ? c.find((p: any) => p.type === 'text')?.text || '' : '');
     const previousNoWorkspaceMessages = this.state.conversation
       .filter(msg => msg.role === 'assistant')
       .slice(-3)
-      .map(msg => msg.content.toLowerCase());
+      .map(msg => getMsgText(msg.content).toLowerCase());
     
     const hasAskedBefore = previousNoWorkspaceMessages.some(msg => 
       msg.includes('open folder') || msg.includes('file → open')
@@ -1940,7 +2257,7 @@ Response:`;
       ];
       
       const response = await this.callAIWithTools(messages);
-      const generatedText = response.content?.trim() || '';
+      const generatedText = (typeof response.content === 'string' ? response.content : '')?.trim() || '';
       
       // Validate the response
       if (generatedText && this.isValidNoWorkspaceResponse(generatedText)) {
@@ -1967,13 +2284,10 @@ Response:`;
       message += `**Great news!** No vulnerabilities found.\n`;
     } else {
       message += `**Found ${scanResults.length} potential issues:**\n\n`;
-      scanResults.slice(0, 10).forEach((result: any, idx: number) => {
+      scanResults.forEach((result: any, idx: number) => {
         message += `${idx + 1}. ${result.severity || 'UNKNOWN'}: ${result.message || result.description || 'Issue detected'}\n`;
         if (result.file) message += `   File: ${result.file}${result.line ? `:${result.line}` : ''}\n`;
       });
-      if (scanResults.length > 10) {
-        message += `\n... and ${scanResults.length - 10} more issues.\n`;
-      }
     }
     
     message += `\n**Note:** Configure your AI provider in Settings (⚙ icon) for detailed analysis and recommendations.`;
@@ -2071,6 +2385,395 @@ Response:`;
   }
 
   /**
+   * Execute project generation
+   */
+  private async executeGenerateProject(
+    name: string,
+    type: string,
+    language: string,
+    basePath?: string
+  ): Promise<any> {
+    try {
+      // Add citation
+      this.citationService.addServiceCitation(
+        this.currentMessageId,
+        'ProjectGenerationService',
+        'generateProject'
+      );
+      
+      // Show action during thinking
+      if (this.chatInterface) {
+        this.chatInterface.showThinkingAction(`Generating project: ${name}`, `Type: ${type}, Language: ${language}`);
+        const citations = this.citationService.getCitations(this.currentMessageId);
+        if (citations.length > 0) {
+          const citationTexts = citations.map(c => {
+            if (c.type === 'file') return `File: ${c.source}`;
+            if (c.type === 'tool') return `Tool: ${c.source}`;
+            if (c.type === 'service') return `Service: ${c.source}`;
+            return c.source;
+          });
+          this.chatInterface.showThinkingCitations(citationTexts);
+        }
+      }
+
+      const structure = this.projectGenService.generateSecureProjectTemplate(
+        name,
+        type as any,
+        language as any
+      );
+
+      const result = await this.projectGenService.generateProject(structure, basePath);
+
+      if (result.success) {
+        // Add citations for created files
+        for (const file of result.filesCreated) {
+          this.citationService.addFileCitation(this.currentMessageId, file);
+        }
+
+        return {
+          success: true,
+          message: `Project "${name}" generated successfully!`,
+          projectPath: result.projectPath,
+          filesCreated: result.filesCreated.length,
+          files: result.filesCreated,
+        };
+      } else {
+        return {
+          success: false,
+          error: result.errors?.join(', ') || 'Unknown error',
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Execute create file
+   */
+  private async executeCreateFile(filePath: string, content: string): Promise<any> {
+    try {
+      // Add citation
+      this.citationService.addServiceCitation(
+        this.currentMessageId,
+        'FileOperationsService',
+        'createFile'
+      );
+      
+      // Show action during thinking
+      if (this.chatInterface) {
+        this.chatInterface.showThinkingAction(`Creating file: ${filePath}`);
+        const citations = this.citationService.getCitations(this.currentMessageId);
+        if (citations.length > 0) {
+          const citationTexts = citations.map(c => {
+            if (c.type === 'file') return `File: ${c.source}`;
+            if (c.type === 'tool') return `Tool: ${c.source}`;
+            if (c.type === 'service') return `Service: ${c.source}`;
+            return c.source;
+          });
+          this.chatInterface.showThinkingCitations(citationTexts);
+        }
+      }
+
+      const result = await this.fileService.createFile(filePath, content);
+
+      if (result.success) {
+        this.citationService.addFileCitation(this.currentMessageId, filePath);
+        
+        // Update citations after file creation
+        if (this.chatInterface) {
+          const citations = this.citationService.getCitations(this.currentMessageId);
+          if (citations.length > 0) {
+            const citationTexts = citations.map(c => {
+              if (c.type === 'file') return `File: ${c.source}`;
+              if (c.type === 'tool') return `Tool: ${c.source}`;
+              if (c.type === 'service') return `Service: ${c.source}`;
+              return c.source;
+            });
+            this.chatInterface.showThinkingCitations(citationTexts);
+          }
+        }
+        return {
+          success: true,
+          message: `File created: ${filePath}`,
+          filePath: result.path,
+        };
+      } else {
+        return {
+          success: false,
+          error: result.error || 'Unknown error',
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Execute edit file
+   */
+  private async executeEditFile(
+    filePath: string,
+    content: string,
+    append: boolean = false,
+    hashForIntegrity: boolean = false
+  ): Promise<any> {
+    try {
+      // Add citation
+      this.citationService.addServiceCitation(
+        this.currentMessageId,
+        'FileOperationsService',
+        append ? 'appendFile' : 'writeFile'
+      );
+      
+      // Show action during thinking
+      if (this.chatInterface) {
+        this.chatInterface.showThinkingAction(`${append ? 'Appending to' : 'Editing'} file: ${filePath}`);
+        const citations = this.citationService.getCitations(this.currentMessageId);
+        if (citations.length > 0) {
+          const citationTexts = citations.map(c => {
+            if (c.type === 'file') return `File: ${c.source}`;
+            if (c.type === 'tool') return `Tool: ${c.source}`;
+            if (c.type === 'service') return `Service: ${c.source}`;
+            return c.source;
+          });
+          this.chatInterface.showThinkingCitations(citationTexts);
+        }
+      }
+
+      let result;
+      if (append) {
+        const existing = await this.fileService.readFile(filePath).catch(() => '');
+        result = await this.fileService.writeFile(filePath, existing + '\n' + content);
+      } else {
+        result = await this.fileService.writeFile(filePath, content);
+      }
+
+      if (result.success) {
+        this.citationService.addFileCitation(this.currentMessageId, filePath);
+
+        // Generate hash if requested
+        let hash: string | undefined;
+        if (hashForIntegrity) {
+          hash = await this.projectGenService.hashFile(filePath);
+          this.citationService.addServiceCitation(
+            this.currentMessageId,
+            'HashingService',
+            'sha256'
+          );
+        }
+
+        return {
+          success: true,
+          message: `File ${append ? 'appended' : 'updated'}: ${filePath}`,
+          filePath: result.path,
+          hash,
+        };
+      } else {
+        return {
+          success: false,
+          error: result.error || 'Unknown error',
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Execute Pentest scan (200+ agents, replaces Cobalt/XBOW)
+   */
+  private async executePentestScan(params: { targetUrl: string }): Promise<any> {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    const targetUrl = (params.targetUrl || '').trim();
+    if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
+      return { success: false, error: 'Valid target URL required' };
+    }
+    if (this.chatInterface) {
+      this.chatInterface.showThinkingAction(`Running Pentest on ${targetUrl}... 200+ agents unleashed.`);
+    }
+    try {
+      const orchestrator = new AgentOrchestrator(this.context);
+      const result = await orchestrator.run({
+        targetUrl,
+        discoverFromWorkspace: true,
+        pentestMode: true,
+        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
+        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
+        enableDeepDive: true,
+        maxDeepDiveAgents: config.get<number>('dast.pentestAgentSwarmSize', 100),
+        agentsPerFinding: config.get<number>('dast.pentestAgentsPerFinding', 4),
+        maxEndpoints: config.get<number>('dast.pentestMaxEndpoints', 300),
+        concurrency: config.get<number>('dast.pentestConcurrency', 50),
+        brutalMode: true,
+        enableGraphQL: true,
+        enableJwtOAuth: true,
+        enableIdor: true,
+        enableFileUploadTests: config.get<boolean>('dast.enableFileUploadTests', true),
+      });
+      if (!result.success) {
+        return { success: false, error: result.error };
+      }
+      return {
+        success: true,
+        targetUrl: result.targetUrl,
+        endpointsTested: result.endpointsTested,
+        attacksPerformed: result.attacksPerformed,
+        vulnerabilities: result.vulnerabilities,
+        pentestHighPlusFindings: result.pentestHighPlusFindings,
+        duration: result.duration,
+        summary: {
+          total: result.vulnerabilities.length,
+          critical: result.vulnerabilities.filter((v: any) => v.severity === 'critical').length,
+          high: result.vulnerabilities.filter((v: any) => v.severity === 'high').length,
+          medium: result.vulnerabilities.filter((v: any) => v.severity === 'medium').length,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Execute DAST scan (Surface Monitoring - replaces StackHawk/Intruder)
+   */
+  private async executeDastScan(params: {
+    targetUrl: string;
+    discoverEndpoints?: boolean;
+    useAIAnalysis?: boolean;
+    maxEndpoints?: number;
+  }): Promise<any> {
+    try {
+      const targetUrl = (params.targetUrl || '').trim();
+      if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
+        return {
+          success: false,
+          error: 'Valid target URL required (e.g. https://api.example.com or http://localhost:3000)',
+        };
+      }
+
+      if (this.chatInterface) {
+        this.chatInterface.showThinkingAction(`Running DAST on ${targetUrl}...`);
+      }
+
+      const scanner = new DastScanner(this.context);
+      const result = await scanner.scan({
+        targetUrl,
+        discoverFromWorkspace: params.discoverEndpoints !== false,
+        enableAIResponseAnalysis: params.useAIAnalysis !== false,
+        maxEndpoints: params.maxEndpoints ?? 30,
+        concurrency: 5,
+        adaptiveThrottling: true,
+        enableGraphQL: true,
+        enableJwtOAuth: true,
+        enableIdor: true,
+      });
+
+      if (!result.success) {
+        return {
+          success: false,
+          error: result.error || 'DAST scan failed',
+        };
+      }
+
+      return {
+        success: true,
+        targetUrl: result.targetUrl,
+        endpointsTested: result.endpointsTested,
+        attacksPerformed: result.attacksPerformed,
+        vulnerabilities: result.vulnerabilities,
+        securityHeaders: result.securityHeaders,
+        duration: result.duration,
+        summary: {
+          total: result.vulnerabilities.length,
+          critical: result.vulnerabilities.filter((v) => v.severity === 'critical').length,
+          high: result.vulnerabilities.filter((v) => v.severity === 'high').length,
+          medium: result.vulnerabilities.filter((v) => v.severity === 'medium').length,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Handle project generation request
+   */
+  private async handleProjectGeneration(userRequest: string): Promise<string> {
+    // Use AI to extract project details
+    const prompt = `Extract project details from this request: "${userRequest}"
+
+Return JSON with:
+{
+  "name": "project name (default: 'my-project')",
+  "type": "web|api|library|cli|fullstack (default: 'web')",
+  "language": "javascript|typescript|python|java|go|rust (default: 'typescript')"
+}`;
+
+    try {
+      const messages: AgentMessage[] = [
+        { role: 'user', content: prompt }
+      ];
+      const response = await this.callAIWithTools(messages);
+      const responseContent = typeof response.content === 'string' ? response.content : '';
+      const parsed = JSON.parse(responseContent);
+
+      const name = parsed.name || 'my-project';
+      const type = parsed.type || 'web';
+      const language = parsed.language || 'typescript';
+
+      // Generate project
+      const result = await this.executeGenerateProject(name, type, language);
+
+      if (result.success) {
+        return `✅ **Project "${name}" generated successfully!**
+
+**Location:** ${result.projectPath}
+**Files Created:** ${result.filesCreated}
+
+The project includes:
+- Secure code templates
+- Security utilities (password hashing, token generation, input validation)
+- Configuration files
+- Documentation
+
+You can now open this folder in VS Code to start working!`;
+      } else {
+        return `❌ Failed to generate project: ${result.error}`;
+      }
+    } catch (error) {
+      return `I can help you generate a project! Please specify:
+- Project name
+- Type (web, api, library, cli, or fullstack)
+- Language (javascript, typescript, python, java, go, or rust)
+
+Example: "Generate a secure web project called 'my-app' in TypeScript"`;
+    }
+  }
+
+  /**
+   * Get citations for current message
+   */
+  getCitations(): string {
+    return this.citationService.getCitationSummary(this.currentMessageId);
+  }
+
+  /**
    * Get current state
    */
   getState(): AgentState {
@@ -2092,6 +2795,61 @@ Response:`;
         pendingRequest: undefined
       }
     };
+  }
+
+  /**
+   * Clean up old conversation history to prevent memory issues
+   * Keeps the most recent messages (default: 50)
+   */
+  private cleanupConversationHistory(maxMessages: number = 50): void {
+    if (this.state.conversation.length > maxMessages) {
+      // Keep system messages and the most recent user/assistant messages
+      const systemMessages = this.state.conversation.filter(m => m.role === 'system');
+      const recentMessages = this.state.conversation
+        .filter(m => m.role !== 'system')
+        .slice(-maxMessages);
+      
+      this.state.conversation = [...systemMessages, ...recentMessages];
+      console.log(`Memory cleanup: Reduced conversation history from ${this.state.conversation.length + (this.state.conversation.length - maxMessages)} to ${this.state.conversation.length} messages`);
+    }
+  }
+
+  /**
+   * Clean up old scan results and vulnerabilities
+   */
+  private cleanupScanData(maxItems: number = 1000): void {
+    if (this.state.scanResults.length > maxItems) {
+      this.state.scanResults = this.state.scanResults.slice(-maxItems);
+    }
+    if (this.state.vulnerabilities.length > maxItems) {
+      // Keep most severe vulnerabilities
+      const severityOrder: Record<string, number> = {
+        'critical': 0, 'error': 0,
+        'high': 1, 'warning': 1,
+        'medium': 2, 'info': 2,
+        'low': 3
+      };
+      this.state.vulnerabilities = this.state.vulnerabilities
+        .sort((a, b) => {
+          const aSev = severityOrder[(a.severity || '').toLowerCase()] ?? 4;
+          const bSev = severityOrder[(b.severity || '').toLowerCase()] ?? 4;
+          return aSev - bSev;
+        })
+        .slice(0, maxItems);
+    }
+  }
+
+  /**
+   * Perform periodic memory cleanup
+   */
+  performMemoryCleanup(): void {
+    this.cleanupConversationHistory(50);
+    this.cleanupScanData(1000);
+    
+    // Limit filesScanned array
+    if (this.state.context.filesScanned.length > 5000) {
+      this.state.context.filesScanned = this.state.context.filesScanned.slice(-5000);
+    }
   }
 }
 

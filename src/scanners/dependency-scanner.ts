@@ -23,6 +23,7 @@ interface VulnerableComponent {
     cve?: string[];
     summary?: string;
     fix?: string;
+    fixedVersion?: string;
     info?: string[];
   }>;
 }
@@ -37,6 +38,12 @@ export class DependencyScanner extends BaseScanner {
   }
 
   async isAvailable(): Promise<boolean> {
+    // Check if scanner is enabled in settings
+    const enabled = this.config.get<boolean>('scanners.enableDependency', true);
+    if (!enabled) {
+      return false;
+    }
+    
     try {
       await execAsync('npx retire --version');
       return true;
@@ -65,14 +72,38 @@ export class DependencyScanner extends BaseScanner {
         };
       }
 
-      // Scan each dependency file type
-      for (const file of dependencyFiles) {
+      // Scan each dependency file type with progress reporting
+      for (let i = 0; i < dependencyFiles.length; i++) {
+        const file = dependencyFiles[i];
+        console.log(`Scanning dependency file ${i + 1}/${dependencyFiles.length}: ${path.basename(file)}`);
+        
+        // Yield to event loop between files
+        await new Promise(resolve => setTimeout(resolve, 0));
+        
         const fileVulns = await this.scanDependencyFile(file);
         vulnerabilities.push(...fileVulns);
       }
 
-      // Enrich vulnerabilities with CVE data
-      await this.enrichWithCVEData(vulnerabilities);
+      // Skip CVE enrichment by default to prevent hanging - can be enabled via settings
+      const cveEnabled = this.config.get<boolean>('cve.enabled', false); // Default to false
+      if (cveEnabled && vulnerabilities.length > 0) {
+        try {
+          // Use shorter timeout and skip if too many vulnerabilities
+          if (vulnerabilities.length > 20) {
+            console.log('Skipping CVE enrichment - too many vulnerabilities to enrich efficiently');
+          } else {
+            await Promise.race([
+              this.enrichWithCVEData(vulnerabilities),
+              new Promise<void>((_, reject) => 
+                setTimeout(() => reject(new Error('CVE enrichment timed out')), 30000) // 30 second timeout
+              )
+            ]);
+          }
+        } catch (error) {
+          console.warn('CVE enrichment failed or timed out, continuing without CVE data:', error);
+          // Continue without CVE enrichment rather than failing entire scan
+        }
+      }
 
       return {
         scanner: this.getName(),
@@ -98,12 +129,18 @@ export class DependencyScanner extends BaseScanner {
   private async findDependencyFiles(): Promise<string[]> {
     const files: string[] = [];
 
+    // Helper function to yield control to event loop
+    const yieldToEventLoop = (): Promise<void> => {
+      return new Promise(resolve => setTimeout(resolve, 0));
+    };
+
     // Find package.json (npm/Node.js)
     const packageJsonFiles = await vscode.workspace.findFiles(
       '**/package.json',
       '**/node_modules/**'
     );
     files.push(...packageJsonFiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find requirements.txt (Python)
     const requirementsFiles = await vscode.workspace.findFiles(
@@ -111,6 +148,7 @@ export class DependencyScanner extends BaseScanner {
       '**/{node_modules,venv,.venv}/**'
     );
     files.push(...requirementsFiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find Pipfile (Python)
     const pipfiles = await vscode.workspace.findFiles(
@@ -118,6 +156,7 @@ export class DependencyScanner extends BaseScanner {
       '**/{node_modules,venv,.venv}/**'
     );
     files.push(...pipfiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find Cargo.toml (Rust)
     const cargoFiles = await vscode.workspace.findFiles(
@@ -125,6 +164,7 @@ export class DependencyScanner extends BaseScanner {
       '**/target/**'
     );
     files.push(...cargoFiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find go.mod (Go)
     const goModFiles = await vscode.workspace.findFiles(
@@ -132,6 +172,7 @@ export class DependencyScanner extends BaseScanner {
       '**/vendor/**'
     );
     files.push(...goModFiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find pom.xml (Maven/Java)
     const pomFiles = await vscode.workspace.findFiles(
@@ -139,6 +180,7 @@ export class DependencyScanner extends BaseScanner {
       '**/target/**'
     );
     files.push(...pomFiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find Gemfile (Ruby)
     const gemfiles = await vscode.workspace.findFiles(
@@ -146,6 +188,7 @@ export class DependencyScanner extends BaseScanner {
       '**/vendor/**'
     );
     files.push(...gemfiles.map(f => f.fsPath));
+    await yieldToEventLoop();
 
     // Find composer.json (PHP)
     const composerFiles = await vscode.workspace.findFiles(
@@ -188,45 +231,76 @@ export class DependencyScanner extends BaseScanner {
     const vulnerabilities: Vulnerability[] = [];
 
     try {
+      // Check if retire.js scanning is enabled (can be slow on large repos)
+      const retireEnabled = this.config.get<boolean>('scanners.enableRetire', true);
+      
+      if (!retireEnabled) {
+        console.log('retire.js scanning disabled, skipping npm dependency scan');
+        return vulnerabilities;
+      }
+
+      // Add timeout to prevent hanging (30 seconds for retire.js - shorter timeout)
+      const RETIRE_TIMEOUT = 30 * 1000; // 30 seconds
+      
       // Try to use retire.js if available
-      const { stdout } = await execAsync(
+      const execPromise = execAsync(
         `npx retire --path "${path.dirname(filePath)}" --outputformat json --colors off`,
-        { maxBuffer: 10 * 1024 * 1024 }
+        { maxBuffer: 10 * 1024 * 1024, timeout: RETIRE_TIMEOUT }
       ).catch((error: any) => {
         // retire exits with code 13 if vulnerabilities found
         if (error.code === 13 && error.stdout) {
           return { stdout: error.stdout };
         }
+        // Timeout or other error
+        if (error.signal === 'SIGTERM' || error.message?.includes('timeout')) {
+          console.log('retire.js timed out, skipping npm vulnerability scan');
+        }
         return { stdout: null };
       });
 
-      if (stdout) {
-        const retireData = JSON.parse(stdout);
-        const components = this.parseRetireOutput(retireData);
+      // Race against timeout
+      const timeoutPromise = new Promise<{ stdout: null }>((resolve) => {
+        setTimeout(() => {
+          console.log('retire.js execution timed out after 30 seconds');
+          resolve({ stdout: null });
+        }, RETIRE_TIMEOUT);
+      });
 
-        for (const component of components) {
-          for (const vuln of component.vulnerabilities) {
-            vulnerabilities.push({
-              id: this.generateVulnId('dependency', filePath),
-              type: 'dependency-vulnerability',
-              severity: vuln.severity,
-              title: `Vulnerable dependency: ${component.component}@${component.version}`,
-              description: vuln.summary || vuln.info?.[0] || 'Known vulnerability in dependency',
-              file: filePath,
-              cve: vuln.cve,
-              fix: vuln.fix,
-              references: vuln.info,
-              metadata: {
-                component: component.component,
-                version: component.version,
-              },
-            });
+      const { stdout } = await Promise.race([execPromise, timeoutPromise]);
+
+      if (stdout) {
+        try {
+          const retireData = JSON.parse(stdout);
+          const components = this.parseRetireOutput(retireData);
+
+          for (const component of components) {
+            for (const vuln of component.vulnerabilities) {
+              vulnerabilities.push({
+                id: this.generateVulnId('dependency', filePath),
+                type: 'dependency-vulnerability',
+                severity: vuln.severity,
+                title: `Vulnerable dependency: ${component.component}@${component.version}`,
+                description: vuln.summary || vuln.info?.[0] || 'Known vulnerability in dependency',
+                file: filePath,
+                line: 0, // Will be resolved when applying fix
+                cve: vuln.cve,
+                fix: vuln.fix,
+                references: vuln.info,
+                metadata: {
+                  component: component.component,
+                  version: component.version,
+                  fixedVersion: vuln.fixedVersion, // For one-click upgrade
+                },
+              });
+            }
           }
+        } catch (parseError) {
+          console.error('Failed to parse retire.js output:', parseError);
         }
       }
     } catch (error) {
       // retire.js not available or failed, continue without it
-      console.log('retire.js not available, skipping npm vulnerability scan');
+      console.log('retire.js not available or failed, skipping npm vulnerability scan:', error);
     }
 
     return vulnerabilities;
@@ -260,13 +334,17 @@ export class DependencyScanner extends BaseScanner {
               component: result.component || result.name || 'unknown',
               version: result.version || 'unknown',
               file: item.file || '',
-              vulnerabilities: (result.vulnerabilities || []).map((v: any) => ({
-                severity: this.mapSeverity(v.severity || 'medium'),
-                cve: v.identifiers?.CVE || [],
-                summary: v.identifiers?.summary,
-                fix: v.below ? `Upgrade to ${v.below} or higher` : undefined,
-                info: v.info || [],
-              })),
+              vulnerabilities: (result.vulnerabilities || []).map((v: any) => {
+                const fixedVersion = v.below || v.upgrade || v.fixed;
+                return {
+                  severity: this.mapSeverity(v.severity || 'medium'),
+                  cve: v.identifiers?.CVE || [],
+                  summary: v.identifiers?.summary,
+                  fix: fixedVersion ? `Upgrade to ${fixedVersion} or higher` : undefined,
+                  fixedVersion, // For one-click SCA autofix
+                  info: v.info || [],
+                };
+              }),
             });
           }
         }
@@ -289,6 +367,12 @@ export class DependencyScanner extends BaseScanner {
    * Enrich vulnerabilities with CVE data
    */
   private async enrichWithCVEData(vulnerabilities: Vulnerability[]): Promise<void> {
+    // Check if CVE enrichment is enabled
+    const cveEnabled = this.config.get<boolean>('cve.enabled', true);
+    if (!cveEnabled) {
+      return;
+    }
+    
     // Collect all CVE IDs
     const cveIds: string[] = [];
     const vulnCveMap = new Map<Vulnerability, string[]>();

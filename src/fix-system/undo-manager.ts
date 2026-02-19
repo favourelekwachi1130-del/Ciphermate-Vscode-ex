@@ -8,16 +8,19 @@
 import * as vscode from 'vscode';
 import { UndoEntry, FixResult, BackupSnapshot } from './types';
 import { BackupManager } from './backup-manager';
+import { DiskStorageService } from '../storage/disk-storage-service';
 
 export class UndoManager {
   private context: vscode.ExtensionContext;
   private backupManager: BackupManager;
+  private diskStorage: DiskStorageService;
   private readonly UNDO_STACK_KEY = 'ciphermate.fixUndoStack';
   private readonly MAX_UNDO_ENTRIES = 50;
 
   constructor(context: vscode.ExtensionContext, backupManager: BackupManager) {
     this.context = context;
     this.backupManager = backupManager;
+    this.diskStorage = new DiskStorageService(context);
   }
 
   /**
@@ -239,7 +242,19 @@ export class UndoManager {
    * Get undo stack from storage
    */
   private async getUndoStack(): Promise<UndoEntry[]> {
-    const stored = this.context.globalState.get<UndoEntry[]>(this.UNDO_STACK_KEY, []);
+    // Try disk storage first, fallback to globalState for migration
+    let stored: UndoEntry[] = [];
+    if (this.diskStorage.exists(this.UNDO_STACK_KEY)) {
+      stored = this.diskStorage.get<UndoEntry[]>(this.UNDO_STACK_KEY, []);
+    } else {
+      // Migrate from globalState if exists
+      stored = this.context.globalState.get<UndoEntry[]>(this.UNDO_STACK_KEY, []);
+      if (stored.length > 0) {
+        this.diskStorage.update(this.UNDO_STACK_KEY, stored);
+        // Clear from globalState after migration
+        this.context.globalState.update(this.UNDO_STACK_KEY, undefined);
+      }
+    }
 
     // Convert date strings back to Date objects
     return stored.map(e => ({
@@ -260,7 +275,7 @@ export class UndoManager {
    * Save undo stack to storage
    */
   private async saveUndoStack(stack: UndoEntry[]): Promise<void> {
-    await this.context.globalState.update(this.UNDO_STACK_KEY, stack);
+    this.diskStorage.update(this.UNDO_STACK_KEY, stack);
   }
 
   /**

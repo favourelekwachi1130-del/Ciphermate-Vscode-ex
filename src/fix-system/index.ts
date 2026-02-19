@@ -19,6 +19,9 @@ export { FixApplicator } from './fix-applicator';
 export { FixValidator } from './fix-validator';
 export { UndoManager } from './undo-manager';
 export { RuleBasedFixer, getRuleBasedFixer } from './rule-based-fixer';
+export { TaskGuard, getTaskGuard, TaskGuardResult } from './task-guard';
+export { ReviewSubagent, getReviewSubagent, ReviewResult } from './review-subagent';
+export { MultiAIFixPipeline, getMultiAIFixPipeline } from './multi-ai-fix-pipeline';
 
 // Main service
 export { FixService } from './fix-service';

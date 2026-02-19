@@ -1,13 +1,17 @@
 /**
  * Code Pattern Security Scanner
  * Detects OWASP Top 10 and common security vulnerabilities in code
+ * 
+ * Uses CipherMate Core PolicyEnforcementService for policy evaluation.
  */
 
 import * as vscode from 'vscode';
-import * as fs from 'fs';
 import * as path from 'path';
+import * as fs from 'fs';
 import { BaseScanner } from './base-scanner';
 import { ScanResult, Vulnerability, Severity } from './types';
+import { getPolicyEnforcementService } from '../core/policy-enforcement-service';
+import { getFileOperationsService } from '../core/file-operations-service';
 
 interface Pattern {
   name: string;
@@ -54,6 +58,9 @@ const PATTERN_TO_TYPE: Record<string, string> = {
 };
 
 export class CodePatternScanner extends BaseScanner {
+  private policyService = getPolicyEnforcementService();
+  private fileOperationsService = getFileOperationsService();
+  // Keep patterns for backward compatibility and additional patterns not in core
   private patterns: Pattern[] = [];
 
   constructor(workspacePath: string) {
@@ -70,7 +77,8 @@ export class CodePatternScanner extends BaseScanner {
   }
 
   async isAvailable(): Promise<boolean> {
-    return true; // Always available
+    // Check if scanner is enabled in settings
+    return this.config.get<boolean>('scanners.enableCodePattern', true);
   }
 
   async scan(): Promise<ScanResult> {
@@ -82,8 +90,60 @@ export class CodePatternScanner extends BaseScanner {
       const codeFiles = await this.findCodeFiles();
 
       for (const file of codeFiles) {
-        const fileVulns = await this.scanFile(file);
-        vulnerabilities.push(...fileVulns);
+        try {
+          // Use core FileOperationsService to read file with 1MB memory limit
+          const content = await this.fileOperationsService.readFile(file, 1024 * 1024);
+          
+          // Use core PolicyEnforcementService for policy evaluation
+          const policyResult = this.policyService.evaluateCode(content, file);
+          
+          // Convert policy violations to vulnerabilities
+          for (const violation of policyResult.violations) {
+            const lines = content.split('\n');
+            // Try to find line number from context or use pattern matching
+            let lineNumber = 1;
+            if (violation.context?.filePath) {
+              // Line number might be in context
+              lineNumber = violation.context.line || 1;
+            } else {
+              // Find line by searching for pattern
+              for (let i = 0; i < lines.length; i++) {
+                const policy = this.policyService.getPolicy(violation.policyId);
+                if (policy) {
+                  const rule = policy.rules.find(r => r.id === violation.ruleId);
+                  if (rule) {
+                    const pattern = typeof rule.pattern === 'string' ? new RegExp(rule.pattern, 'i') : rule.pattern;
+                    if (pattern.test(lines[i])) {
+                      lineNumber = i + 1;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+
+            vulnerabilities.push({
+              id: this.generateVulnId('policy-violation', file, lineNumber),
+              type: PATTERN_TO_TYPE[violation.ruleId] || 'policy-violation',
+              severity: violation.severity,
+              title: violation.message,
+              description: violation.message,
+              file: file,
+              line: lineNumber,
+              code: lines[lineNumber - 1]?.trim() || '',
+              metadata: {
+                policyId: violation.policyId,
+                ruleId: violation.ruleId,
+              },
+            });
+          }
+
+          // Also run legacy pattern matching for patterns not in core
+          const legacyVulns = await this.scanFileLegacy(file, content);
+          vulnerabilities.push(...legacyVulns);
+        } catch (error: any) {
+          console.error(`Error scanning ${file}:`, error);
+        }
       }
 
       return {
@@ -105,6 +165,47 @@ export class CodePatternScanner extends BaseScanner {
         error: error.message,
       };
     }
+  }
+
+  /**
+   * Legacy pattern scanning for patterns not covered by core PolicyEnforcementService
+   */
+  private async scanFileLegacy(filePath: string, content: string): Promise<Vulnerability[]> {
+    const vulnerabilities: Vulnerability[] = [];
+    const lines = content.split('\n');
+    const fileExt = path.extname(filePath).toLowerCase();
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const lineNumber = i + 1;
+
+      for (const pattern of this.patterns) {
+        // Check if pattern applies to this file type
+        if (pattern.fileExtensions && !pattern.fileExtensions.includes(fileExt)) {
+          continue;
+        }
+
+        if (pattern.pattern.test(line)) {
+          vulnerabilities.push({
+            id: this.generateVulnId('pattern', filePath, lineNumber),
+            type: PATTERN_TO_TYPE[pattern.name] || 'security-pattern',
+            severity: pattern.severity,
+            title: pattern.name,
+            description: pattern.description,
+            file: filePath,
+            line: lineNumber,
+            code: line.trim(),
+            metadata: {
+              cwe: pattern.cwe,
+              owasp: pattern.owasp,
+              fix: pattern.fix,
+            },
+          });
+        }
+      }
+    }
+
+    return vulnerabilities;
   }
 
   private initializePatterns(): void {

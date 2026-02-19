@@ -10,11 +10,13 @@ export class OpenAIProvider implements AIProvider {
   private client: OpenAI;
   private model: string;
   private maxTokens: number;
+  private baseURL?: string;
 
-  constructor(apiKey: string, model: string, maxTokens: number = 4096) {
-    this.client = new OpenAI({ apiKey });
+  constructor(apiKey: string, model: string, maxTokens: number = 4096, baseURL?: string) {
+    this.client = new OpenAI({ apiKey, ...(baseURL && { baseURL }) });
     this.model = model;
     this.maxTokens = maxTokens;
+    this.baseURL = baseURL;
   }
 
   async chat(messages: ConversationMessage[], systemPrompt: string): Promise<string> {
@@ -47,7 +49,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   getProviderName(): string {
-    return 'OpenAI (ChatGPT)';
+    return this.baseURL?.includes('openrouter') ? 'OpenRouter' : 'OpenAI (ChatGPT)';
   }
 }
 

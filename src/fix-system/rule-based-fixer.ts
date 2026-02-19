@@ -15,6 +15,8 @@ export interface RuleBasedFix {
   confidence: number;
   securityImprovements: string[];
   testingNotes: string;
+  /** Environment variables to add to .env when fixing secrets */
+  envVarsToCreate?: Array<{ name: string; value: string }>;
 }
 
 /**
@@ -155,7 +157,206 @@ export class RuleBasedFixer {
       return this.fixWeakPassword(vulnerability);
     }
 
+    // IaC (Infrastructure as Code) - Terraform, Kubernetes, CloudFormation
+    if (vulnType.startsWith('IAC-')) {
+      return this.fixIac(vulnerability);
+    }
+
+    // Container / Dockerfile (CONT-001, CONT-003, CONT-005, CONT-011)
+    if (vulnType.startsWith('CONT-') || vulnType.includes('container')) {
+      return this.fixContainer(vulnerability);
+    }
+
     // No matching rule
+    return null;
+  }
+
+  /**
+   * Fix IaC misconfigurations (Terraform, Kubernetes, CloudFormation)
+   */
+  private fixIac(vulnerability: Vulnerability): RuleBasedFix | null {
+    const code = vulnerability.code || '';
+    const ruleId = vulnerability.type || '';
+
+    // IAC-K8S-001: privileged: true -> false
+    if (ruleId === 'IAC-K8S-001' && /privileged\s*:\s*true/i.test(code)) {
+      return {
+        originalCode: code,
+        fixedCode: code.replace(/privileged\s*:\s*true/i, 'privileged: false'),
+        explanation: 'Set privileged to false to disable host-level container access',
+        confidence: 0.95,
+        securityImprovements: ['Restricts container to user namespace', 'Reduces attack surface'],
+        testingNotes: 'Verify the container still runs correctly; some workloads require privileged mode'
+      };
+    }
+
+    // IAC-K8S-002: runAsUser: 0 -> runAsUser: 1000
+    if (ruleId === 'IAC-K8S-002') {
+      if (/runAsUser\s*:\s*0\b/i.test(code)) {
+        return {
+          originalCode: code,
+          fixedCode: code.replace(/runAsUser\s*:\s*0\b/i, 'runAsUser: 1000'),
+          explanation: 'Set runAsUser to non-root (1000). Add runAsNonRoot: true for defense in depth.',
+          confidence: 0.9,
+          securityImprovements: ['Container runs as non-root user'],
+          testingNotes: 'Ensure your image supports running as non-root; some images require root'
+        };
+      }
+      if (/runAsRoot\s*:\s*true/i.test(code)) {
+        return {
+          originalCode: code,
+          fixedCode: code.replace(/runAsRoot\s*:\s*true/i, 'runAsNonRoot: true'),
+          explanation: 'Set runAsNonRoot to true to prevent running as root',
+          confidence: 0.95,
+          securityImprovements: ['Forbids root execution'],
+          testingNotes: 'Verify container works with runAsNonRoot: true'
+        };
+      }
+    }
+
+    // IAC-K8S-003: hostNetwork/hostPID/hostIPC: true -> false
+    if (ruleId === 'IAC-K8S-003') {
+      let fixed = code;
+      if (/hostNetwork\s*:\s*true/i.test(fixed)) fixed = fixed.replace(/hostNetwork\s*:\s*true/i, 'hostNetwork: false');
+      if (/hostPID\s*:\s*true/i.test(fixed)) fixed = fixed.replace(/hostPID\s*:\s*true/i, 'hostPID: false');
+      if (/hostIPC\s*:\s*true/i.test(fixed)) fixed = fixed.replace(/hostIPC\s*:\s*true/i, 'hostIPC: false');
+      if (fixed !== code) {
+        return {
+          originalCode: code,
+          fixedCode: fixed,
+          explanation: 'Disable host namespace sharing (hostNetwork, hostPID, hostIPC)',
+          confidence: 0.9,
+          securityImprovements: ['Pod uses isolated network/PID/IPC namespaces'],
+          testingNotes: 'Some DaemonSets (e.g. node exporter) require hostNetwork; add ciphermate:ignore if intentional'
+        };
+      }
+    }
+
+    // IAC-K8S-006: readOnlyRootFilesystem: false -> true
+    if (ruleId === 'IAC-K8S-006' && /readOnlyRootFilesystem\s*:\s*false/i.test(code)) {
+      return {
+        originalCode: code,
+        fixedCode: code.replace(/readOnlyRootFilesystem\s*:\s*false/i, 'readOnlyRootFilesystem: true'),
+        explanation: 'Enable read-only root filesystem for immutability',
+        confidence: 0.9,
+        securityImprovements: ['Prevents writes to container filesystem', 'Immutable container'],
+        testingNotes: 'Ensure app uses tmpfs or volumes for any required writes'
+      };
+    }
+
+    // IAC-K8S-007: allowPrivilegeEscalation: true -> false
+    if (ruleId === 'IAC-K8S-007' && /allowPrivilegeEscalation\s*:\s*true/i.test(code)) {
+      return {
+        originalCode: code,
+        fixedCode: code.replace(/allowPrivilegeEscalation\s*:\s*true/i, 'allowPrivilegeEscalation: false'),
+        explanation: 'Disable privilege escalation in the container',
+        confidence: 0.95,
+        securityImprovements: ['Prevents privilege escalation via setuid binaries'],
+        testingNotes: 'Verify no legitimate use of privilege escalation'
+      };
+    }
+
+    // IAC-TF-003: cidr_blocks = ["0.0.0.0/0"] -> restrict (placeholder - user must specify)
+    if (ruleId === 'IAC-TF-003' && /cidr_blocks\s*=\s*\[?\s*["']0\.0\.0\.0\/0["']\s*\]?/i.test(code)) {
+      return {
+        originalCode: code,
+        fixedCode: code.replace(/["']0\.0\.0\.0\/0["']/gi, '"10.0.0.0/8"  # TODO: Restrict to your VPC or specific IPs'),
+        explanation: 'Replace 0.0.0.0/0 with your VPC CIDR or specific IP ranges',
+        confidence: 0.7,
+        securityImprovements: ['Restricts ingress to internal/specific IPs'],
+        testingNotes: 'Update the CIDR to match your environment (VPC CIDR, office IPs, etc.)'
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Fix container / Dockerfile misconfigurations (CONT-001, CONT-003, CONT-005, CONT-011)
+   */
+  private fixContainer(vulnerability: Vulnerability): RuleBasedFix | null {
+    const code = vulnerability.code || '';
+    const ruleId = vulnerability.type || '';
+
+    // CONT-001: FROM xxx:latest -> suggest pinned tag (alpine:3.19, node:20, etc.)
+    if (ruleId === 'CONT-001') {
+      const fromMatch = code.match(/FROM\s+(?:--platform=\S+\s+)?([\w./-]+):(?:latest|stable|LTS)\s*(.*)$/im);
+      if (fromMatch) {
+        const [, base, rest] = fromMatch;
+        let suggested = base;
+        if (/alpine/i.test(base)) suggested = `${base}:3.19`;
+        else if (/node/i.test(base)) suggested = `${base}:20`;
+        else if (/python/i.test(base)) suggested = `${base}:3.11`;
+        else if (/ubuntu|debian/i.test(base)) suggested = `${base}:22.04`;
+        else suggested = `${base}:<pin-version>`;
+        const fixed = code.replace(
+          /(FROM\s+(?:--platform=\S+\s+)?)([\w./-]+):(?:latest|stable|LTS)(\s.*)?$/im,
+          `$1${suggested}$3`
+        );
+        if (fixed !== code) {
+          return {
+            originalCode: code,
+            fixedCode: fixed,
+            explanation: `Pinned base image to a specific version instead of :latest`,
+            confidence: 0.85,
+            securityImprovements: ['Reproducible builds', 'Reduced supply chain risk'],
+            testingNotes: 'Verify the pinned version is maintained and compatible'
+          };
+        }
+      }
+    }
+
+    // CONT-003: Add USER directive before CMD/ENTRYPOINT
+    if (ruleId === 'CONT-003') {
+      // Insert USER nobody (or 1000) before the first CMD or ENTRYPOINT if not already present
+      if (!/^\s*USER\s+/mi.test(code)) {
+        const beforeCmd = code.replace(
+          /^(\s*)((?:RUN\s+[^\n]+\n)+)(\s*(?:CMD|ENTRYPOINT)\s)/m,
+          '$1$2$1USER nobody\n$3'
+        );
+        if (beforeCmd !== code) {
+          return {
+            originalCode: code,
+            fixedCode: beforeCmd,
+            explanation: 'Added USER directive so container runs as non-root',
+            confidence: 0.8,
+            securityImprovements: ['Container runs as non-root user'],
+            testingNotes: 'Use USER 1000 or a named user if your image has one; ensure directories are writable'
+          };
+        }
+      }
+    }
+
+    // CONT-005: apt-get install -> add --no-install-recommends
+    if (ruleId === 'CONT-005' && /apt-get\s+install\s+-y\s+[^;]+(?!--no-install-recommends)/i.test(code)) {
+      const fixed = code.replace(
+        /apt-get\s+install\s+(-y)\s+/gi,
+        'apt-get install -y --no-install-recommends '
+      );
+      if (fixed !== code) {
+        return {
+          originalCode: code,
+          fixedCode: fixed,
+          explanation: 'Added --no-install-recommends to reduce image size and attack surface',
+          confidence: 0.95,
+          securityImprovements: ['Smaller image', 'Fewer packages to maintain'],
+          testingNotes: 'Verify app still works; some packages need recommended deps'
+        };
+      }
+    }
+
+    // CONT-011: privileged: true -> false (docker-compose)
+    if (ruleId === 'CONT-011' && /privileged\s*:\s*true/i.test(code)) {
+      return {
+        originalCode: code,
+        fixedCode: code.replace(/privileged\s*:\s*true/i, 'privileged: false'),
+        explanation: 'Set privileged to false; use cap_add for specific capabilities if needed',
+        confidence: 0.9,
+        securityImprovements: ['Disables host-level container access'],
+        testingNotes: 'Verify container works without privileged; some drivers need it'
+      };
+    }
+
     return null;
   }
 
@@ -502,34 +703,129 @@ ${fixedCode}`,
 
   /**
    * Fix hardcoded secrets by using environment variables
+   * IMPORTANT: Check file extension FIRST to avoid applying wrong language's syntax (e.g. Python in PHP)
    */
   private fixHardcodedSecret(vulnerability: Vulnerability): RuleBasedFix {
     const code = vulnerability.code || '';
+    const fileExt = (vulnerability.file || '').toLowerCase();
 
-    // Pattern: const/let/var SECRET = "value"
-    const secretAssignMatch = code.match(/(const|let|var)\s+(\w*(?:key|secret|password|token|credential|api_key|apikey|auth)\w*)\s*=\s*["'`][^"'`]+["'`]/i);
-    if (secretAssignMatch) {
-      const [fullMatch, keyword, varName] = secretAssignMatch;
-      const envVarName = varName.toUpperCase().replace(/([a-z])([A-Z])/g, '$1_$2');
-      const fixedCode = code.replace(
-        fullMatch,
-        `${keyword} ${varName} = process.env.${envVarName}`
-      );
-      return {
-        originalCode: code,
-        fixedCode,
-        explanation: `Moved hardcoded secret to environment variable ${envVarName}`,
-        confidence: 0.9,
-        securityImprovements: [
-          'Secret is not committed to source control',
-          'Can be rotated without code changes',
-          'Different values per environment'
-        ],
-        testingNotes: `Set ${envVarName} in .env file or environment`
-      };
+    // PHP pattern FIRST when .php file - prevents Python/JS patterns from matching $db_password etc.
+    if (fileExt.endsWith('.php') || (code.includes('$') && (code.includes('mysqli') || code.includes('new mysqli')))) {
+      const phpVarRegex = /\$(\w+)\s*=\s*["']([^"']*)["']\s*;/g;
+      const matches: Array<{ full: string; varName: string; value: string }> = [];
+      let m;
+      while ((m = phpVarRegex.exec(code)) !== null) {
+        matches.push({ full: m[0], varName: m[1], value: m[2] });
+      }
+      if (matches.length > 0) {
+        const envVarsToCreate: Array<{ name: string; value: string }> = [];
+        let fixedCode = code;
+        for (const { full, varName, value } of matches) {
+          const envName = varName.toUpperCase().replace(/([a-z])([A-Z])/g, '$1_$2');
+          fixedCode = fixedCode.replace(full, `$${varName} = getenv('${envName}') ?: '';`);
+          envVarsToCreate.push({ name: envName, value });
+        }
+        return {
+          originalCode: code,
+          fixedCode,
+          explanation: 'Replaced hardcoded credentials with getenv() - values moved to .env',
+          confidence: 0.9,
+          securityImprovements: [
+            'Credentials loaded from environment',
+            'Create .env file (add to .gitignore)'
+          ],
+          testingNotes: 'Add .env to .gitignore. Create .env with the variable names shown.',
+          envVarsToCreate
+        };
+      }
     }
 
-    // Pattern: AWS Access Key
+    // Config object pattern: host, database, user, password (mysql.createPool, pg, etc.)
+    // Run for .js/.ts/.mjs/.cjs OR when code clearly looks like JS connection config (handles wrong/missing extension)
+    const isJsLike = /\.(m?jsx?|c?tsx?)$/.test(fileExt) ||
+      /createPool|createConnection|new\s+Pool|pg\.Pool|mysql\.create/.test(code);
+    if (isJsLike) {
+      const configKeyPattern = /\b(host|database|user|password|db_host|db_user|db_password|db_name|port)\s*:\s*["'`]([^"'`]*)["'`]/gi;
+      const configMatches = [...code.matchAll(configKeyPattern)];
+      if (configMatches.length > 0) {
+        const envVarsToCreate: Array<{ name: string; value: string }> = [];
+        let fixedCode = code;
+        const keyToEnv: Record<string, string> = {
+          host: 'DB_HOST', database: 'DB_DATABASE', user: 'DB_USER', password: 'DB_PASSWORD',
+          db_host: 'DB_HOST', db_user: 'DB_USER', db_password: 'DB_PASSWORD', db_name: 'DB_NAME',
+          port: 'DB_PORT'
+        };
+        for (const m of configMatches) {
+          const key = m[1].toLowerCase();
+          const value = m[2];
+          const envName = keyToEnv[key] || `DB_${key.toUpperCase().replace(/^db_/, '')}`;
+          const replacement = `${m[1]}: process.env.${envName} || ''`;
+          fixedCode = fixedCode.replace(m[0], replacement);
+          envVarsToCreate.push({ name: envName, value });
+        }
+        // Deduplicate envVarsToCreate by name (same key may appear in multiple matches)
+        const seen = new Set<string>();
+        const uniqueEnvVars = envVarsToCreate.filter(({ name }) => {
+          if (seen.has(name)) return false;
+          seen.add(name);
+          return true;
+        });
+        return {
+          originalCode: code,
+          fixedCode,
+          explanation: 'Replaced hardcoded DB credentials with environment variables - values moved to .env',
+          confidence: 0.9,
+          securityImprovements: [
+            'Credentials loaded from environment',
+            'Create .env file (add to .gitignore)'
+          ],
+          testingNotes: 'Add .env to .gitignore. Set DB_HOST, DB_DATABASE, DB_USER, DB_PASSWORD (or similar) in .env',
+          envVarsToCreate: uniqueEnvVars
+        };
+      }
+
+      const secretAssignMatch = code.match(/(const|let|var)\s+(\w*(?:key|secret|password|token|credential|api_key|apikey|auth)\w*)\s*=\s*["'`][^"'`]+["'`]/i);
+      if (secretAssignMatch) {
+        const [fullMatch, keyword, varName] = secretAssignMatch;
+        const envVarName = varName.toUpperCase().replace(/([a-z])([A-Z])/g, '$1_$2');
+        return {
+          originalCode: code,
+          fixedCode: code.replace(fullMatch, `${keyword} ${varName} = process.env.${envVarName}`),
+          explanation: `Moved hardcoded secret to environment variable ${envVarName}`,
+          confidence: 0.9,
+          securityImprovements: [
+            'Secret is not committed to source control',
+            'Can be rotated without code changes',
+            'Different values per environment'
+          ],
+          testingNotes: `Set ${envVarName} in .env file or environment`
+        };
+      }
+    }
+
+    // Python: only for .py
+    if (fileExt.endsWith('.py')) {
+      const pythonSecretMatch = code.match(/(\w*(?:key|secret|password|token|credential)\w*)\s*=\s*["']([^"']*)["']/i);
+      if (pythonSecretMatch) {
+        const [fullMatch, varName, value] = pythonSecretMatch;
+        const envVarName = varName.toUpperCase().replace(/([a-z])([A-Z])/g, '$1_$2');
+        return {
+          originalCode: code,
+          fixedCode: code.replace(fullMatch, `${varName} = os.environ.get("${envVarName}", "")`),
+          explanation: 'Replaced hardcoded secret with environment variable - values moved to .env',
+          confidence: 0.9,
+          securityImprovements: [
+            'Secret loaded from environment at runtime',
+            'Not exposed in source code',
+            'Create .env file (add to .gitignore)'
+          ],
+          testingNotes: `Add ${envVarName} to .env. Ensure 'import os' at top of file. Add .env to .gitignore.`,
+          envVarsToCreate: [{ name: envVarName, value }]
+        };
+      }
+    }
+
+    // AWS Access Key (language-agnostic)
     const awsKeyMatch = code.match(/(["'`])(AKIA[0-9A-Z]{16})\1/);
     if (awsKeyMatch) {
       const fixedCode = code.replace(awsKeyMatch[0], 'process.env.AWS_ACCESS_KEY_ID');
@@ -543,24 +839,6 @@ ${fixedCode}`,
           'Prevents exposure in source control'
         ],
         testingNotes: 'Set AWS_ACCESS_KEY_ID in environment or use AWS credentials file'
-      };
-    }
-
-    // Python pattern: PASSWORD = "value"
-    const pythonSecretMatch = code.match(/(\w*(?:key|secret|password|token|credential)\w*)\s*=\s*["'][^"']+["']/i);
-    if (pythonSecretMatch) {
-      const [fullMatch, varName] = pythonSecretMatch;
-      const envVarName = varName.toUpperCase();
-      return {
-        originalCode: code,
-        fixedCode: `${varName} = os.environ.get("${envVarName}")`,
-        explanation: `Replaced hardcoded secret with environment variable`,
-        confidence: 0.9,
-        securityImprovements: [
-          'Secret loaded from environment at runtime',
-          'Not exposed in source code'
-        ],
-        testingNotes: `Add ${envVarName} to your .env file`
       };
     }
 

@@ -5,6 +5,10 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { EventEmitter } from 'events';
+
+// Mitigate MaxListenersExceededWarning (e.g. from winston/file streams)
+EventEmitter.defaultMaxListeners = 200;
 import { OAuthCallbackServer } from './oauth/callback-server';
 import { RedTeamOperationsCenter } from './redteam/operations-center';
 import { PenetrationTestingEngine } from './redteam/penetration-testing';
@@ -13,6 +17,12 @@ import { AILearningEngine } from './redteam/ai-learning-engine';
 import { AIAgentCore } from './ai-agent/core';
 import { ChatInterface } from './ai-agent/chat-interface';
 import { ScanDataService } from './database/scan-data-service';
+import { DiskStorageService } from './storage/disk-storage-service';
+import { ApiKeyStorage } from './core/api-key-storage';
+import { getLiveDiagnosticsService } from './core/live-diagnostics-service';
+import { AgentOrchestrator } from './dast/agent-orchestrator';
+import { startWarRoomServer } from './dast/war-room-server';
+import { discoverApisBrutal } from './dast/api-discovery-brutal';
 
 // Enterprise Architecture - Core Infrastructure
 interface Logger {
@@ -1465,7 +1475,34 @@ const DEFAULT_SETTINGS = {
 };
 
 let saveCounter = 0;
+// Memory management: Limit scan results stored in memory
+const MAX_SCAN_RESULTS_IN_MEMORY = 5000; // Limit to 5000 vulnerabilities in memory
 let lastScanResults: any[] = [];
+
+/**
+ * Clean up old scan results to prevent memory issues
+ */
+function cleanupScanResults(): void {
+  if (lastScanResults.length > MAX_SCAN_RESULTS_IN_MEMORY) {
+    // Keep only the most recent results, sorted by severity
+    const severityOrder: Record<string, number> = {
+      'critical': 0, 'error': 0,
+      'high': 1, 'warning': 1,
+      'medium': 2, 'info': 2,
+      'low': 3
+    };
+    
+    lastScanResults = lastScanResults
+      .sort((a, b) => {
+        const aSev = severityOrder[(a.severity || '').toLowerCase()] ?? 4;
+        const bSev = severityOrder[(b.severity || '').toLowerCase()] ?? 4;
+        return aSev - bSev;
+      })
+      .slice(0, MAX_SCAN_RESULTS_IN_MEMORY);
+    
+    console.log(`Memory cleanup: Reduced scan results from ${lastScanResults.length + (lastScanResults.length - MAX_SCAN_RESULTS_IN_MEMORY)} to ${lastScanResults.length}`);
+  }
+}
 
 // Store highlighted vulnerabilities for CodeLens
 interface HighlightedVulnerability {
@@ -1488,6 +1525,13 @@ class VulnerabilityCodeLensProvider implements vscode.CodeLensProvider {
 
   public provideCodeLenses(document: vscode.TextDocument, token: vscode.CancellationToken): vscode.CodeLens[] | Thenable<vscode.CodeLens[]> {
     const codeLenses: vscode.CodeLens[] = [];
+    
+    // Check if CodeLens is enabled
+    const settings = getVSCodeSettings();
+    if (!settings.ui.showCodeLens) {
+      return codeLenses;
+    }
+    
     const filePath = document.uri.fsPath;
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     
@@ -1542,6 +1586,11 @@ export function getScanDataService(): ScanDataService | null {
 
 export function setLastScanResults(results: any[]): void {
   lastScanResults = results;
+  cleanupScanResults(); // Clean up if too many results
+}
+
+export function getLastScanResults(): any[] {
+  return Array.isArray(lastScanResults) ? lastScanResults : [];
 }
 
 export async function postResultsToWebviewExported(): Promise<void> {
@@ -1702,6 +1751,85 @@ function getSettings(context: vscode.ExtensionContext) {
 
 function updateSettings(context: vscode.ExtensionContext, newSettings: any) {
 context.globalState.update(SETTINGS_KEY, newSettings);
+}
+
+/**
+ * Get VS Code configuration settings with defaults
+ */
+function getVSCodeSettings() {
+  const config = vscode.workspace.getConfiguration('ciphermate');
+  return {
+    // Scanner settings
+    scanners: {
+      enableDependency: config.get<boolean>('scanners.enableDependency', true),
+      enableSecrets: config.get<boolean>('scanners.enableSecrets', true),
+      enableSmartContract: config.get<boolean>('scanners.enableSmartContract', true),
+      enableCodePattern: config.get<boolean>('scanners.enableCodePattern', true),
+      enableSemgrep: config.get<boolean>('enableSemgrep', true),
+      enableBandit: config.get<boolean>('enableBandit', true),
+    },
+    // Scan behavior
+    scanBehavior: {
+      scanOnStartup: config.get<boolean>('scanBehavior.scanOnStartup', false),
+      scanMode: config.get<'full' | 'incremental' | 'changed-only'>('scanBehavior.scanMode', 'incremental'),
+      maxFileSize: config.get<number>('scanBehavior.maxFileSize', 1048576),
+      excludePatterns: config.get<string[]>('scanBehavior.excludePatterns', [
+        '**/node_modules/**',
+        '**/.git/**',
+        '**/dist/**',
+        '**/build/**',
+        '**/target/**',
+        '**/vendor/**',
+        '**/.venv/**',
+        '**/venv/**'
+      ]),
+      severityFilter: config.get<string[]>('scanBehavior.severityFilter', []),
+    },
+    // CVE settings
+    cve: {
+      enabled: config.get<boolean>('cve.enabled', true),
+      cacheEnabled: config.get<boolean>('cve.cacheEnabled', true),
+      cacheTTLHours: config.get<number>('cve.cacheTTLHours', 24),
+      apiPreference: config.get<'nvd' | 'mitre' | 'both'>('cve.apiPreference', 'both'),
+      rateLimitDelay: config.get<number>('cve.rateLimitDelay', 200),
+    },
+    // UI settings
+    ui: {
+      showCodeLens: config.get<boolean>('ui.showCodeLens', true),
+      highlightDuration: config.get<number>('ui.highlightDuration', 5),
+      showGutterIcon: config.get<boolean>('ui.showGutterIcon', true),
+      showOverviewRuler: config.get<boolean>('ui.showOverviewRuler', true),
+      codeLensPosition: config.get<'above' | 'inline'>('ui.codeLensPosition', 'above'),
+      theme: config.get<'auto' | 'light' | 'dark'>('ui.theme', 'auto'),
+      compactMode: config.get<boolean>('ui.compactMode', false),
+    },
+    // Notification settings
+    notifications: {
+      enabled: config.get<boolean>('notifications.enabled', true),
+      minSeverity: config.get<'info' | 'low' | 'medium' | 'high' | 'critical'>('notifications.minSeverity', 'medium'),
+      showPopups: config.get<boolean>('notifications.showPopups', true),
+      soundEnabled: config.get<boolean>('notifications.soundEnabled', false),
+    },
+    // Performance settings
+    performance: {
+      maxConcurrentScans: config.get<number>('performance.maxConcurrentScans', 5),
+      scanTimeout: config.get<number>('performance.scanTimeout', 300000),
+      cacheEnabled: config.get<boolean>('performance.cacheEnabled', true),
+      cacheTTLHours: config.get<number>('performance.cacheTTLHours', 24),
+    },
+    // Explain settings
+    explain: {
+      enabled: config.get<boolean>('explain.enabled', true),
+      provider: config.get<string>('explain.provider', 'same-as-chat'),
+      maxLength: config.get<number>('explain.maxLength', 500),
+      includeCodeContext: config.get<boolean>('explain.includeCodeContext', true),
+      codeContextLines: config.get<number>('explain.codeContextLines', 5),
+    },
+    // AI provider (for providers section in settings UI)
+    aiProvider: config.get<string>('ai.provider', 'openrouter'),
+    openrouterModel: config.get<string>('ai.openrouter.model', 'openrouter/free'),
+    conversationModel: config.get<string>('ai.conversationModel', ''),
+  };
 }
 
 /**
@@ -2093,8 +2221,46 @@ async function postResultsToWebview() {
   }
   
   try {
-    // Load scan data - prioritize lastScanResults (current scan), fallback to database
+    // Load scan data: lastScanResults -> encrypted storage -> database (most recent scan)
     let results = Array.isArray(lastScanResults) ? lastScanResults : [];
+    if (results.length === 0 && extensionContext) {
+      const saved = loadEncryptedData(extensionContext);
+      if (saved && Array.isArray(saved) && saved.length > 0) {
+        lastScanResults = saved;
+        results = saved;
+        logger?.info('postResultsToWebview: Restored from encrypted storage', { count: results.length });
+      }
+    }
+    // Filter out user-marked false positives
+    const ctx = extensionContext;
+    const suppressions = new Set<string>(ctx?.globalState.get<string[]>('ciphermate.falsePositiveSuppressions', []) || []);
+    results = results.filter((r: any) => {
+      const path = (r.path || r.filename || r.file || '').trim();
+      const line = r.start?.line ?? r.line ?? r.line_number ?? 0;
+      const desc = (r.extra?.message || r.issue_text || r.description || '').slice(0, 60);
+      const key = `suppress:${path}:${line}:${desc}`;
+      return !suppressions.has(key);
+    });
+    // Merge Eagle Eye (silent save) findings into results
+    try {
+      const { getEagleEyeService } = require('./core/eagle-eye-service');
+      const eagleFindings = getEagleEyeService().getSessionFindings();
+      const eagleAsResults = eagleFindings
+        .filter((f: any) => {
+          const key = `suppress:${f.filePath}:${f.line}:${(f.message || '').slice(0, 60)}`;
+          return !suppressions.has(key);
+        })
+        .map((f: any) => ({
+        path: f.filePath,
+        start: { line: f.line },
+        extra: { message: f.message },
+        tool: f.tool || 'Eagle Eye',
+        severity: f.severity,
+        check_id: f.ruleId,
+        eagleEye: true,
+      }));
+      results = [...eagleAsResults, ...results];
+    } catch { /* Eagle Eye not available */ }
     let recentScans: any[] = [];
     let latestScanInfo = null;
     
@@ -2113,18 +2279,27 @@ async function postResultsToWebview() {
           currentResultsLength: results.length
         });
         
-        // Don't auto-load from database - show empty state if no current scan
-        // Database results should only be shown when user explicitly requests them (e.g., via Scan History)
-        if (recentScans.length > 0 && results.length === 0) {
-          // Store latest scan info for reference but don't load results
-          latestScanInfo = recentScans[0];
-          logger?.info('No current scan results - showing empty state. Latest scan available:', {
-            scanId: latestScanInfo.id,
-            timestamp: latestScanInfo.timestamp
-          });
-        } else if (recentScans.length > 0 && results.length > 0) {
-          // We have current results, store latest scan info for reference
-          latestScanInfo = recentScans[0];
+        latestScanInfo = recentScans.length > 0 ? recentScans[0] : null;
+        // When no in-memory results, load latest scan from database so Refresh shows something
+        if (recentScans.length > 0 && results.length === 0 && latestScanInfo) {
+          try {
+            const dbVulns = scanDataService.getVulnerabilities(latestScanInfo.id);
+            results = dbVulns.map((v: any) => ({
+              tool: v.type || 'Unknown',
+              path: v.file || '',
+              file: v.file,
+              start: { line: v.line || 0 },
+              line: v.line,
+              severity: (v.severity || 'INFO').toUpperCase(),
+              extra: { message: v.description || v.title, severity: v.severity, cwe: v.cwe, cve: v.cve },
+              title: v.title,
+              description: v.description,
+            }));
+            lastScanResults = results;
+            logger?.info('postResultsToWebview: Loaded from database', { scanId: latestScanInfo.id, count: results.length });
+          } catch (e) {
+            logger?.warn('postResultsToWebview: Failed to load from database', e as Error);
+          }
         }
       } catch (error) {
         logger?.error('Failed to load scan data from database', error as Error);
@@ -2208,12 +2383,14 @@ async function postResultsToWebview() {
     
     // Send comprehensive data to webview (using current scan statistics, not aggregated)
     try {
+      const suppressionsList = Array.from(suppressions);
       const message = { 
         command: 'updateResults', 
         results: results,
         scanStatistics: currentScanStatistics, // Use current scan stats, not aggregated
         recentScans: recentScans,
-        vulnerabilityAnalysis: vulnerabilityAnalysis // Include analysis for charts and trends
+        vulnerabilityAnalysis: vulnerabilityAnalysis, // Include analysis for charts and trends
+        suppressions: suppressionsList
       };
       
       logger?.info('Posting message to webview', { 
@@ -2385,28 +2562,6 @@ async function callOllamaAPI(prompt: string, config: vscode.WorkspaceConfigurati
   const directModel = config.get<string>('ai.ollama.model');
   if (directUrl) baseUrl = directUrl;
   if (directModel) model = directModel;
-
-  // Method 3: Read from workspace settings.json directly if still localhost
-  if (baseUrl === 'http://localhost:11434') {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (workspaceFolders && workspaceFolders.length > 0) {
-      try {
-        const settingsPath = path.join(workspaceFolders[0].uri.fsPath, '.vscode', 'settings.json');
-        if (fs.existsSync(settingsPath)) {
-          const settingsContent = fs.readFileSync(settingsPath, 'utf8');
-          const settings = JSON.parse(settingsContent);
-
-          const ollamaUrl = settings['ciphermate.ai.ollama.apiUrl'];
-          const ollamaModel = settings['ciphermate.ai.ollama.model'];
-
-          if (ollamaUrl && typeof ollamaUrl === 'string') baseUrl = ollamaUrl.trim();
-          if (ollamaModel && typeof ollamaModel === 'string') model = ollamaModel.trim();
-        }
-      } catch (error) {
-        console.error('callOllamaAPI: Error reading settings.json:', error);
-      }
-    }
-  }
 
   // Ensure URL doesn't have trailing slash
   baseUrl = baseUrl.replace(/\/$/, '');
@@ -2750,6 +2905,43 @@ class ActiveCodeReviewer {
 }
 
 function showNotification(type: NotificationType, message: string, details?: string) {
+  // Check notification settings
+  const settings = getVSCodeSettings();
+  
+  // If notifications are disabled, only log to console
+  if (!settings.notifications.enabled) {
+    console.log(`[${type.toUpperCase()}] ${message}${details ? ` - ${details}` : ''}`);
+    return;
+  }
+  
+  // Check severity filter
+  const severityMap: Record<NotificationType, string> = {
+    [NotificationType.VULNERABILITY]: 'high',
+    [NotificationType.ERROR]: 'critical',
+    [NotificationType.WARNING]: 'medium',
+    [NotificationType.FIX]: 'medium',
+    [NotificationType.SUGGESTION]: 'low',
+    [NotificationType.INFO]: 'info',
+  };
+  
+  const severityOrder: Record<string, number> = {
+    info: 0,
+    low: 1,
+    medium: 2,
+    high: 3,
+    critical: 4,
+  };
+  
+  const notificationSeverity = severityMap[type] || 'info';
+  const minSeverityOrder = severityOrder[settings.notifications.minSeverity] || 0;
+  const notificationSeverityOrder = severityOrder[notificationSeverity] || 0;
+  
+  // Only show if severity meets minimum threshold
+  if (notificationSeverityOrder < minSeverityOrder) {
+    console.log(`[${type.toUpperCase()}] ${message}${details ? ` - ${details}` : ''} (filtered by severity)`);
+    return;
+  }
+  
   const prefixes = {
     [NotificationType.VULNERABILITY]: '[SECURITY]',
     [NotificationType.SUGGESTION]: '[SUGGESTION]',
@@ -2761,20 +2953,23 @@ function showNotification(type: NotificationType, message: string, details?: str
 
   const fullMessage = `${prefixes[type]} CipherMate: ${message}`;
   
-  switch (type) {
-    case NotificationType.VULNERABILITY:
-    case NotificationType.ERROR:
-      vscode.window.showErrorMessage(fullMessage);
-      break;
-    case NotificationType.WARNING:
-      vscode.window.showWarningMessage(fullMessage);
-      break;
-    case NotificationType.FIX:
-    case NotificationType.SUGGESTION:
-      vscode.window.showInformationMessage(fullMessage);
-      break;
-    default:
-      vscode.window.showInformationMessage(fullMessage);
+  // Only show popups if enabled
+  if (settings.notifications.showPopups) {
+    switch (type) {
+      case NotificationType.VULNERABILITY:
+      case NotificationType.ERROR:
+        vscode.window.showErrorMessage(fullMessage);
+        break;
+      case NotificationType.WARNING:
+        vscode.window.showWarningMessage(fullMessage);
+        break;
+      case NotificationType.FIX:
+      case NotificationType.SUGGESTION:
+        vscode.window.showInformationMessage(fullMessage);
+        break;
+      default:
+        vscode.window.showInformationMessage(fullMessage);
+    }
   }
 
   // Log to output channel for debugging
@@ -3124,6 +3319,9 @@ async function loadVulnerabilityHistory(context: vscode.ExtensionContext): Promi
 }
 
 function getFallbackExplanation(issue: any, vulnerabilityType: string): string {
+  // Normalize type for lookup (e.g. "Weak Credential Management" -> "Hardcoded Secret")
+  const typeKey = /weak credential|hardcoded secret|secret|credential/i.test(vulnerabilityType)
+    ? 'Hardcoded Secret' : vulnerabilityType;
   const explanations: { [key: string]: string } = {
     'SQL Injection': `
 SQL Injection is a code injection technique where malicious SQL statements are inserted into an application's database query.
@@ -3241,7 +3439,7 @@ const hash = crypto.createHash('sha256').update(data).digest('hex');
     `
   };
 
-  return explanations[vulnerabilityType] || `
+  return explanations[typeKey] || explanations[vulnerabilityType] || `
 This is a security vulnerability that has been detected in your code.
 
 Vulnerability Type: ${vulnerabilityType}
@@ -3249,9 +3447,7 @@ File: ${issue.path || issue.filename || 'Unknown'}
 Line: ${issue.start?.line || issue.line_number || 'Unknown'}
 Severity: ${issue.extra?.severity || issue.severity || 'Unknown'}
 
-Description: ${issue.extra?.message || issue.issue_text || issue.check_id || 'Security issue detected'}
-
-To get detailed AI-powered explanations, please ensure your AI provider (LM Studio, Ollama, or OpenAI) is properly configured and running in CipherMate settings.
+To get detailed AI-powered explanations, configure your AI provider (OpenRouter, OpenAI, LM Studio, or Ollama) in CipherMate Settings.
   `;
 }
 
@@ -3290,12 +3486,13 @@ async function intelligentRepositoryScan(workspacePath: string, context: vscode.
     // Convert scanner results to existing format
     const scannerVulns = scanner.getAllVulnerabilities(scanResult.results);
     results.push(...scannerVulns.map((v: any) => ({
-      ...v,
-      severity: v.severity.toUpperCase(),
-      file: v.file,
-      line: v.line,
-      message: v.description,
+      tool: v.metadata?.scanner || v.type || 'Scanner',
+      path: v.file,
+      start: { line: v.line || 0 },
+      extra: { message: v.description || v.title },
+      severity: (v.severity || 'info').toUpperCase(),
       type: v.type,
+      ...v,
     })));
     
     logger.info(`Repository scanner found ${scanResult.aggregated.total} vulnerabilities`);
@@ -3665,6 +3862,31 @@ async function callLmStudioEnhanced(prompt: string, codeContext?: string): Promi
   return callLmStudio(enhancedPrompt);
 }
 
+/** Use configured AI provider (OpenRouter, OpenAI, etc.) for explanations; fallback to LM Studio/Ollama */
+async function callAIForExplanation(prompt: string, extensionContext: vscode.ExtensionContext): Promise<string> {
+  const config = vscode.workspace.getConfiguration('ciphermate');
+  const provider = config.get<string>('ai.provider', 'openrouter');
+  const cloudProviders = ['openrouter', 'openai', 'anthropic', 'gemini', 'custom'];
+  if (cloudProviders.includes(provider)) {
+    try {
+      const { MultiProviderAIService } = require('./ai-agent/multi-provider-service');
+      const aiService = new MultiProviderAIService(extensionContext);
+      const res = await aiService.callAI({
+        messages: [
+          { role: 'system', content: 'You are a security expert. Explain vulnerabilities clearly for developers.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.4,
+        max_tokens: 2048
+      });
+      return res?.content?.trim() || '';
+    } catch (e) {
+      throw e; // Re-throw so caller can show fallback
+    }
+  }
+  return callLmStudio(prompt);
+}
+
 // AI Memory and Pattern Recognition System
 interface DeveloperProfile {
   id: string;
@@ -3704,7 +3926,22 @@ function generateDeveloperId(): string {
 }
 
 function loadDeveloperProfile(context: vscode.ExtensionContext): DeveloperProfile {
-  const encrypted = context.globalState.get(MEMORY_KEY, '');
+  const diskStorage = new DiskStorageService(context);
+  
+  // Try disk storage first, fallback to globalState for migration
+  let encrypted = '';
+  if (diskStorage.exists(MEMORY_KEY)) {
+    encrypted = diskStorage.get<string>(MEMORY_KEY, '');
+  } else {
+    // Migrate from globalState if exists
+    encrypted = context.globalState.get(MEMORY_KEY, '');
+    if (encrypted) {
+      diskStorage.update(MEMORY_KEY, encrypted);
+      // Clear from globalState after migration
+      context.globalState.update(MEMORY_KEY, undefined);
+    }
+  }
+  
   if (!encrypted) {
     return createNewDeveloperProfile();
   }
@@ -3713,14 +3950,14 @@ function loadDeveloperProfile(context: vscode.ExtensionContext): DeveloperProfil
     const profile = decryptData(encrypted, context);
     if (!profile) {
       // Decryption failed - clear corrupted data and create new profile
-      context.globalState.update(MEMORY_KEY, '');
+      diskStorage.delete(MEMORY_KEY);
       return createNewDeveloperProfile();
     }
     return profile;
   } catch (e) {
     // Clear corrupted data on any error
     try {
-      context.globalState.update(MEMORY_KEY, '');
+      diskStorage.delete(MEMORY_KEY);
     } catch (clearError) {
       // Ignore errors when clearing
     }
@@ -3743,7 +3980,8 @@ function createNewDeveloperProfile(): DeveloperProfile {
 
 function saveDeveloperProfile(profile: DeveloperProfile, context: vscode.ExtensionContext) {
   const encrypted = encryptData(profile, context);
-  context.globalState.update(MEMORY_KEY, encrypted);
+  const diskStorage = new DiskStorageService(context);
+  diskStorage.update(MEMORY_KEY, encrypted);
 }
 
 function updateDeveloperProfile(updates: Partial<DeveloperProfile>, context: vscode.ExtensionContext) {
@@ -4205,22 +4443,38 @@ const TEAM_DATA_KEY = 'ciphermate.team_data';
 const TEAM_REPORTS_KEY = 'ciphermate.team_reports';
 let currentTeamLead: TeamLead | null = null;
 let teamVulnerabilityReports: TeamVulnerabilityReport[] = [];
+let extensionContext: vscode.ExtensionContext | null = null;
 
 function loadTeamData(context: vscode.ExtensionContext): TeamLead | null {
-  const encrypted = context.globalState.get(TEAM_DATA_KEY, '');
+  const diskStorage = new DiskStorageService(context);
+  
+  // Try disk storage first, fallback to globalState for migration
+  let encrypted = '';
+  if (diskStorage.exists(TEAM_DATA_KEY)) {
+    encrypted = diskStorage.get<string>(TEAM_DATA_KEY, '');
+  } else {
+    // Migrate from globalState if exists
+    encrypted = context.globalState.get(TEAM_DATA_KEY, '');
+    if (encrypted) {
+      diskStorage.update(TEAM_DATA_KEY, encrypted);
+      // Clear from globalState after migration
+      context.globalState.update(TEAM_DATA_KEY, undefined);
+    }
+  }
+  
   if (!encrypted) {return null;}
   
   try {
     const data = decryptData(encrypted, context);
     if (!data) {
       // Clear corrupted data
-      context.globalState.update(TEAM_DATA_KEY, '');
+      diskStorage.delete(TEAM_DATA_KEY);
     }
     return data;
   } catch (e) {
     // Clear corrupted data on error
     try {
-      context.globalState.update(TEAM_DATA_KEY, '');
+      diskStorage.delete(TEAM_DATA_KEY);
     } catch (clearError) {
       // Ignore errors when clearing
     }
@@ -4230,25 +4484,41 @@ function loadTeamData(context: vscode.ExtensionContext): TeamLead | null {
 
 function saveTeamData(teamData: TeamLead, context: vscode.ExtensionContext) {
   const encrypted = encryptData(teamData, context);
-  context.globalState.update(TEAM_DATA_KEY, encrypted);
+  const diskStorage = new DiskStorageService(context);
+  diskStorage.update(TEAM_DATA_KEY, encrypted);
 }
 
 function loadTeamReports(context: vscode.ExtensionContext): TeamVulnerabilityReport[] {
-  const encrypted = context.globalState.get(TEAM_REPORTS_KEY, '');
+  const diskStorage = new DiskStorageService(context);
+  
+  // Try disk storage first, fallback to globalState for migration
+  let encrypted = '';
+  if (diskStorage.exists(TEAM_REPORTS_KEY)) {
+    encrypted = diskStorage.get<string>(TEAM_REPORTS_KEY, '');
+  } else {
+    // Migrate from globalState if exists
+    encrypted = context.globalState.get(TEAM_REPORTS_KEY, '');
+    if (encrypted) {
+      diskStorage.update(TEAM_REPORTS_KEY, encrypted);
+      // Clear from globalState after migration
+      context.globalState.update(TEAM_REPORTS_KEY, undefined);
+    }
+  }
+  
   if (!encrypted) {return [];}
   
   try {
     const data = decryptData(encrypted, context);
     if (!data) {
       // Clear corrupted data
-      context.globalState.update(TEAM_REPORTS_KEY, '');
+      diskStorage.delete(TEAM_REPORTS_KEY);
       return [];
     }
     return data || [];
   } catch (e) {
     // Clear corrupted data on error
     try {
-      context.globalState.update(TEAM_REPORTS_KEY, '');
+      diskStorage.delete(TEAM_REPORTS_KEY);
     } catch (clearError) {
       // Ignore errors when clearing
     }
@@ -4258,7 +4528,8 @@ function loadTeamReports(context: vscode.ExtensionContext): TeamVulnerabilityRep
 
 function saveTeamReports(reports: TeamVulnerabilityReport[], context: vscode.ExtensionContext) {
   const encrypted = encryptData(reports, context);
-  context.globalState.update(TEAM_REPORTS_KEY, encrypted);
+  const diskStorage = new DiskStorageService(context);
+  diskStorage.update(TEAM_REPORTS_KEY, encrypted);
 }
 
 function createTeamVulnerabilityReport(
@@ -4334,7 +4605,78 @@ function updateTeamMemberProgress(teamMemberId: string, vulnerabilityType: strin
   saveTeamData(currentTeamLead, context);
 }
 
+/**
+ * Migrate large data from globalState to disk storage
+ * This is a one-time migration that happens during extension activation
+ */
+function migrateLargeDataToDisk(context: vscode.ExtensionContext): void {
+  try {
+    const diskStorage = new DiskStorageService(context);
+    
+    // List of keys that should be migrated to disk storage
+    const keysToMigrate = [
+      'ciphermate.db.scans',
+      'ciphermate.db.vulnerabilities',
+      'ciphermate.db.users',
+      'ciphermate.chatSessions',
+      MEMORY_KEY,
+      TEAM_DATA_KEY,
+      TEAM_REPORTS_KEY,
+      'ciphermate.fixBackups',
+      'ciphermate.fixUndoStack'
+    ];
+    
+    const migrated = diskStorage.migrateFromGlobalState(keysToMigrate);
+    
+    if (migrated > 0) {
+      console.log(`CipherMate: Migrated ${migrated} large data keys from globalState to disk storage`);
+      
+      // Force clear migrated keys from globalState to prevent warning
+      // This ensures old data is completely removed
+      for (const key of keysToMigrate) {
+        const value = context.globalState.get(key);
+        if (value !== undefined) {
+          // Only clear if it's large (string length > 1000 or object/array)
+          const size = typeof value === 'string' ? value.length : JSON.stringify(value).length;
+          if (size > 1000) {
+            context.globalState.update(key, undefined);
+            console.log(`CipherMate: Cleared large key from globalState: ${key} (${size} bytes)`);
+          }
+        }
+      }
+    } else {
+      console.log('CipherMate: No data to migrate (already using disk storage)');
+    }
+  } catch (error) {
+    console.error('CipherMate: Failed to migrate data to disk storage:', error);
+    // Don't throw - migration failure shouldn't prevent extension activation
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
+  extensionContext = context;
+  // Migrate large data to disk storage on activation
+  migrateLargeDataToDisk(context);
+  
+  // Register global memory cleanup for MemoryMonitor to call when critical
+  (global as any).performMemoryCleanup = () => {
+    cleanupScanResults();
+    if (typeof (global as any).gc === 'function') {
+      try { (global as any).gc(); } catch { /* gc not available */ }
+    }
+  };
+
+  // Initialize memory monitoring (optional, only in development)
+  if (process.env.NODE_ENV === 'development' || vscode.workspace.getConfiguration('ciphermate').get<boolean>('enableMemoryMonitoring', false)) {
+    try {
+      const { memoryMonitor } = require('./utils/memory-monitor');
+      memoryMonitor.startMonitoring(30000); // Check every 30 seconds
+      logger?.info('Memory monitoring enabled');
+    } catch (error) {
+      // Memory monitor not critical, continue without it
+    }
+  }
+  
   // Initialize Enterprise Infrastructure
   logger = new EnterpriseLogger();
   const config = new EnterpriseConfiguration();
@@ -4385,6 +4727,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Also register as the main entry point - auto-open welcome screen
   let mainDisposable = vscode.commands.registerCommand('ciphermate', () => {
+    welcomeTreeView.reveal(welcomeTreeProvider.getStartedItem);
     chatInterface.show();
   });
 
@@ -4397,43 +4740,40 @@ export function activate(context: vscode.ExtensionContext) {
       this._onDidChangeTreeData.fire();
     }
 
+    readonly getStartedItem: vscode.TreeItem;
+    readonly configureSettingsItem: vscode.TreeItem;
+    readonly viewResultsItem: vscode.TreeItem;
+
+    constructor() {
+      this.getStartedItem = new vscode.TreeItem('Get Started', vscode.TreeItemCollapsibleState.None);
+      this.getStartedItem.command = { command: 'ciphermate', title: 'Open CipherMate' };
+      this.getStartedItem.iconPath = new vscode.ThemeIcon('rocket');
+      this.getStartedItem.tooltip = 'Open CipherMate welcome screen';
+
+      this.configureSettingsItem = new vscode.TreeItem('Configure Settings', vscode.TreeItemCollapsibleState.None);
+      this.configureSettingsItem.command = { command: 'ciphermate.advancedSettings', title: 'Open Settings' };
+      this.configureSettingsItem.iconPath = new vscode.ThemeIcon('settings-gear');
+      this.configureSettingsItem.tooltip = 'Configure API keys and settings';
+
+      this.viewResultsItem = new vscode.TreeItem('View Results', vscode.TreeItemCollapsibleState.None);
+      this.viewResultsItem.command = { command: 'ciphermate.showResults', title: 'Show Results' };
+      this.viewResultsItem.iconPath = new vscode.ThemeIcon('list-unordered');
+      this.viewResultsItem.tooltip = 'View security scan results';
+    }
+
     getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
       if (element) {
         return [];
       }
-      return [
-        {
-          label: 'Get Started',
-          command: {
-            command: 'ciphermate',
-            title: 'Open CipherMate'
-          },
-          iconPath: new vscode.ThemeIcon('rocket'),
-          tooltip: 'Open CipherMate welcome screen'
-        },
-        {
-          label: 'Configure Settings',
-          command: {
-            command: 'ciphermate.advancedSettings',
-            title: 'Open Settings'
-          },
-          iconPath: new vscode.ThemeIcon('settings-gear'),
-          tooltip: 'Configure API keys and settings'
-        },
-        {
-          label: 'View Results',
-          command: {
-            command: 'ciphermate.showResults',
-            title: 'Show Results'
-          },
-          iconPath: new vscode.ThemeIcon('list-unordered'),
-          tooltip: 'View security scan results'
-        }
-      ];
+      return [this.getStartedItem, this.configureSettingsItem, this.viewResultsItem];
     }
     
     getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
       return element;
+    }
+    
+    getParent(element: vscode.TreeItem): vscode.TreeItem | undefined {
+      return undefined; // Flat tree - all items are top-level
     }
   }
 
@@ -4453,14 +4793,18 @@ export function activate(context: vscode.ExtensionContext) {
     getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
       return element || new vscode.TreeItem('No findings yet', vscode.TreeItemCollapsibleState.None);
     }
+    
+    getParent(element: vscode.TreeItem): vscode.TreeItem | undefined {
+      return undefined; // Flat tree
+    }
   }
 
   const welcomeTreeProvider = new WelcomeTreeDataProvider();
   const findingsTreeProvider = new FindingsTreeDataProvider();
-  
-  // Register TreeDataProviders and add to subscriptions
+  const welcomeTreeView = vscode.window.createTreeView('ciphermateWelcome', { treeDataProvider: welcomeTreeProvider });
+
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider('ciphermateWelcome', welcomeTreeProvider),
+    welcomeTreeView,
     vscode.window.registerTreeDataProvider('ciphermateFindings', findingsTreeProvider)
   );
   
@@ -4545,6 +4889,27 @@ export function activate(context: vscode.ExtensionContext) {
     }
   });
 
+  // Init AI Security Analyzer (for CipherMate SAST + Eagle Eye)
+  try {
+    const { getAISecurityAnalyzer } = require('./core/ai-security-analyzer');
+    getAISecurityAnalyzer().init(context);
+  } catch (_) { /* optional */ }
+
+  // Eagle Eye: AI-powered silent save watcher - scans on save, notifies in dashboard
+  const eagleEyeEnabled = vscode.workspace.getConfiguration('ciphermate').get<boolean>('eagleEye.enabled', true);
+  if (eagleEyeEnabled) {
+    try {
+      const { getEagleEyeService } = require('./core/eagle-eye-service');
+      const eagleEye = getEagleEyeService();
+      eagleEye.initialize(context);
+      eagleEye.setOnFindingsChanged(() => postResultsToWebview());
+      context.subscriptions.push({ dispose: () => eagleEye.dispose() });
+      logger?.info('Eagle Eye service initialized');
+    } catch (e) {
+      logger?.warn('Eagle Eye service failed to initialize', e as Error);
+    }
+  }
+
   // Command: Intelligent Repository Scan
   let intelligentScanDisposable = vscode.commands.registerCommand('ciphermate.intelligentScan', async () => {
     const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -4564,6 +4929,7 @@ export function activate(context: vscode.ExtensionContext) {
       logger.info('Repository scan initiated', { workspacePath });
       
       lastScanResults = await intelligentRepositoryScan(workspacePath, context);
+      cleanupScanResults(); // Clean up if too many results
       
       logger?.info('Intelligent scan completed', { resultCount: lastScanResults.length });
       
@@ -4571,7 +4937,26 @@ export function activate(context: vscode.ExtensionContext) {
       saveEncryptedData(lastScanResults, context);
       await saveVulnerabilityHistory(lastScanResults, 'Intelligent Scan', context);
       
-      // Update webview with results (only if already open)
+      // Persist to scan database for History (when available)
+      if (scanDataService) {
+        try {
+          await scanDataService.saveScan({
+            scanType: 'Intelligent Scan',
+            workspacePath,
+            vulnerabilities: lastScanResults,
+            timestamp: new Date(),
+            duration: 0,
+          });
+        } catch (e) {
+          logger?.warn('Failed to save scan to database', e as Error);
+        }
+      }
+      
+      // Ensure results reach the dashboard: if panel is closed but we have results, open it
+      // (webviewReady + retries will then transmit data)
+      if (lastScanResults.length > 0 && !resultsPanel) {
+        await vscode.commands.executeCommand('ciphermate.showResults');
+      }
       await postResultsToWebview();
       
       // Prompt user to review dashboard
@@ -4603,6 +4988,33 @@ export function activate(context: vscode.ExtensionContext) {
     await vscode.commands.executeCommand('ciphermate.intelligentScan');
   });
 
+  // Command: Run Benchmark
+  let benchmarkDisposable = vscode.commands.registerCommand('ciphermate.runBenchmark', async () => {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) {
+      showNotification(NotificationType.ERROR, 'No workspace folder open.');
+      return;
+    }
+    const workspacePath = workspaceFolders[0].uri.fsPath;
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'CipherMate Benchmark...', cancellable: false },
+        async () => {
+          const { runBenchmark, formatBenchmarkReport } = await import('./core/benchmark-runner');
+          const result = await runBenchmark(workspacePath, context);
+          const report = formatBenchmarkReport(result);
+          const channel = vscode.window.createOutputChannel('CipherMate Benchmark');
+          channel.clear();
+          channel.append(report);
+          channel.show();
+          showNotification(NotificationType.INFO, `Benchmark: ${result.total} findings in ${(result.durationMs / 1000).toFixed(1)}s`);
+        }
+      );
+    } catch (e) {
+      showNotification(NotificationType.ERROR, 'Benchmark failed', String(e));
+    }
+  });
+
   // Command: Semgrep scan - enhanced with AI analysis
   let semgrepDisposable = vscode.commands.registerCommand('ciphermate.scanSemgrep', async () => {
     showNotification(NotificationType.INFO, 'Running Semgrep with AI enhancement...');
@@ -4621,6 +5033,7 @@ export function activate(context: vscode.ExtensionContext) {
       console.log('AI results received:', aiResults.length, 'items');
       
       lastScanResults = prioritizeAndDeduplicate([...semgrepResults, ...aiResults]);
+      cleanupScanResults(); // Clean up if too many results
       console.log('Final results after deduplication:', lastScanResults.length, 'items');
       saveEncryptedData(lastScanResults, context);
       postResultsToWebview();
@@ -4637,6 +5050,348 @@ export function activate(context: vscode.ExtensionContext) {
     } catch (e) {
       console.error('Enhanced Semgrep scan error:', e);
       showNotification(NotificationType.ERROR, 'Enhanced Semgrep scan failed', String(e));
+    }
+  });
+
+  // Command: DAST Brutal Mode (demonic destroyer)
+  let scanDastBrutalDisposable = vscode.commands.registerCommand('ciphermate.scanDastBrutal', async () => {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    if (!config.get<boolean>('dast.enabled', true)) {
+      showNotification(NotificationType.INFO, 'DAST is disabled in settings.');
+      return;
+    }
+    const targetUrl = await vscode.window.showInputBox({
+      prompt: 'Target URL for BRUTAL scan (timing attacks, header injection, NoSQL, log injection). Authorized targets only.',
+      placeHolder: 'https://localhost:3000',
+      validateInput: (v) => (!v?.trim() ? 'URL required' : !v.startsWith('http') ? 'Must start with http(s)://' : null),
+    });
+    if (!targetUrl?.trim()) return;
+
+    const proceed = await vscode.window.showWarningMessage(
+      'Brutal mode runs aggressive attacks including timing-based blind SQLi. Only use on systems you own or have authorization to test.',
+      'I have authorization',
+      'Cancel'
+    );
+    if (proceed !== 'I have authorization') return;
+
+    showNotification(NotificationType.INFO, `Inferno engaged. Target: ${targetUrl}`);
+    try {
+      const orchestrator = new AgentOrchestrator(context);
+      const result = await orchestrator.run({
+        targetUrl: targetUrl.trim(),
+        discoverFromWorkspace: true,
+        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
+        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
+        enableDeepDive: config.get<boolean>('dast.enableDeepDive', true),
+        resilienceRetries: config.get<number>('dast.resilienceRetries', 3),
+        resilienceCircuitThreshold: config.get<number>('dast.resilienceCircuitThreshold', 5),
+        maxEndpoints: 50,
+        concurrency: 10,
+        delayBetweenRequestsMs: 0,
+        brutalMode: true,
+        enableGraphQL: true,
+        enableJwtOAuth: true,
+        enableIdor: true,
+      });
+
+      if (!result.success) {
+        showNotification(NotificationType.ERROR, `Brutal scan failed: ${result.error}`);
+        return;
+      }
+
+      const mapped = (result.vulnerabilities || []).map((v: any) => ({
+        tool: 'DAST-BRUTAL',
+        path: v.endpoint || result.targetUrl,
+        start: { line: 0 },
+        extra: { message: v.description || v.title },
+        severity: (v.severity || 'info').toUpperCase(),
+        type: v.type,
+        ...v,
+      }));
+      lastScanResults = mapped;
+      cleanupScanResults();
+      saveEncryptedData(lastScanResults, context);
+      postResultsToWebview();
+
+      showNotification(
+        result.vulnerabilities.length > 0 ? NotificationType.VULNERABILITY : NotificationType.INFO,
+        `Brutal scan complete: ${result.endpointsTested} endpoints, ${result.attacksPerformed} attacks, ${result.vulnerabilities.length} findings`
+      );
+      if (result.vulnerabilities.length > 0) {
+        await vscode.commands.executeCommand('ciphermate.showResults');
+      }
+    } catch (error) {
+      showNotification(NotificationType.ERROR, `Brutal scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  let warRoomPort: number | null = null;
+  let openDastWarRoomDisposable = vscode.commands.registerCommand('ciphermate.openDastWarRoom', async () => {
+    try {
+      const port = warRoomPort ?? await startWarRoomServer();
+      warRoomPort = port;
+      const uri = vscode.Uri.parse(`http://localhost:${port}`);
+      await vscode.env.openExternal(uri);
+      showNotification(NotificationType.INFO, `DAST War Room opened at http://localhost:${port}`);
+    } catch (error) {
+      showNotification(NotificationType.ERROR, `Failed to start War Room: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  let discoverApisBrutalDisposable = vscode.commands.registerCommand('ciphermate.discoverApisBrutal', async () => {
+    const mode = await vscode.window.showQuickPick(
+      [
+        { label: 'Standard', description: 'Core paths + JS parsing', detail: '~25 probes' },
+        { label: 'Wicked', description: 'Actuator, debug, admin, cloud, 100+ probes', detail: 'Framework escapes, dev endpoints' },
+      ],
+      { placeHolder: 'Discovery mode' }
+    );
+    if (!mode) return;
+    const wickedMode = mode.label === 'Wicked';
+    const targetUrl = await vscode.window.showInputBox({
+      prompt: 'Enter target website URL to brutally discover all APIs',
+      placeHolder: 'https://example.com',
+      validateInput: (v) => (!v?.trim() ? 'URL required' : !v.startsWith('http') ? 'Must start with http(s)://' : null),
+    });
+    if (!targetUrl?.trim()) return;
+    showNotification(NotificationType.INFO, wickedMode ? 'Wicked mode: probing 100+ paths (actuator, debug, admin...)' : 'Discovering APIs...');
+    try {
+      const apis = await discoverApisBrutal(targetUrl.trim(), { wickedMode });
+      if (apis.length === 0) {
+        showNotification(NotificationType.INFO, 'No APIs discovered.');
+        return;
+      }
+      const baseOrigin = new URL(targetUrl).origin;
+      const allLabel = '$(check-all) Test ALL discovered APIs';
+      const items: vscode.QuickPickItem[] = [
+        { label: allLabel, description: `${apis.length} APIs` },
+        ...apis.map((a) => ({
+          label: a.url,
+          description: `${a.path} · ${a.source}${a.status ? ' (' + a.status + ')' : ''}`,
+        })),
+      ];
+      const chosen = await vscode.window.showQuickPick(items, {
+        canPickMany: true,
+        title: 'Select APIs to DAST test',
+        placeHolder: 'Select one or more, or "Test ALL"',
+        matchOnDescription: true,
+      });
+      if (!chosen || chosen.length === 0) return;
+      const testAll = chosen.some(c => (typeof c === 'string' ? c : c.label).includes('Test ALL'));
+      const urlsToTest = testAll ? apis.map(a => a.url) : chosen.map(c => c.label).filter((l: string) => l !== allLabel && l.startsWith('http'));
+      if (urlsToTest.length === 0) return;
+      const proceed = await vscode.window.showQuickPick(
+        ['Run DAST on selected APIs', 'Cancel'],
+        { placeHolder: `Test ${urlsToTest.length} API(s)?` }
+      );
+      if (proceed !== 'Run DAST on selected APIs') return;
+      showNotification(NotificationType.INFO, `Running DAST on ${urlsToTest.length} APIs...`);
+      const config = vscode.workspace.getConfiguration('ciphermate');
+      const orchestrator = new AgentOrchestrator(context);
+      const result = await orchestrator.run({
+        targetUrl: baseOrigin,
+        preDiscoveredApiUrls: urlsToTest,
+        discoverFromWorkspace: false,
+        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
+        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
+        enableDeepDive: config.get<boolean>('dast.enableDeepDive', true),
+        maxEndpoints: urlsToTest.length,
+        concurrency: config.get<number>('dast.concurrency', 5),
+        enableGraphQL: true,
+        enableJwtOAuth: true,
+        enableIdor: true,
+      });
+      if (!result.success) {
+        showNotification(NotificationType.ERROR, `DAST failed: ${result.error}`);
+        return;
+      }
+      const mapped = (result.vulnerabilities || []).map((v: any) => ({
+        tool: 'DAST',
+        path: v.endpoint || result.targetUrl,
+        start: { line: 0 },
+        extra: { message: v.description || v.title },
+        severity: (v.severity || 'info').toUpperCase(),
+        type: v.type,
+        ...v,
+      }));
+      lastScanResults = mapped;
+      cleanupScanResults();
+      saveEncryptedData(lastScanResults, context);
+      postResultsToWebview();
+      showNotification(
+        result.vulnerabilities!.length > 0 ? NotificationType.VULNERABILITY : NotificationType.INFO,
+        `DAST on ${urlsToTest.length} APIs: ${result.vulnerabilities!.length} findings`
+      );
+      if (result.vulnerabilities!.length > 0) {
+        await vscode.commands.executeCommand('ciphermate.showResults');
+      }
+    } catch (error) {
+      showNotification(NotificationType.ERROR, `API discovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  // Command: DAST / Surface Monitoring (replaces StackHawk & Intruder)
+  let scanDastDisposable = vscode.commands.registerCommand('ciphermate.scanDast', async () => {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    if (!config.get<boolean>('dast.enabled', true)) {
+      showNotification(NotificationType.INFO, 'DAST (Surface Monitoring) is disabled in settings.');
+      return;
+    }
+    const targetUrl = await vscode.window.showInputBox({
+      prompt: 'Enter the URL of your web app or API to test (e.g. https://api.example.com or http://localhost:3000)',
+      placeHolder: 'https://localhost:3000',
+      validateInput: (value) => {
+        if (!value || !value.trim()) return 'URL is required';
+        if (!value.startsWith('http://') && !value.startsWith('https://')) return 'URL must start with http:// or https://';
+        try {
+          new URL(value.trim());
+          return null;
+        } catch {
+          return 'Invalid URL';
+        }
+      },
+    });
+    if (!targetUrl?.trim()) return;
+
+    showNotification(NotificationType.INFO, `Running DAST on ${targetUrl}...`);
+    try {
+      const orchestrator = new AgentOrchestrator(context);
+      const result = await orchestrator.run({
+        targetUrl: targetUrl.trim(),
+        discoverFromWorkspace: true,
+        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
+        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
+        enableDeepDive: config.get<boolean>('dast.enableDeepDive', true),
+        resilienceRetries: config.get<number>('dast.resilienceRetries', 3),
+        resilienceCircuitThreshold: config.get<number>('dast.resilienceCircuitThreshold', 5),
+        maxEndpoints: config.get<number>('dast.maxEndpoints', 30),
+        concurrency: config.get<number>('dast.concurrency', 5),
+        adaptiveThrottling: config.get<boolean>('dast.adaptiveThrottling', true),
+        enableGraphQL: config.get<boolean>('dast.enableGraphQL', true),
+        enableJwtOAuth: config.get<boolean>('dast.enableJwtOAuth', true),
+        enableIdor: config.get<boolean>('dast.enableIdor', true),
+        brutalMode: config.get<boolean>('dast.brutalMode', false),
+      });
+
+      if (!result.success) {
+        showNotification(NotificationType.ERROR, `DAST scan failed: ${result.error}`);
+        return;
+      }
+
+      const mapped = (result.vulnerabilities || []).map((v: any) => ({
+        tool: 'DAST',
+        path: v.endpoint || result.targetUrl,
+        start: { line: 0 },
+        extra: { message: v.description || v.title },
+        severity: (v.severity || 'info').toUpperCase(),
+        type: v.type,
+        ...v,
+      }));
+      lastScanResults = mapped;
+      cleanupScanResults();
+      saveEncryptedData(lastScanResults, context);
+      postResultsToWebview();
+
+      const crit = result.vulnerabilities.filter((v: any) => v.severity === 'critical').length;
+      const high = result.vulnerabilities.filter((v: any) => v.severity === 'high').length;
+      showNotification(
+        result.vulnerabilities.length > 0 ? NotificationType.VULNERABILITY : NotificationType.INFO,
+        `DAST completed: ${result.endpointsTested} endpoints tested, ${result.vulnerabilities.length} findings (${crit} critical, ${high} high)`
+      );
+      if (result.vulnerabilities.length > 0) {
+        await vscode.commands.executeCommand('ciphermate.showResults');
+      }
+    } catch (error) {
+      showNotification(NotificationType.ERROR, `DAST scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+
+  // Command: Run Pentest (200+ agents, replaces Cobalt/XBOW - No High+? Money back)
+  let runPentestDisposable = vscode.commands.registerCommand('ciphermate.runPentest', async () => {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    if (!config.get<boolean>('dast.enabled', true)) {
+      showNotification(NotificationType.INFO, 'DAST is disabled in settings.');
+      return;
+    }
+    const targetUrl = await vscode.window.showInputBox({
+      prompt: 'Enter the URL to pentest (e.g. https://api.example.com or http://localhost:3000). 200+ agents, Brutal payloads, hours not weeks.',
+      placeHolder: 'https://localhost:3000',
+      validateInput: (value) => {
+        if (!value || !value.trim()) return 'URL is required';
+        if (!value.startsWith('http://') && !value.startsWith('https://')) return 'URL must start with http:// or https://';
+        try {
+          new URL(value.trim());
+          return null;
+        } catch {
+          return 'Invalid URL';
+        }
+      },
+    });
+    if (!targetUrl?.trim()) return;
+
+    const proceed = await vscode.window.showWarningMessage(
+      'Pentest mode uses aggressive attacks (timing SQLi, header injection, etc.). Only use on systems you own or have authorization to test.',
+      { modal: true },
+      'Run Pentest',
+      'Cancel'
+    );
+    if (proceed !== 'Run Pentest') return;
+
+    showNotification(NotificationType.INFO, `Running Pentest on ${targetUrl}... 200+ agents unleashed.`);
+    try {
+      const orchestrator = new AgentOrchestrator(context);
+      const result = await orchestrator.run({
+        targetUrl: targetUrl.trim(),
+        discoverFromWorkspace: true,
+        pentestMode: true,
+        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
+        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
+        enableDeepDive: true,
+        maxDeepDiveAgents: config.get<number>('dast.pentestAgentSwarmSize', 100),
+        agentsPerFinding: config.get<number>('dast.pentestAgentsPerFinding', 4),
+        resilienceRetries: config.get<number>('dast.resilienceRetries', 3),
+        resilienceCircuitThreshold: config.get<number>('dast.resilienceCircuitThreshold', 5),
+        maxEndpoints: config.get<number>('dast.pentestMaxEndpoints', 300),
+        concurrency: config.get<number>('dast.pentestConcurrency', 50),
+        adaptiveThrottling: config.get<boolean>('dast.adaptiveThrottling', true),
+        enableGraphQL: true,
+        enableJwtOAuth: true,
+        enableIdor: true,
+        brutalMode: true,
+        enableFileUploadTests: config.get<boolean>('dast.enableFileUploadTests', true),
+      });
+
+      if (!result.success) {
+        showNotification(NotificationType.ERROR, `Pentest failed: ${result.error}`);
+        return;
+      }
+
+      const mapped = (result.vulnerabilities || []).map((v: any) => ({
+        tool: 'PENTEST',
+        path: v.endpoint || result.targetUrl,
+        start: { line: 0 },
+        extra: { message: v.description || v.title },
+        severity: (v.severity || 'info').toUpperCase(),
+        type: v.type,
+        ...v,
+      }));
+      lastScanResults = mapped;
+      cleanupScanResults();
+      saveEncryptedData(lastScanResults, context);
+      postResultsToWebview();
+
+      const highPlus = result.pentestHighPlusFindings || [];
+      const crit = highPlus.filter((f: any) => f.severity === 'critical').length;
+      const high = highPlus.filter((f: any) => f.severity === 'high').length;
+      showNotification(
+        result.vulnerabilities.length > 0 ? NotificationType.VULNERABILITY : NotificationType.INFO,
+        `Pentest complete: ${result.endpointsTested} endpoints, ${result.attacksPerformed} attacks, ${result.vulnerabilities.length} findings (${crit} critical, ${high} high). No High+? Money back.`
+      );
+      if (result.vulnerabilities.length > 0) {
+        await vscode.commands.executeCommand('ciphermate.showResults');
+      }
+    } catch (error) {
+      showNotification(NotificationType.ERROR, `Pentest failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
 
@@ -4717,20 +5472,35 @@ export function activate(context: vscode.ExtensionContext) {
       'ciphermateSettings',
       'CipherMate Settings',
       vscode.ViewColumn.One,
-      {}
+      { enableScripts: true }
     );
-    const settings = getSettings(context);
-    panel.webview.html = getSettingsHtml(settings);
-    panel.webview.onDidReceiveMessage((message) => {
+    const vsCodeSettings = getVSCodeSettings();
+    panel.webview.html = getSettingsHtml(vsCodeSettings);
+    panel.webview.onDidReceiveMessage(async (message) => {
       if (message.command === 'saveSettings') {
-        updateSettings(context, message.settings);
-        vscode.window.showInformationMessage('CipherMate settings saved!');
+        const config = vscode.workspace.getConfiguration('ciphermate');
+        try {
+          // Save all settings to VS Code configuration
+          await config.update('scanners.enableDependency', message.settings.scanners?.enableDependency, vscode.ConfigurationTarget.Global);
+          await config.update('scanners.enableSecrets', message.settings.scanners?.enableSecrets, vscode.ConfigurationTarget.Global);
+          await config.update('scanners.enableSmartContract', message.settings.scanners?.enableSmartContract, vscode.ConfigurationTarget.Global);
+          await config.update('scanners.enableCodePattern', message.settings.scanners?.enableCodePattern, vscode.ConfigurationTarget.Global);
+          await config.update('enableSemgrep', message.settings.enableSemgrep, vscode.ConfigurationTarget.Global);
+          await config.update('enableBandit', message.settings.enableBandit, vscode.ConfigurationTarget.Global);
+          await config.update('scanOnSave', message.settings.scanOnSave, vscode.ConfigurationTarget.Global);
+          await config.update('scanInterval', message.settings.scanInterval, vscode.ConfigurationTarget.Global);
+          panel.webview.postMessage({ command: 'settingsSaved' });
+          vscode.window.showInformationMessage('CipherMate settings saved!');
+        } catch (error) {
+          panel.webview.postMessage({ command: 'settingsError', error: String(error) });
+        }
       }
     });
   });
 
   // Command: Advanced Settings (sidebar-based like Kilo Code)
-  let advancedSettingsDisposable = vscode.commands.registerCommand('ciphermate.advancedSettings', () => {
+  let advancedSettingsDisposable = vscode.commands.registerCommand('ciphermate.advancedSettings', async () => {
+    welcomeTreeView.reveal(welcomeTreeProvider.configureSettingsItem);
     const panel = vscode.window.createWebviewPanel(
       'ciphermateAdvancedSettings',
       'CipherMate Settings',
@@ -4741,12 +5511,134 @@ export function activate(context: vscode.ExtensionContext) {
         localResourceRoots: [context.extensionUri]
       }
     );
-    const settings = getSettings(context);
-    panel.webview.html = getSidebarSettingsHtml(settings, panel, context);
-    panel.webview.onDidReceiveMessage((message) => {
+    panel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.visible) {
+        welcomeTreeView.reveal(welcomeTreeProvider.configureSettingsItem);
+      }
+    });
+    const vsCodeSettings = getVSCodeSettings();
+    const apiKeyStorage = new ApiKeyStorage(context);
+    const apiKeysConfigured = {
+      openrouter: await apiKeyStorage.has('openrouter'),
+      openai: await apiKeyStorage.has('openai'),
+      anthropic: await apiKeyStorage.has('anthropic'),
+      gemini: await apiKeyStorage.has('gemini'),
+    };
+    panel.webview.html = getSidebarSettingsHtml(vsCodeSettings, panel, context, apiKeysConfigured);
+    panel.webview.onDidReceiveMessage(async (message) => {
       if (message.command === 'saveSettings') {
-        updateSettings(context, message.settings);
-        panel.webview.postMessage({ command: 'settingsSaved' });
+        const config = vscode.workspace.getConfiguration('ciphermate');
+        try {
+          // Save all settings to VS Code configuration
+          const settings = message.settings;
+
+          // Save API keys FIRST so they persist even if other updates fail
+          if (settings.apiKeys) {
+            const apiKeyStorage = new ApiKeyStorage(context);
+            const providers = ['openrouter', 'openai', 'anthropic', 'gemini'] as const;
+            for (const provider of providers) {
+              const key = settings.apiKeys[provider];
+              if (key && key.trim()) {
+                await apiKeyStorage.set(provider, key.trim());
+              }
+            }
+          }
+          
+          // Scanner settings
+          if (settings.scanners) {
+            await config.update('scanners.enableDependency', settings.scanners.enableDependency, vscode.ConfigurationTarget.Global);
+            await config.update('scanners.enableSecrets', settings.scanners.enableSecrets, vscode.ConfigurationTarget.Global);
+            await config.update('scanners.enableSmartContract', settings.scanners.enableSmartContract, vscode.ConfigurationTarget.Global);
+            await config.update('scanners.enableCodePattern', settings.scanners.enableCodePattern, vscode.ConfigurationTarget.Global);
+          }
+          if (settings.enableSemgrep !== undefined) await config.update('enableSemgrep', settings.enableSemgrep, vscode.ConfigurationTarget.Global);
+          if (settings.enableBandit !== undefined) await config.update('enableBandit', settings.enableBandit, vscode.ConfigurationTarget.Global);
+          
+          // Scan behavior
+          if (settings.scanBehavior) {
+            await config.update('scanBehavior.scanOnStartup', settings.scanBehavior.scanOnStartup, vscode.ConfigurationTarget.Global);
+            await config.update('scanBehavior.scanMode', settings.scanBehavior.scanMode, vscode.ConfigurationTarget.Global);
+            await config.update('scanBehavior.maxFileSize', settings.scanBehavior.maxFileSize, vscode.ConfigurationTarget.Global);
+            await config.update('scanBehavior.excludePatterns', settings.scanBehavior.excludePatterns, vscode.ConfigurationTarget.Global);
+            await config.update('scanBehavior.severityFilter', settings.scanBehavior.severityFilter, vscode.ConfigurationTarget.Global);
+          }
+          if (settings.scanOnSave !== undefined) await config.update('scanOnSave', settings.scanOnSave, vscode.ConfigurationTarget.Global);
+          if (settings.scanInterval !== undefined) await config.update('scanInterval', settings.scanInterval, vscode.ConfigurationTarget.Global);
+          
+          // CVE settings
+          if (settings.cve) {
+            await config.update('cve.enabled', settings.cve.enabled, vscode.ConfigurationTarget.Global);
+            await config.update('cve.cacheEnabled', settings.cve.cacheEnabled, vscode.ConfigurationTarget.Global);
+            await config.update('cve.cacheTTLHours', settings.cve.cacheTTLHours, vscode.ConfigurationTarget.Global);
+            await config.update('cve.apiPreference', settings.cve.apiPreference, vscode.ConfigurationTarget.Global);
+            await config.update('cve.rateLimitDelay', settings.cve.rateLimitDelay, vscode.ConfigurationTarget.Global);
+          }
+          
+          // UI settings
+          if (settings.ui) {
+            await config.update('ui.showCodeLens', settings.ui.showCodeLens, vscode.ConfigurationTarget.Global);
+            await config.update('ui.highlightDuration', settings.ui.highlightDuration, vscode.ConfigurationTarget.Global);
+            await config.update('ui.showGutterIcon', settings.ui.showGutterIcon, vscode.ConfigurationTarget.Global);
+            await config.update('ui.showOverviewRuler', settings.ui.showOverviewRuler, vscode.ConfigurationTarget.Global);
+            await config.update('ui.codeLensPosition', settings.ui.codeLensPosition, vscode.ConfigurationTarget.Global);
+            await config.update('ui.theme', settings.ui.theme, vscode.ConfigurationTarget.Global);
+            await config.update('ui.compactMode', settings.ui.compactMode, vscode.ConfigurationTarget.Global);
+          }
+          
+          // Notification settings
+          if (settings.notifications) {
+            await config.update('notifications.enabled', settings.notifications.enabled, vscode.ConfigurationTarget.Global);
+            await config.update('notifications.minSeverity', settings.notifications.minSeverity, vscode.ConfigurationTarget.Global);
+            await config.update('notifications.showPopups', settings.notifications.showPopups, vscode.ConfigurationTarget.Global);
+            await config.update('notifications.soundEnabled', settings.notifications.soundEnabled, vscode.ConfigurationTarget.Global);
+          }
+          
+          // Performance settings
+          if (settings.performance) {
+            await config.update('performance.maxConcurrentScans', settings.performance.maxConcurrentScans, vscode.ConfigurationTarget.Global);
+            await config.update('performance.scanTimeout', settings.performance.scanTimeout, vscode.ConfigurationTarget.Global);
+            await config.update('performance.cacheEnabled', settings.performance.cacheEnabled, vscode.ConfigurationTarget.Global);
+            await config.update('performance.cacheTTLHours', settings.performance.cacheTTLHours, vscode.ConfigurationTarget.Global);
+          }
+          
+          // Explain settings
+          if (settings.explain) {
+            await config.update('explain.enabled', settings.explain.enabled, vscode.ConfigurationTarget.Global);
+            await config.update('explain.provider', settings.explain.provider, vscode.ConfigurationTarget.Global);
+            await config.update('explain.maxLength', settings.explain.maxLength, vscode.ConfigurationTarget.Global);
+            await config.update('explain.includeCodeContext', settings.explain.includeCodeContext, vscode.ConfigurationTarget.Global);
+            await config.update('explain.codeContextLines', settings.explain.codeContextLines, vscode.ConfigurationTarget.Global);
+          }
+          
+          // AI provider, Ollama URL, OpenRouter model, and API keys (store keys securely in SecretStorage / OS keychain)
+          if (settings.aiProvider !== undefined) {
+            await config.update('ai.provider', settings.aiProvider, vscode.ConfigurationTarget.Global);
+          }
+          if (settings.openrouterModel !== undefined) {
+            const openrouter = config.get<{ model?: string; apiKey?: string; timeout?: number }>('ai.openrouter') || {};
+            await config.update('ai.openrouter', { ...openrouter, model: settings.openrouterModel }, vscode.ConfigurationTarget.Global);
+          }
+          if (settings.ollamaUrl) {
+            const url = settings.ollamaUrl.replace(/\/v1\/chat\/completions.*$/, '').replace(/\/$/, '') || 'http://localhost:11434';
+            // VS Code does not allow updating nested properties of object configs;
+            // we must update the whole ai.ollama object.
+            const ollama = config.get<{ apiUrl?: string; model?: string; timeout?: number }>('ai.ollama') || {};
+            await config.update('ai.ollama', { ...ollama, apiUrl: url }, vscode.ConfigurationTarget.Global);
+          }
+          // API keys saved at top of try block
+          
+          panel.webview.postMessage({ command: 'settingsSaved' });
+          vscode.window.showInformationMessage('CipherMate settings saved successfully!');
+        } catch (error) {
+          panel.webview.postMessage({ command: 'settingsError', error: String(error) });
+          vscode.window.showErrorMessage(`Failed to save settings: ${error}`);
+        }
+      } else if (message.command === 'navigateTo') {
+        // Handle navigation commands from settings panel
+        vscode.commands.executeCommand(message.target);
+      } else if (message.command === 'showResults') {
+        // Handle show results command
+        vscode.commands.executeCommand('ciphermate.showResults');
       } else if (message.command === 'testAIConnection') {
         testAIConnection().then(result => {
           panel.webview.postMessage({ 
@@ -4771,7 +5663,11 @@ export function activate(context: vscode.ExtensionContext) {
       'ciphermateHome',
       'CipherMate Home',
       vscode.ViewColumn.One,
-      { enableScripts: true }
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [context.extensionUri]
+      }
     );
     const settings = getSettings(context);
     // Ensure lastScanResults is always an array
@@ -4822,6 +5718,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: Show Results Panel (modern webview)
   let resultsDisposable = vscode.commands.registerCommand('ciphermate.showResults', async () => {
+    welcomeTreeView.reveal(welcomeTreeProvider.viewResultsItem);
     // If panel already exists, just reveal it and update with latest data
     if (resultsPanel) {
       resultsPanel.reveal(vscode.ViewColumn.One, false);
@@ -4840,6 +5737,11 @@ export function activate(context: vscode.ExtensionContext) {
         localResourceRoots: [context.extensionUri]
       }
     );
+    resultsPanel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.visible) {
+        welcomeTreeView.reveal(welcomeTreeProvider.viewResultsItem);
+      }
+    });
     resultsPanel.webview.html = getResultsPanelHtml(context, resultsPanel);
     
     // Handle panel disposal
@@ -4869,7 +5771,7 @@ export function activate(context: vscode.ExtensionContext) {
         showNotification(NotificationType.INFO, 'Results cleared');
       } else if (message.command === 'openSettings') {
         // Open settings
-        vscode.commands.executeCommand('ciphermate.settings');
+        vscode.commands.executeCommand('ciphermate.advancedSettings');
       } else if (message.command === 'loadScan') {
         // Load a specific scan from database
         if (scanDataService && message.scanId) {
@@ -4895,6 +5797,7 @@ export function activate(context: vscode.ExtensionContext) {
               metadata: v.metadata ? JSON.parse(v.metadata) : {}
             }));
             lastScanResults = results;
+            cleanupScanResults(); // Clean up if too many results
             postResultsToWebview().catch(err => {
               logger?.error('Failed to post scan results', err as Error);
             });
@@ -4964,17 +5867,31 @@ export function activate(context: vscode.ExtensionContext) {
                   editor.revealRange(lineRange, vscode.TextEditorRevealType.InCenter);
                   editor.selection = new vscode.Selection(lineRange.start, lineRange.end);
                   
-                  // Add a prominent decoration to highlight the line with bold question mark
-                  const decorationType = vscode.window.createTextEditorDecorationType({
+                  // Get UI settings for decoration
+                  const settings = getVSCodeSettings();
+                  const highlightDuration = settings.ui.highlightDuration * 1000; // Convert to milliseconds
+                  
+                  // Build decoration options based on settings
+                  const decorationOptions: vscode.DecorationRenderOptions = {
                     backgroundColor: new vscode.ThemeColor('editor.selectionBackground'),
                     isWholeLine: true,
                     border: '2px solid',
                     borderColor: new vscode.ThemeColor('textLink.foreground'),
-                    gutterIconPath: vscode.Uri.parse('data:image/svg+xml;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#007acc" opacity="0.4"/><circle cx="14" cy="14" r="11" fill="none" stroke="#007acc" stroke-width="2"/><text x="14" y="19" font-size="18" font-weight="bold" fill="#007acc" text-anchor="middle" font-family="Arial, sans-serif">?</text></svg>').toString('base64')),
-                    gutterIconSize: 'contain',
-                    overviewRulerColor: new vscode.ThemeColor('textLink.foreground'),
-                    overviewRulerLane: vscode.OverviewRulerLane.Right
-                  });
+                  };
+                  
+                  // Add gutter icon if enabled
+                  if (settings.ui.showGutterIcon) {
+                    decorationOptions.gutterIconPath = vscode.Uri.parse('data:image/svg+xml;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#007acc" opacity="0.4"/><circle cx="14" cy="14" r="11" fill="none" stroke="#007acc" stroke-width="2"/><text x="14" y="19" font-size="18" font-weight="bold" fill="#007acc" text-anchor="middle" font-family="Arial, sans-serif">?</text></svg>').toString('base64'));
+                    decorationOptions.gutterIconSize = 'contain';
+                  }
+                  
+                  // Add overview ruler if enabled
+                  if (settings.ui.showOverviewRuler) {
+                    decorationOptions.overviewRulerColor = new vscode.ThemeColor('textLink.foreground');
+                    decorationOptions.overviewRulerLane = vscode.OverviewRulerLane.Right;
+                  }
+                  
+                  const decorationType = vscode.window.createTextEditorDecorationType(decorationOptions);
                   // Find the vulnerability for this line - normalize paths for comparison
                   const normalizePath = (p: string): string => {
                     if (!p) return '';
@@ -5008,10 +5925,10 @@ export function activate(context: vscode.ExtensionContext) {
                     vulnerabilityCodeLensProvider.refresh();
                   }, 100);
                     
-                    // Remove decoration after 5 seconds
+                    // Remove decoration after configured duration
                     setTimeout(() => {
                       decorationType.dispose();
-                    }, 5000);
+                    }, highlightDuration);
                     
                     // Ensure results panel stays visible on right side after opening file
                     if (resultsPanel) {
@@ -5038,14 +5955,12 @@ export function activate(context: vscode.ExtensionContext) {
       } else if (message.command === 'explainVulnerability') {
         const idx = message.index;
         const issue = lastScanResults[idx];
-        if (!issue) {return;}
-        
-        // Get code context for better AI analysis
-        const codeContext = getCodeContext(issue.path, issue.start?.line || issue.line_number || 0);
-        
-        // Detect vulnerability type for personalized learning
+        if (!issue) { return; }
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const relPath = (issue.path || issue.filename || issue.file || '').trim();
+        const absPath = workspaceRoot && relPath && !path.isAbsolute(relPath) ? path.join(workspaceRoot, relPath) : relPath;
+        const codeContext = getCodeContext(absPath, issue.start?.line || issue.line_number || 0);
         const vulnerabilityType = detectVulnerabilityType(issue);
-        
         const explainPrompt = `
 As a security expert, explain this vulnerability in detail:
 
@@ -5067,72 +5982,107 @@ Please provide:
 
 Keep the explanation clear and educational for developers.
         `;
-        
         try {
-          const response = await callLmStudio(explainPrompt);
+          const response = await callAIForExplanation(explainPrompt, context);
           resultsPanel?.webview.postMessage({
             command: 'showExplanation',
             title: `Security Explanation - ${vulnerabilityType}`,
             text: response
           });
         } catch (error) {
-          // Fallback to built-in explanations if AI is not available
           const fallbackExplanation = getFallbackExplanation(issue, vulnerabilityType);
+          const provider = vscode.workspace.getConfiguration('ciphermate').get<string>('ai.provider', 'openrouter');
+          const configHint = provider === 'openrouter' 
+            ? 'Add your OpenRouter API key in CipherMate Settings → AI Providers (openrouter.ai for free tier).'
+            : provider === 'openai' 
+              ? 'Add your OpenAI API key in CipherMate Settings.'
+              : 'Configure your AI provider (OpenRouter, OpenAI, or LM Studio) in CipherMate Settings.';
           resultsPanel?.webview.postMessage({
             command: 'showExplanation',
             title: `Security Explanation - ${vulnerabilityType}`,
-            text: `AI Explanation Unavailable\n\n${fallbackExplanation}\n\nNote: To get AI-powered explanations, please ensure LM Studio is running and configured in CipherMate settings.`
+            text: `AI Explanation Unavailable\n\n${fallbackExplanation}\n\nNote: ${configHint}`
           });
         }
+      } else if (message.command === 'generateFix') {
+        // Fix single vulnerability from Results panel (Merge Fix button)
+        const idx = message.index;
+        const issue = lastScanResults[idx];
+        if (!issue) {
+          showNotification(NotificationType.WARNING, 'Vulnerability not found');
+          return;
+        }
+        const vuln = scanResultToVulnerability(issue, idx);
+        vscode.commands.executeCommand('ciphermate.generateFix', vuln);
+      } else if (message.command === 'generateFixAll') {
+        // Fix All / Merge All - batch fix visible results
+        const indices = message.indices as number[] | undefined;
+        const vulns = (indices ?? lastScanResults.map((_, i) => i))
+          .map(i => lastScanResults[i])
+          .filter(Boolean)
+          .map((issue, i) => scanResultToVulnerability(issue, indices?.[i] ?? i));
+        if (vulns.length === 0) {
+          showNotification(NotificationType.WARNING, 'No vulnerabilities to fix');
+          return;
+        }
+        vscode.commands.executeCommand('ciphermate.batchFix', vulns);
+      } else if (message.command === 'markFalsePositive') {
+        const idx = message.index;
+        const issue = lastScanResults[idx];
+        if (!issue) return;
+        const fp = (issue.path || issue.filename || issue.file || '').trim();
+        const line = issue.start?.line ?? issue.line ?? issue.line_number ?? 0;
+        const desc = (issue.extra?.message || issue.issue_text || issue.description || '').slice(0, 60);
+        const key = `suppress:${fp}:${line}:${desc}`;
+        const suppressions = new Set<string>(context.globalState.get<string[]>('ciphermate.falsePositiveSuppressions', []) || []);
+        suppressions.add(key);
+        context.globalState.update('ciphermate.falsePositiveSuppressions', Array.from(suppressions));
+        showNotification(NotificationType.INFO, 'Dismissed from findings');
+        postResultsToWebview();
+      } else if (message.command === 'restoreSuppression') {
+        const key = message.key;
+        if (!key) return;
+        const suppressions = new Set<string>(context.globalState.get<string[]>('ciphermate.falsePositiveSuppressions', []) || []);
+        suppressions.delete(key);
+        context.globalState.update('ciphermate.falsePositiveSuppressions', Array.from(suppressions));
+        showNotification(NotificationType.INFO, 'Restored to findings');
+        postResultsToWebview();
+      } else if (message.command === 'clearSuppressions') {
+        context.globalState.update('ciphermate.falsePositiveSuppressions', []);
+        showNotification(NotificationType.INFO, 'All dismissed items restored');
+        postResultsToWebview();
       } else if (message.command === 'fixIt' || message.command === 'explain') {
         const idx = message.index;
         const issue = lastScanResults[idx];
-        if (!issue) {return;}
-        
-        // Get code context for better AI analysis - this gets REAL code from the file
-        const codeContext = getCodeContext(issue.path, issue.start?.line || issue.line_number || 0);
-        const vulnerableCode = issue.code || codeContext || '';
-        
-        // Detect vulnerability type for personalized learning
-        const vulnerabilityType = detectVulnerabilityType(issue);
-        
-        let basePrompt = '';
+        if (!issue) { return; }
+
         if (message.command === 'fixIt') {
-          basePrompt = `
-As a security expert, analyze this vulnerability and provide a detailed fix using ONLY the actual code from the file:
+          // Wire Fix it to actual code application: generate fix proposal and apply to files
+          try {
+            const vulnerability = scanResultToVulnerability(issue, idx);
+            if (!vulnerability.code && vulnerability.file) {
+              vulnerability.code = getCodeContext(vulnerability.file, vulnerability.line || 1);
+            }
+            await vscode.commands.executeCommand('ciphermate.generateFix', vulnerability);
+          } catch (err) {
+            logger?.error('Fix it failed', err as Error);
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            resultsPanel?.webview.postMessage({ command: 'llmResponse', index: idx, action: 'fixIt', response: `Could not apply fix: ${errorMsg}` });
+            showNotification(NotificationType.ERROR, 'Fix failed', errorMsg);
+          }
+          return;
+        }
 
-Vulnerability: ${issue.extra?.message || issue.issue_text || issue.check_id || 'Security issue'}
-File: ${issue.path}:${issue.start?.line || issue.line_number}
-Tool: ${issue.tool}
-Severity: ${issue.severity}
-
-ACTUAL CODE FROM FILE (DO NOT HALLUCINATE - USE ONLY THIS CODE):
-\`\`\`
-${vulnerableCode}
-\`\`\`
-
-${codeContext && codeContext !== vulnerableCode ? `SURROUNDING CONTEXT:\n\`\`\`\n${codeContext}\n\`\`\`\n` : ''}
-
-IMPORTANT: 
-- Use ONLY the actual code shown above
-- Do NOT invent or hallucinate code that doesn't exist
-- Provide a fix that modifies the REAL vulnerable code
-- Show the exact line(s) that need to be changed
-- Provide the complete fixed code block
-
-Please provide:
-1. A detailed explanation of why this is vulnerable
-2. The EXACT code fix using the real code from the file (show before/after)
-3. Additional security considerations
-4. Best practices to prevent similar issues
-`;
-          logger.info('AI analysis initiated', { operation: 'vulnerability_fix', vulnerabilityType });
-        } else {
-          basePrompt = `
+        // Explain: AI analysis only (no file edits)
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const relPath = (issue.path || issue.filename || issue.file || '').trim();
+        const absPath = workspaceRoot && relPath && !path.isAbsolute(relPath) ? path.join(workspaceRoot, relPath) : relPath;
+        const codeContext = getCodeContext(absPath, issue.start?.line || issue.line_number || 0);
+        const vulnerabilityType = detectVulnerabilityType(issue);
+        const basePrompt = `
 As a security expert, explain this vulnerability in detail:
 
 Vulnerability: ${issue.extra?.message || issue.issue_text || issue.check_id || 'Security issue'}
-File: ${issue.path}:${issue.start?.line || issue.line_number}
+File: ${issue.path || issue.file}:${issue.start?.line || issue.line_number}
 Tool: ${issue.tool}
 Severity: ${issue.severity}
 
@@ -5148,9 +6098,8 @@ Please provide:
 4. Why this is a security concern
 5. Related security concepts
 `;
-          logger.info('AI analysis initiated', { operation: 'vulnerability_explanation', vulnerabilityType });
-        }
-        
+        logger.info('AI analysis initiated', { operation: 'vulnerability_explanation', vulnerabilityType });
+
         // Get personalized prompt based on developer's learning history
         const personalizedPrompt = getPersonalizedPrompt(basePrompt, vulnerabilityType, context);
         
@@ -5161,7 +6110,7 @@ Please provide:
           addConversationEntry({
             timestamp: Date.now(),
             vulnerability: vulnerabilityType,
-            question: message.command === 'fixIt' ? 'How to fix this vulnerability?' : 'Explain this vulnerability',
+            question: 'Explain this vulnerability',
             aiResponse: response
           }, context);
           
@@ -5169,12 +6118,7 @@ Please provide:
           updateLearningProgress(vulnerabilityType, context);
           
           resultsPanel?.webview.postMessage({ command: 'llmResponse', index: idx, action: message.command, response });
-          
-          if (message.command === 'fixIt') {
-            showNotification(NotificationType.FIX, 'AI has generated a personalized fix for the vulnerability');
-          } else {
-            showNotification(NotificationType.SUGGESTION, 'AI has generated a personalized explanation for the vulnerability');
-          }
+          showNotification(NotificationType.SUGGESTION, 'AI has generated a personalized explanation for the vulnerability');
         } catch (e) {
           const errorMsg = String(e);
           resultsPanel?.webview.postMessage({ command: 'llmResponse', index: idx, action: message.command, response: errorMsg });
@@ -5186,24 +6130,18 @@ Please provide:
       resultsPanel = null;
     });
     
-    // Send current results to the webview immediately
-    // Use multiple attempts to ensure webview receives the data
+    // Send current results to the webview - use multiple attempts since webview loads asynchronously
     const sendData = () => {
       postResultsToWebview().catch(err => {
         logger?.error('Failed to post results to webview', err as Error);
       });
     };
     
-    // Send immediately
     sendData();
-    
-    // Send after short delay to ensure webview is ready
-    setTimeout(sendData, 100);
-    
-    // Send after longer delay as fallback
-    setTimeout(sendData, 500);
-    
-    // Also send when webview becomes ready (handled by webviewReady message)
+    setTimeout(sendData, 150);
+    setTimeout(sendData, 400);
+    setTimeout(sendData, 800);
+    // webviewReady message also triggers postResultsToWebview
   });
 
   // Command: Scan Me (manual scan)
@@ -5731,84 +6669,35 @@ Identify specific attack vectors an attacker could use. Return in this format:
     }
   });
 
-  // Live Code Review - GitHub Copilot style
-  let liveReviewDisposable = vscode.workspace.onDidChangeTextDocument(async (event) => {
+  // Live Static Analysis - always-on rule-based security diagnostics (no AI required)
+  const liveDiagnosticsModule = require('./core/live-diagnostics-service');
+  const liveDiagnosticsService = liveDiagnosticsModule.getLiveDiagnosticsService();
+
+  vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('ciphermate.enableLiveReview')) {
+      liveDiagnosticsService.setEnabled(vscode.workspace.getConfiguration('ciphermate').get('enableLiveReview', true));
+    }
+  });
+
+  liveDiagnosticsService.setEnabled(vscode.workspace.getConfiguration('ciphermate').get('enableLiveReview', true));
+
+  const liveReviewChangeDisposable = vscode.workspace.onDidChangeTextDocument((event) => {
     const config = vscode.workspace.getConfiguration('ciphermate');
-    if (!config.get('enableLiveReview', true)) {return;}
-    
-    const document = event.document;
-    if (!isCodeFile(document.fileName)) {return;}
-    
-    // Debounce rapid changes
-    clearTimeout((liveReviewDisposable as any).timeout);
-    (liveReviewDisposable as any).timeout = setTimeout(async () => {
-      try {
-        const code = document.getText();
-        const lines = code.split('\n');
-        const changedLines = event.contentChanges.map(change => 
-          document.positionAt(change.rangeOffset).line + 1
-        );
-        
-        // Analyze changed lines for security issues
-        for (const lineNum of changedLines) {
-          if (lineNum > lines.length) {continue;}
-          
-          const line = lines[lineNum - 1];
-          if (line.trim().length === 0) {continue;}
-          
-          const prompt = `
-Analyze this single line of code for security vulnerabilities:
+    if (!config.get('enableLiveReview', true)) return;
+    liveDiagnosticsService.analyzeDocument(event.document);
+  });
 
-Line ${lineNum}: ${line}
+  const liveReviewOpenDisposable = vscode.workspace.onDidOpenTextDocument((document) => {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    if (!config.get('enableLiveReview', true)) return;
+    liveDiagnosticsService.analyzeDocument(document);
+  });
 
-Return a security suggestion if there's an issue, or null if safe:
-{
-  "has_issue": true/false,
-  "severity": "HIGH/MEDIUM/LOW",
-  "issue_type": "SQL Injection",
-  "suggestion": "Use parameterized queries instead of string concatenation",
-  "secure_code": "const query = 'SELECT * FROM users WHERE id = ?'; db.query(query, [userId]);"
-}
-`;
-          
-          try {
-            const response = await callLmStudio(prompt);
-            const analysis = JSON.parse(response);
-            
-            if (analysis.has_issue) {
-              const diagnostic = new vscode.Diagnostic(
-                new vscode.Range(lineNum - 1, 0, lineNum - 1, line.length),
-                `[SECURITY] ${analysis.issue_type}: ${analysis.suggestion}`,
-                vscode.DiagnosticSeverity.Warning
-              );
-              diagnostic.source = 'CipherMate';
-              diagnostic.code = analysis.issue_type;
-              
-              vscode.languages.createDiagnosticCollection('ciphermate').set(
-                document.uri, 
-                [diagnostic]
-              );
-              
-              // Show quick suggestion
-              vscode.window.showInformationMessage(
-                `[SECURITY] ${analysis.issue_type}: ${analysis.suggestion}`,
-                'View Fix', 'Dismiss'
-              ).then(selection => {
-                if (selection === 'View Fix') {
-                  vscode.window.showInformationMessage(
-                    `Secure Code:\n${analysis.secure_code}`
-                  );
-                }
-              });
-            }
-          } catch (e) {
-            // Ignore AI errors for live review
-          }
-        }
-      } catch (e) {
-        // Ignore live review errors
-      }
-    }, 1000); // 1 second debounce
+  // Analyze already-open documents on activation
+  vscode.workspace.textDocuments.forEach((doc) => {
+    if (vscode.workspace.getConfiguration('ciphermate').get('enableLiveReview', true) && isCodeFile(doc.fileName)) {
+      liveDiagnosticsService.analyzeDocument(doc);
+    }
   });
 
   // Register inline suggestion provider
@@ -6163,6 +7052,35 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
     });
   }
 
+  // Convert scan result (from lastScanResults) to FixService Vulnerability format
+  function scanResultToVulnerability(issue: any, index: number): any {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    let filePath = (issue.path || issue.filename || issue.file || '').trim();
+    if (workspaceRoot && filePath && !path.isAbsolute(filePath)) {
+      filePath = path.join(workspaceRoot, filePath);
+    }
+    const line = issue.start?.line ?? issue.line ?? issue.line_number ?? 1;
+    const desc = (issue.extra?.message) || issue.issue_text || issue.check_id || issue.message || issue.description || 'Security issue';
+    const sev = (issue.severity || issue.extra?.severity || 'medium').toString().toLowerCase();
+    const severityMap: Record<string, string> = {
+      critical: 'critical', error: 'critical', high: 'high', warning: 'high',
+      medium: 'medium', info: 'medium', low: 'low'
+    };
+    return {
+      id: `vuln-${index}-${Date.now()}`,
+      type: issue.type || issue.tool || 'security-issue',
+      severity: severityMap[sev] || 'medium',
+      title: desc,
+      description: desc,
+      file: filePath,
+      line,
+      column: issue.start?.col ?? issue.column,
+      code: issue.code || issue.match || issue.extra?.lines,
+      cwe: issue.cwe || issue.extra?.cwe,
+      metadata: issue.metadata || {}
+    };
+  }
+
   // Fix System Commands
   const { FixService } = require('./fix-system');
   const fixService = new FixService(context);
@@ -6367,28 +7285,52 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
 
           try {
             const proposal = await fixService.generateFix(vuln);
-            proposals.push(proposal);
+            // Only include proposals with real code fixes (not comment-only advice)
+            if (proposal && !fixService.isProposalCommentOnly(proposal)) {
+              proposals.push(proposal);
+            }
           } catch (error: any) {
             console.error(`Failed to generate fix for vulnerability ${i + 1}:`, error);
             // Continue with other vulnerabilities
           }
         }
 
+        const failedCount = total - proposals.length;
         if (proposals.length === 0) {
-          vscode.window.showErrorMessage('Failed to generate any fixes');
+          vscode.window.showErrorMessage(
+            failedCount > 0
+              ? `Could not generate automatic fixes for any of ${total} findings. Configure an AI provider in CipherMate Settings for AI-powered fixes, or fix manually.`
+              : 'No vulnerabilities to fix'
+          );
           return;
         }
 
+        // Filter out comment-only "fixes" (advice blocks, not real code edits)
+        const executableProposals = fixService.filterApplyableProposals(proposals);
+        const skipped = proposals.length - executableProposals.length;
+        if (executableProposals.length === 0) {
+          vscode.window.showErrorMessage(
+            `No executable fixes available. ${skipped} finding(s) need AI or manual fixes. Configure an AI provider in CipherMate Settings.`
+          );
+          return;
+        }
+        if (skipped > 0) {
+          vscode.window.showInformationMessage(
+            `${skipped} finding(s) could not be auto-fixed (advice only). ${executableProposals.length} fix(es) will be applied.`
+          );
+        }
+
         // Generate batch preview
-        const preview = await fixService.generateBatchPreview(proposals);
+        const preview = await fixService.generateBatchPreview(executableProposals);
 
         // Show summary and confirmation
-        const highConfidence = proposals.filter((p: any) => p.confidence >= 0.7).length;
-        const lowConfidence = proposals.length - highConfidence;
+        const highConfidence = executableProposals.filter((p: any) => p.confidence >= 0.7).length;
+        const lowConfidence = executableProposals.length - highConfidence;
 
+        const failedNote = failedCount > 0 ? ` (${failedCount} could not be auto-fixed)` : '';
         const choice = await vscode.window.showInformationMessage(
           `Batch Fix Summary\n\n` +
-          `Total fixes: ${proposals.length}\n` +
+          `Fixable: ${executableProposals.length} of ${total} findings${failedNote}\n` +
           `High confidence (≥70%): ${highConfidence}\n` +
           `Low confidence (<70%): ${lowConfidence}\n` +
           `Files affected: ${preview.summary.totalFiles}\n` +
@@ -6401,12 +7343,12 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
         );
 
         if (choice === 'Apply All Fixes') {
-          const result = await fixService.applyBatchFixes(proposals, true);
+          const result = await fixService.applyBatchFixes(executableProposals, true);
           vscode.window.showInformationMessage(
             `Batch fix complete: ${result.successful} applied, ${result.failed} failed. Use "CipherMate: Undo Last Fix" to rollback.`
           );
         } else if (choice === 'Apply High Confidence Only') {
-          const highConfidenceProposals = proposals.filter((p: any) => p.confidence >= 0.7);
+          const highConfidenceProposals = executableProposals.filter((p: any) => p.confidence >= 0.7);
           if (highConfidenceProposals.length === 0) {
             vscode.window.showWarningMessage('No high confidence fixes available');
             return;
@@ -6468,8 +7410,14 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
     chatDisposable,
     mainDisposable,
     scanDisposable, 
+    benchmarkDisposable,
     semgrepDisposable, 
-    banditDisposable, 
+    banditDisposable,
+    scanDastDisposable,
+    scanDastBrutalDisposable,
+    runPentestDisposable,
+    openDastWarRoomDisposable,
+    discoverApisBrutalDisposable, 
     settingsDisposable, 
     advancedSettingsDisposable, 
     homeDisposable, 
@@ -6488,7 +7436,9 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
     switchAgentDisposable, 
     testAgentDisposable, 
     redTeamDisposable, 
-    liveReviewDisposable, 
+    liveReviewChangeDisposable,
+    liveReviewOpenDisposable,
+    { dispose: () => liveDiagnosticsService.dispose() }, 
     inlineSuggestionDisposable, 
     applyFixDisposable, 
     clearCacheDisposable, 
@@ -7352,8 +8302,8 @@ function getAdvancedSettingsHtml(settings: any) {
                     
                     <div class="setting-item">
                         <div class="setting-label">
-                            <div class="setting-title">Enable Live Review</div>
-                            <div class="setting-description">Real-time code analysis as you type</div>
+                            <div class="setting-title">Live Static Analysis</div>
+                            <div class="setting-description">Always watch code and point out security issues as you edit (squiggles in Problems panel)</div>
                         </div>
                         <div class="setting-control">
                             <label class="checkbox">
@@ -7790,8 +8740,10 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
         <title>CipherMate Home</title>
         <style>
             :root {
-                --border-radius: 0;
-                --border-radius-sm: 0;
+                --border-radius: 10px;
+                --border-radius-sm: 6px;
+                --accent-warm: #b86f4a;
+                --accent-sage: #5a7d6e;
                 --spacing-xs: 4px;
                 --spacing-sm: 8px;
                 --spacing-md: 12px;
@@ -7817,22 +8769,6 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
             
             * {
                 box-sizing: border-box;
-                border-radius: 0 !important;
-                -webkit-border-radius: 0 !important;
-                -moz-border-radius: 0 !important;
-            }
-            
-            *:before,
-            *:after {
-                border-radius: 0 !important;
-                -webkit-border-radius: 0 !important;
-                -moz-border-radius: 0 !important;
-            }
-            
-            input, textarea, button, select, div, section, article {
-                border-radius: 0 !important;
-                -webkit-border-radius: 0 !important;
-                -moz-border-radius: 0 !important;
             }
             
             body {
@@ -7840,10 +8776,10 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
                 font-size: var(--font-size-md);
                 font-weight: var(--font-weight-normal);
                 color: var(--vscode-foreground);
-                background: linear-gradient(135deg, var(--vscode-editor-background) 0%, var(--vscode-panel-background) 100%);
+                background: linear-gradient(160deg, var(--vscode-editor-background) 0%, var(--vscode-panel-background) 50%, rgba(107, 144, 128, 0.04) 100%);
                 margin: 0;
                 padding: 0;
-                line-height: 1.5;
+                line-height: 1.6;
                 -webkit-font-smoothing: antialiased;
                 -moz-osx-font-smoothing: grayscale;
                 min-height: 100vh;
@@ -7859,7 +8795,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
                 text-align: center;
                 margin-bottom: var(--spacing-xxxl);
                 padding: var(--spacing-xxl) 0;
-                background: var(--vscode-panel-background);
+                background: linear-gradient(180deg, rgba(184, 111, 74, 0.2) 0%, var(--vscode-panel-background) 100%);
                 border-radius: var(--border-radius);
                 border: 1px solid var(--vscode-panel-border);
                 box-shadow: var(--shadow-sm);
@@ -7868,7 +8804,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
       .logo {
                 font-size: var(--font-size-xxxl);
                 font-weight: var(--font-weight-bold);
-                color: var(--vscode-textLink-foreground);
+                color: var(--accent-warm);
                 margin-bottom: var(--spacing-sm);
         display: flex;
         align-items: center;
@@ -7919,7 +8855,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
             .stat-card {
                 background: var(--vscode-panel-background);
                 border: 1px solid var(--vscode-panel-border);
-                border-radius: var(--border-radius);
+                border-radius: 12px;
                 padding: var(--spacing-lg);
                 text-align: center;
                 box-shadow: var(--shadow-sm);
@@ -8874,8 +9810,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
     <title>CipherMate Results</title>
     <style>
         :root {
-            --border-radius: 0;
-            --border-radius-sm: 0;
+            --border-radius: 10px;
+            --border-radius-sm: 6px;
+            --border-radius-lg: 14px;
             --spacing-xs: 4px;
             --spacing-sm: 8px;
             --spacing-md: 12px;
@@ -8892,6 +9829,10 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             --font-weight-medium: 500;
             --font-weight-semibold: 600;
             --font-weight-bold: 700;
+            --accent-warm: #b86f4a;
+            --accent-warm-soft: rgba(184, 111, 74, 0.35);
+            --accent-sage: #5a7d6e;
+            --accent-sage-soft: rgba(90, 125, 110, 0.3);
         }
         
         * {
@@ -8899,17 +9840,14 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'SF Pro Text', Roboto, 'Helvetica Neue', Arial, sans-serif;
             font-size: var(--font-size-md);
             font-weight: var(--font-weight-normal);
             color: var(--vscode-foreground);
             background: var(--vscode-editor-background);
-            background-image: 
-                radial-gradient(circle at 1px 1px, rgba(0, 122, 204, 0.08) 1px, transparent 0);
-            background-size: 24px 24px;
             margin: 0;
             padding: 0;
-            line-height: 1.6;
+            line-height: 1.65;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
             position: relative;
@@ -8921,12 +9859,8 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             top: 0;
             left: 0;
             right: 0;
-            height: 1px;
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(0, 122, 204, 0.3) 20%, 
-                rgba(0, 122, 204, 0.3) 80%, 
-                transparent 100%);
+            height: 3px;
+            background: var(--accent-warm);
             z-index: 1000;
             pointer-events: none;
         }
@@ -8943,39 +9877,23 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             padding-bottom: var(--spacing-xl);
             border-bottom: 2px solid var(--vscode-panel-border);
             position: relative;
-            background: linear-gradient(180deg, 
-                rgba(0, 122, 204, 0.05) 0%, 
-                transparent 100%);
+            background: var(--vscode-panel-background);
             padding-top: var(--spacing-lg);
             padding-left: var(--spacing-xl);
             padding-right: var(--spacing-xl);
             margin-left: calc(-1 * var(--spacing-xl));
             margin-right: calc(-1 * var(--spacing-xl));
-            border-radius: 0;
+            border-radius: var(--border-radius-lg);
             overflow: visible;
         }
         
-        .header::after {
-            content: '';
-            position: absolute;
-            bottom: -2px;
-            left: 0;
-            right: 0;
-            height: 1px;
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(0, 122, 204, 0.4) 50%, 
-                transparent 100%);
-        }
-        
         .title {
-            font-size: 24px;
-            font-weight: 700;
+            font-size: 22px;
+            font-weight: 600;
             color: var(--vscode-foreground);
             margin: 0 0 var(--spacing-xs) 0;
-            letter-spacing: -0.02em;
-            text-transform: none;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            letter-spacing: -0.01em;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'SF Pro Text', Roboto, 'Helvetica Neue', Arial, sans-serif;
             position: relative;
             padding-left: var(--spacing-lg);
             display: flex;
@@ -8990,12 +9908,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             top: 50%;
             transform: translateY(-50%);
             width: 4px;
-            height: 28px;
-            background: linear-gradient(180deg, 
-                var(--vscode-textLink-foreground) 0%, 
-                rgba(0, 122, 204, 0.6) 100%);
-            border-radius: 0;
-            box-shadow: 0 0 8px rgba(0, 122, 204, 0.3);
+            height: 24px;
+            background: var(--accent-warm);
+            border-radius: 2px;
         }
         
         .title-logo {
@@ -9022,27 +9937,12 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
             padding: var(--spacing-xs) var(--spacing-md);
-            background: linear-gradient(135deg, 
-                var(--vscode-panel-background) 0%, 
-                rgba(0, 122, 204, 0.05) 100%);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 0;
+            background: var(--vscode-panel-background);
+            border: 2px solid var(--vscode-panel-border);
+            border-left: 4px solid var(--accent-warm);
+            border-radius: var(--border-radius-sm);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             font-weight: 500;
-            position: relative;
-            overflow: visible;
-        }
-        
-        .scan-status::before {
-            content: '';
-            position: absolute;
-            left: 0;
-            top: 0;
-            bottom: 0;
-            width: 2px;
-            background: linear-gradient(180deg, 
-                var(--vscode-textLink-foreground) 0%, 
-                transparent 100%);
         }
         
         .scan-time {
@@ -9066,40 +9966,17 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         
         .stat-card {
             background: var(--vscode-panel-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 0;
+            border: 2px solid var(--vscode-panel-border);
+            border-radius: 8px;
             padding: var(--spacing-lg);
             text-align: center;
-            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: all 0.2s ease;
             position: relative;
             overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-        
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(0, 122, 204, 0.3) 50%, 
-                transparent 100%);
-            opacity: 0;
-            transition: opacity 0.25s ease;
         }
         
         .stat-card:hover {
-            background: var(--vscode-list-hoverBackground);
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-            border-color: rgba(0, 122, 204, 0.3);
-        }
-        
-        .stat-card:hover::before {
-            opacity: 1;
+            transform: translateY(-1px);
         }
         
         .stat-number {
@@ -9123,82 +10000,60 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .stat-critical {
-            background: linear-gradient(135deg, 
-                rgba(211, 47, 47, 0.12) 0%, 
-                rgba(211, 47, 47, 0.06) 50%,
-                rgba(211, 47, 47, 0.02) 100%);
-            border: 1px solid rgba(211, 47, 47, 0.4);
-            border-top: 2px solid #d32f2f;
+            background: #2d1515;
+            border: 2px solid #c62828;
         }
         .stat-critical .stat-number {
-            color: #d32f2f;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            text-shadow: 0 0 20px rgba(211, 47, 47, 0.2);
+            color: #ef5350;
+            font-weight: 700;
         }
-        .stat-critical::before {
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(211, 47, 47, 0.4) 50%, 
-                transparent 100%);
+        .stat-critical .stat-label {
+            color: #b0b0b0;
         }
         
         .stat-high {
-            background: linear-gradient(135deg, 
-                rgba(245, 124, 0, 0.12) 0%, 
-                rgba(245, 124, 0, 0.06) 50%,
-                rgba(245, 124, 0, 0.02) 100%);
-            border: 1px solid rgba(245, 124, 0, 0.4);
-            border-top: 2px solid #f57c00;
+            background: #2d200a;
+            border: 2px solid #e65100;
         }
         .stat-high .stat-number {
-            color: #f57c00;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            text-shadow: 0 0 20px rgba(245, 124, 0, 0.2);
+            color: #ff9800;
+            font-weight: 700;
         }
-        .stat-high::before {
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(245, 124, 0, 0.4) 50%, 
-                transparent 100%);
+        .stat-high .stat-label {
+            color: #b0b0b0;
         }
         
         .stat-medium {
-            background: linear-gradient(135deg, 
-                rgba(25, 118, 210, 0.12) 0%, 
-                rgba(25, 118, 210, 0.06) 50%,
-                rgba(25, 118, 210, 0.02) 100%);
-            border: 1px solid rgba(25, 118, 210, 0.4);
-            border-top: 2px solid #1976d2;
+            background: #0d2137;
+            border: 2px solid #1565c0;
         }
         .stat-medium .stat-number {
-            color: #1976d2;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            text-shadow: 0 0 20px rgba(25, 118, 210, 0.2);
+            color: #42a5f5;
+            font-weight: 700;
         }
-        .stat-medium::before {
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(25, 118, 210, 0.4) 50%, 
-                transparent 100%);
+        .stat-medium .stat-label {
+            color: #b0b0b0;
         }
         
         .stat-low {
-            background: linear-gradient(135deg, 
-                rgba(117, 117, 117, 0.08) 0%, 
-                rgba(117, 117, 117, 0.04) 50%,
-                rgba(117, 117, 117, 0.01) 100%);
-            border: 1px solid rgba(117, 117, 117, 0.3);
-            border-top: 2px solid #757575;
+            background: #1e1e1e;
+            border: 2px solid #616161;
         }
         .stat-low .stat-number {
-            color: #757575;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            color: #9e9e9e;
+            font-weight: 600;
         }
-        .stat-low::before {
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(117, 117, 117, 0.3) 50%, 
-                transparent 100%);
+        .stat-low .stat-label {
+            color: #b0b0b0;
+        }
+        
+        .stat-card:not(.stat-critical):not(.stat-high):not(.stat-medium):not(.stat-low) {
+            background: #1a1a1a;
+            border: 2px solid #404040;
+        }
+        .stat-card:not(.stat-critical):not(.stat-high):not(.stat-medium):not(.stat-low) .stat-number {
+            color: var(--vscode-foreground);
+            font-weight: 700;
         }
         
         .controls {
@@ -9227,24 +10082,6 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
         }
         
-        .btn::before {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 0;
-            height: 0;
-            border-radius: 0;
-            background: rgba(255, 255, 255, 0.2);
-            transform: translate(-50%, -50%);
-            transition: width 0.3s ease, height 0.3s ease;
-        }
-        
-        .btn:hover::before {
-            width: 300px;
-            height: 300px;
-        }
-        
         .btn:active {
             transform: scale(0.98);
         }
@@ -9255,19 +10092,15 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .btn-primary {
-            background: linear-gradient(135deg, 
-                var(--vscode-button-background) 0%, 
-                rgba(0, 122, 204, 0.9) 100%);
-            color: var(--vscode-button-foreground);
-            border: 1px solid rgba(0, 122, 204, 0.3);
-            box-shadow: 0 2px 4px rgba(0, 122, 204, 0.2);
+            background: var(--accent-warm);
+            color: #fff;
+            border: 2px solid #a86b47;
+            border-radius: var(--border-radius-sm);
         }
         
         .btn-primary:hover {
-            background: linear-gradient(135deg, 
-                var(--vscode-button-hoverBackground) 0%, 
-                rgba(0, 122, 204, 1) 100%);
-            box-shadow: 0 4px 8px rgba(0, 122, 204, 0.3);
+            background: #c97a52;
+            border-color: var(--accent-warm);
             transform: translateY(-1px);
         }
         
@@ -9326,10 +10159,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         
         .results-section {
             background-color: var(--vscode-panel-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 0;
+            border: 2px solid var(--vscode-panel-border);
+            border-radius: var(--border-radius-lg);
             overflow: visible;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
             position: relative;
         }
         
@@ -9339,36 +10171,21 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             top: 0;
             left: 0;
             right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, 
-                rgba(0, 122, 204, 0.4) 0%, 
-                rgba(0, 122, 204, 0.2) 50%, 
-                rgba(0, 122, 204, 0.4) 100%);
+            height: 3px;
+            border-radius: var(--border-radius-lg) var(--border-radius-lg) 0 0;
+            background: var(--accent-warm);
         }
         
         .results-header {
-            background: linear-gradient(180deg, 
-                var(--vscode-panel-background) 0%, 
-                rgba(0, 122, 204, 0.03) 100%);
+            background: var(--vscode-panel-background);
             padding: var(--spacing-lg);
-            border-bottom: 1px solid var(--vscode-panel-border);
+            border-bottom: 2px solid var(--vscode-panel-border);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
+            gap: var(--spacing-sm);
             position: relative;
-        }
-        
-        .results-header::after {
-            content: '';
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 1px;
-            background: linear-gradient(90deg, 
-                transparent 0%, 
-                rgba(0, 122, 204, 0.3) 50%, 
-                transparent 100%);
         }
         
         .results-title {
@@ -9378,13 +10195,20 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             margin: 0;
         }
         
+        .results-header-actions {
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-sm);
+        }
+        
         .results-count {
             font-size: var(--font-size-sm);
-            color: var(--vscode-descriptionForeground);
-            background-color: var(--vscode-badge-background);
-            color: var(--vscode-badge-foreground);
+            background-color: var(--vscode-input-background);
+            color: var(--vscode-foreground);
             padding: var(--spacing-xs) var(--spacing-sm);
             border-radius: var(--border-radius-sm);
+            font-weight: 500;
+            border: 1px solid var(--vscode-input-border);
         }
         
         .results-content {
@@ -9396,13 +10220,14 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             display: flex;
             align-items: flex-start;
             padding: var(--spacing-lg);
-            margin-bottom: var(--spacing-md);
+            margin: 0 var(--spacing-sm) var(--spacing-md) var(--spacing-sm);
             border-bottom: 1px solid var(--vscode-panel-border);
             transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
             position: relative;
             z-index: 1;
             background: var(--vscode-panel-background);
-            border-left: 3px solid transparent;
+            border-left: 4px solid transparent;
+            border-radius: var(--border-radius-sm);
         }
         
         .result-item::before {
@@ -9411,11 +10236,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             left: 0;
             top: 0;
             bottom: 0;
-            width: 3px;
-            background: linear-gradient(180deg, 
-                transparent 0%, 
-                rgba(0, 122, 204, 0.3) 50%, 
-                transparent 100%);
+            width: 4px;
+            border-radius: var(--border-radius-sm) 0 0 var(--border-radius-sm);
+            background: var(--accent-warm);
             opacity: 0;
             transition: opacity 0.25s ease;
         }
@@ -9426,12 +10249,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .result-item:hover {
-            background: linear-gradient(90deg, 
-                var(--vscode-list-hoverBackground) 0%, 
-                var(--vscode-panel-background) 100%);
+            background: var(--vscode-list-hoverBackground);
             transform: translateX(4px);
-            border-left-color: var(--vscode-textLink-foreground);
-            box-shadow: -4px 0 12px rgba(0, 122, 204, 0.15);
+            border-left-color: var(--accent-warm);
             z-index: 10;
         }
         
@@ -9457,33 +10277,30 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .severity-critical {
-            background: linear-gradient(135deg, #d32f2f 0%, #b71c1c 100%);
+            background: #c62828;
             color: #ffffff;
-            border: 2px solid #d32f2f;
-            box-shadow: 0 0 10px rgba(211, 47, 47, 0.5);
+            border: 2px solid #b71c1c;
             font-weight: var(--font-weight-bold);
         }
         
         .severity-high {
-            background: linear-gradient(135deg, #f57c00 0%, #e65100 100%);
+            background: #e65100;
             color: #ffffff;
-            border: 2px solid #f57c00;
-            box-shadow: 0 0 10px rgba(245, 124, 0, 0.5);
+            border: 2px solid #bf360c;
             font-weight: var(--font-weight-bold);
         }
         
         .severity-medium {
-            background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%);
+            background: #1565c0;
             color: #ffffff;
-            border: 2px solid #1976d2;
-            box-shadow: 0 0 10px rgba(25, 118, 210, 0.5);
+            border: 2px solid #0d47a1;
             font-weight: var(--font-weight-semibold);
         }
         
         .severity-low {
-            background: linear-gradient(135deg, #757575 0%, #616161 100%);
+            background: #616161;
             color: #ffffff;
-            border: 2px solid #757575;
+            border: 2px solid #424242;
             font-weight: var(--font-weight-medium);
         }
         
@@ -9536,6 +10353,17 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             transform: scale(1.05);
         }
         
+        .confidence-badge {
+            display: inline-flex;
+            align-items: center;
+            margin-left: var(--spacing-xs);
+            padding: 2px 6px;
+            font-size: 10px;
+            background-color: var(--accent-sage-soft);
+            color: var(--vscode-foreground);
+            border-radius: var(--border-radius-sm);
+        }
+        
         .result-description {
             font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
@@ -9577,7 +10405,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         .action-btn {
             display: inline-flex;
             align-items: center;
-            padding: var(--spacing-xs) var(--spacing-sm);
+            padding: 6px 12px;
             border: 1px solid var(--vscode-input-border);
             border-radius: var(--border-radius-sm);
             background-color: transparent;
@@ -9585,7 +10413,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             font-size: var(--font-size-xs);
             font-weight: var(--font-weight-medium);
             cursor: pointer;
-            transition: all 0.15s ease;
+            transition: all 0.2s ease;
         }
         
         .action-btn:hover {
@@ -9594,13 +10422,13 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .action-btn-primary {
-            background-color: var(--vscode-button-background);
-            color: var(--vscode-button-foreground);
-            border-color: var(--vscode-button-border);
+            background: var(--accent-warm);
+            color: #fff;
+            border-color: #a86b47;
         }
         
         .action-btn-primary:hover {
-            background-color: var(--vscode-button-hoverBackground);
+            background: #c97a52;
         }
         
         .no-results {
@@ -9612,7 +10440,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         .no-results-icon {
             font-size: 48px;
             margin-bottom: var(--spacing-lg);
-            opacity: 0.5;
+            opacity: 0.6;
         }
         
         .no-results-title {
@@ -9625,6 +10453,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         .no-results-description {
             font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
+            line-height: 1.5;
         }
         
         .loading {
@@ -9638,8 +10467,8 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             width: 20px;
             height: 20px;
             border: 2px solid var(--vscode-panel-border);
-            border-radius: 0;
-            border-top-color: var(--vscode-foreground);
+            border-radius: 50%;
+            border-top-color: var(--accent-warm);
             animation: spin 1s ease-in-out infinite;
             margin-right: var(--spacing-sm);
         }
@@ -9667,13 +10496,54 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             transform: translate(-50%, -50%);
             background-color: var(--vscode-editor-background);
             border: 1px solid var(--vscode-panel-border);
-            border-radius: var(--border-radius);
+            border-radius: var(--border-radius-lg);
             padding: 0;
-            max-width: 600px;
+            max-width: 580px;
             max-height: 80vh;
             width: 90%;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
             overflow: hidden;
+        }
+        
+        .suppressions-intro {
+            font-size: var(--font-size-sm);
+            color: var(--vscode-descriptionForeground);
+            margin: 0 0 var(--spacing-lg) 0;
+            line-height: 1.5;
+        }
+        
+        .suppression-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: var(--spacing-md);
+            margin-bottom: var(--spacing-sm);
+            background: var(--vscode-input-background);
+            border-radius: var(--border-radius-sm);
+            border: 1px solid var(--vscode-panel-border);
+        }
+        
+        .suppression-item-info {
+            flex: 1;
+            min-width: 0;
+        }
+        
+        .suppression-item-file {
+            font-family: var(--vscode-editor-font-family, monospace);
+            font-size: var(--font-size-sm);
+            color: var(--vscode-textLink-foreground);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .suppression-item-desc {
+            font-size: var(--font-size-xs);
+            color: var(--vscode-descriptionForeground);
+            margin-top: 2px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         
         .modal-header {
@@ -9726,6 +10596,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             border: 1px solid var(--vscode-panel-border);
             padding: var(--spacing-lg);
             margin-bottom: var(--spacing-xl);
+            border-radius: var(--border-radius);
         }
         
         .filters-row {
@@ -9980,37 +10851,23 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         /* Graphical Analysis Section */
         .graphical-analysis-section {
             background: var(--vscode-panel-background);
-            border: 1px solid var(--vscode-panel-border);
+            border: 2px solid var(--vscode-panel-border);
             padding: var(--spacing-xl);
             margin-bottom: var(--spacing-xl);
-            border-radius: 0;
+            border-radius: 8px;
             overflow: visible;
         }
         
         .section-title {
-            font-size: 20px;
+            font-size: 18px;
             font-weight: 600;
             color: var(--vscode-foreground);
             margin: 0 0 var(--spacing-xl) 0;
             padding-bottom: var(--spacing-md);
-            border-bottom: 1px solid var(--vscode-panel-border);
+            border-bottom: 2px solid var(--vscode-panel-border);
             text-transform: none;
             letter-spacing: -0.01em;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            position: relative;
-            padding-left: var(--spacing-md);
-        }
-        
-        .section-title::before {
-            content: '';
-            position: absolute;
-            left: 0;
-            bottom: -1px;
-            width: 40px;
-            height: 2px;
-            background: linear-gradient(90deg, 
-                var(--vscode-textLink-foreground) 0%, 
-                transparent 100%);
         }
         
         .charts-grid {
@@ -10021,9 +10878,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         
         .chart-container {
             background: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-panel-border);
+            border: 2px solid var(--vscode-panel-border);
             padding: var(--spacing-lg);
-            border-radius: 0;
+            border-radius: 8px;
             overflow: visible;
         }
         
@@ -10086,7 +10943,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             ${logoUri ? `<img src="${logoUri}" alt="CipherMate" class="title-logo" style="background: transparent !important; border-radius: 0 !important;">` : ''}
             Security Analysis
         </h1>
-        <p class="subtitle">Comprehensive security vulnerability assessment</p>
+        <p class="subtitle">Vulnerability assessment for your workspace</p>
         <div class="scan-info">
             <span class="scan-status" id="scan-status">Ready to scan</span>
             <span class="scan-time" id="scan-time"></span>
@@ -10142,9 +10999,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
     </div>
     
     <div class="controls">
-        <button class="btn btn-primary" onclick="startScan()">Start Scan</button>
+        <button class="btn btn-primary" onclick="startScan()">Take a look</button>
         <button class="btn btn-refresh" onclick="refreshResults()" id="refresh-btn">Refresh</button>
-        <button class="btn btn-secondary" onclick="exportResults()">Export Results</button>
+        <button class="btn btn-secondary" onclick="exportResults()">Export</button>
         <button class="btn btn-history" onclick="showScanHistory()" title="View Scan History">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="12" cy="12" r="10"></circle>
@@ -10217,13 +11074,18 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
     
     <div class="results-section" id="results-section">
         <div class="results-header">
-            <h2 class="results-title">Vulnerabilities</h2>
-            <span class="results-count" id="results-count">0 found</span>
+            <h2 class="results-title">What we found</h2>
+            <div class="results-header-actions">
+                <span class="results-count" id="results-count">All clear</span>
+                <button class="action-btn action-btn-primary" id="fix-all-btn" onclick="fixAllVulnerabilities()" style="display: none;" title="Apply fixes to all findings across the repository">Fix all findings</button>
+                <button class="action-btn" id="manage-suppressions-btn" onclick="showSuppressionsModal()" style="display: none;" title="Items you've dismissed">Manage dismissed</button>
+                <button class="action-btn action-btn-ghost" id="clear-suppressions-btn" onclick="clearSuppressions()" style="display: none;" title="Bring back all dismissed items">Restore all</button>
+            </div>
         </div>
         <div class="results-content" id="results-container">
             <div class="loading">
                 <div class="loading-spinner"></div>
-                Loading security analysis results...
+                Taking a look...
             </div>
         </div>
     </div>
@@ -10232,17 +11094,33 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
     <div class="explanation-panel" id="explanationPanel">
         <div class="explanation-content">
             <div class="explanation-header">
-                <h2 id="explanationTitle">AI Explanation</h2>
+                <h2 id="explanationTitle">Explanation</h2>
                 <button class="close-btn" id="closeExplanation">Close</button>
             </div>
             <div class="explanation-text" id="explanationText">
-                Loading explanation...
+                Loading...
+            </div>
+        </div>
+    </div>
+    
+    <!-- Suppressions Modal -->
+    <div class="modal-overlay" id="suppressionsModal" onclick="if(event.target===this)hideSuppressionsModal()">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2 class="modal-title">Dismissed items</h2>
+                <button class="modal-close" onclick="hideSuppressionsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="suppressions-intro" id="suppressions-intro">Items you've marked as "not an issue" won't show in your findings. You can restore them here.</p>
+                <div id="suppressions-list"></div>
+                <button class="btn btn-secondary" id="clear-suppressions-modal-btn" onclick="clearSuppressionsFromModal()" style="margin-top: 12px; display: none;">Restore all dismissed</button>
             </div>
         </div>
     </div>
     <script>
       const vscode = acquireVsCodeApi();
       let lastResults = [];
+      let suppressionsData = [];
       let vulnerabilityAnalysisData = null;
       let recentScansData = [];
       let currentFilter = 'all';
@@ -10422,11 +11300,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
               const x = index * (trendCtx.width / trendData.length) + 5;
               const y = trendCtx.height - barHeight - 40;
               
-              // Draw bar with gradient effect
-              const gradient = ctx.createLinearGradient(x, y, x, y + barHeight);
-              gradient.addColorStop(0, '#1976d2');
-              gradient.addColorStop(1, '#1565c0');
-              ctx.fillStyle = gradient;
+              ctx.fillStyle = '#1565c0';
               ctx.fillRect(x, y, barWidth, barHeight);
               
               // Add subtle border
@@ -10600,19 +11474,29 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             document.getElementById('medium-count').textContent = stats.medium;
             document.getElementById('low-count').textContent = stats.low;
             
-            // Update results count
-            const countText = stats.total === 1 ? '1 found' : \`\${stats.total} found\`;
+            // Update results count - friendly copy
+            let countText = 'All clear';
+            if (stats.total === 1) countText = '1 thing to review';
+            else if (stats.total > 1) countText = \`\${stats.total} things to review\`;
             document.getElementById('results-count').textContent = countText;
+            const fixAllBtn = document.getElementById('fix-all-btn');
+            if (fixAllBtn) fixAllBtn.style.display = filtered.length > 0 ? 'inline-block' : 'none';
+            const manageBtn = document.getElementById('manage-suppressions-btn');
+            const clearSuppBtn = document.getElementById('clear-suppressions-btn');
+            if (manageBtn) manageBtn.style.display = suppressionsData.length > 0 ? 'inline-block' : 'none';
+            if (clearSuppBtn) clearSuppBtn.style.display = suppressionsData.length > 0 ? 'inline-block' : 'none';
             
             // Render charts
             renderCharts(results, stats);
             
             if (filtered.length === 0) {
+                const fixAllBtn = document.getElementById('fix-all-btn');
+                if (fixAllBtn) fixAllBtn.style.display = 'none';
                 const emptyMessage = results.length === 0 
-                  ? 'No scan results available. Click "Start Scan" to begin security analysis.'
-                  : 'No vulnerabilities match the current filter. Try changing the severity filter.';
+                  ? 'Click "Take a look" above to run a scan, or press Ctrl+Shift+P (Mac: Cmd+Shift+P) and run "CipherMate: Intelligent Scan". Results will appear here.'
+                  : 'Nothing matches the filter. Try adjusting the severity.';
                 const emptyIcon = results.length === 0 ? '🔍' : '✓';
-                const emptyTitle = results.length === 0 ? 'No Scan Results' : 'No Security Issues Found';
+                const emptyTitle = results.length === 0 ? 'No scan yet' : 'Looking good from here';
                 container.innerHTML = \`
                     <div class="no-results">
                         <div class="no-results-icon">\${emptyIcon}</div>
@@ -10627,6 +11511,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             
             for (let i = 0; i < filtered.length; i++) {
                 const r = filtered[i];
+                const origIdx = lastResults.indexOf(r);
                 let severityClass = 'severity-low';
                 let severityText = r.severity || 'INFO';
                 
@@ -10664,14 +11549,17 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
                                 <h3 class="result-title">\${desc}</h3>
                                 <div class="result-meta">
                                     <span class="tool-badge">\${tool}</span>
+                                    \${r.metadata?.confidence != null ? \`<span class="confidence-badge" title="AI confidence">\${r.metadata.confidence}%</span>\` : ''}
                                 </div>
                             </div>
                             <div class="result-description">
                                 \${fileLinkHtml}
                             </div>
                             <div class="result-actions">
-                                <button class="action-btn" onclick="event.stopPropagation(); explainVulnerability(\${i})">Explain</button>
-                                \${r.patch ? \`<button class="action-btn action-btn-primary" onclick="event.stopPropagation(); applyPatch(\${i})">Apply Fix</button>\` : ''}
+                                <button class="action-btn" onclick="event.stopPropagation(); explainVulnerability(\${origIdx})">Tell me more</button>
+                                <button class="action-btn action-btn-primary" onclick="event.stopPropagation(); fixVulnerability(\${origIdx})">Fix it</button>
+                                <button class="action-btn action-btn-ghost" onclick="event.stopPropagation(); markFalsePositive(\${origIdx})" title="Dismiss — not a real issue">Dismiss</button>
+                                \${r.patch ? \`<button class="action-btn action-btn-primary" onclick="event.stopPropagation(); applyPatch(\${origIdx})">Apply Fix</button>\` : ''}
                             </div>
                         </div>
                     </div>
@@ -10964,14 +11852,76 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         });
         
         function explainVulnerability(index) {
-            // Show loading state
-            showExplanation('Loading...', 'Getting AI explanation for this vulnerability...');
+            showExplanation('One moment...', 'Looking this up for you...');
             
             // Send message to extension to get AI explanation
             vscode.postMessage({ 
                 command: 'explainVulnerability', 
                 index: index 
             });
+        }
+        
+        function fixVulnerability(index) {
+            vscode.postMessage({ command: 'generateFix', index: index });
+        }
+        
+        function fixAllVulnerabilities() {
+            // Fix ALL findings from the scan - every file with a vulnerability in the repository
+            const allResults = lastResults && lastResults.length ? lastResults : [];
+            if (allResults.length === 0) return;
+            const indices = allResults.map((r, i) => i);
+            vscode.postMessage({ command: 'generateFixAll', indices: indices });
+        }
+        
+        function markFalsePositive(index) {
+            vscode.postMessage({ command: 'markFalsePositive', index: index });
+        }
+        
+        function showSuppressionsModal() {
+            const modal = document.getElementById('suppressionsModal');
+            const listEl = document.getElementById('suppressions-list');
+            const clearBtn = document.getElementById('clear-suppressions-modal-btn');
+            if (!modal || !listEl) return;
+            listEl.innerHTML = '';
+            if (suppressionsData.length === 0) {
+                listEl.innerHTML = '<p class="suppressions-intro" style="margin: 0;">No dismissed items. When you mark something as "not an issue," it will show up here.</p>';
+                if (clearBtn) clearBtn.style.display = 'none';
+            } else {
+                suppressionsData.forEach(key => {
+                    const m = key.match(/^suppress:(.+?):(\d+):(.+)$/);
+                    const path = m ? m[1] : '';
+                    const line = m ? m[2] : '';
+                    const desc = m ? m[3] : key;
+                    const shortPath = path.split(/[/\\\\]/).pop() || path;
+                    const item = document.createElement('div');
+                    item.className = 'suppression-item';
+                    const esc = (s) => (s||'').replace(/'/g, "\\\\'");
+                    item.innerHTML = \`<div class="suppression-item-info"><div class="suppression-item-file" title="\${path}">\${shortPath}:\${line}</div><div class="suppression-item-desc" title="\${desc}">\${desc}</div></div><button class="action-btn" onclick="restoreSuppression('\${esc(key)}')">Restore</button>\`;
+                    listEl.appendChild(item);
+                });
+                if (clearBtn) clearBtn.style.display = 'inline-block';
+            }
+            modal.style.display = 'block';
+        }
+        
+        function hideSuppressionsModal() {
+            const modal = document.getElementById('suppressionsModal');
+            if (modal) modal.style.display = 'none';
+        }
+        
+        function restoreSuppression(key) {
+            vscode.postMessage({ command: 'restoreSuppression', key: key });
+            hideSuppressionsModal();
+        }
+        
+        function clearSuppressions() {
+            vscode.postMessage({ command: 'clearSuppressions' });
+            hideSuppressionsModal();
+        }
+        
+        function clearSuppressionsFromModal() {
+            vscode.postMessage({ command: 'clearSuppressions' });
+            hideSuppressionsModal();
         }
         
         function showExplanation(title, text) {
@@ -11020,6 +11970,9 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             });
             
         if (message.command === 'updateResults') {
+          if (message.suppressions && Array.isArray(message.suppressions)) {
+            suppressionsData = message.suppressions;
+          }
           console.log('Processing updateResults command', {
             resultsLength: message.results?.length || 0,
             results: message.results
@@ -11906,7 +12859,11 @@ function getTeamSetupHtml(): string {
   `;
 }
 
-function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, context: vscode.ExtensionContext): string {
+function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, context: vscode.ExtensionContext, apiKeysConfigured?: { openrouter: boolean; openai: boolean; anthropic: boolean; gemini: boolean }): string {
+  const keys = apiKeysConfigured || { openrouter: false, openai: false, anthropic: false, gemini: false };
+  const placeholder = (provider: string) => keys[provider as keyof typeof keys]
+    ? '✓ Key configured - enter new key to replace'
+    : 'Enter key (stored in system keychain)';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12023,6 +12980,8 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
         }
         input[type="text"],
         input[type="url"],
+        input[type="password"],
+        input[type="number"],
         select {
             padding: 6px 10px;
             background: var(--vscode-input-background);
@@ -12032,6 +12991,10 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             font-family: inherit;
             font-size: 13px;
             min-width: 200px;
+        }
+        input[type="number"] {
+            min-width: 120px;
+            text-align: center;
         }
         input:focus, select:focus {
             outline: 1px solid var(--vscode-focusBorder);
@@ -12101,20 +13064,472 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             <h2>CIPHERMATE</h2>
             <p>Settings</p>
         </div>
-        <div class="nav-item active" data-section="providers">Providers</div>
-        <div class="nav-item" data-section="scanning">Scanning</div>
-        <div class="nav-item" data-section="ai">AI Configuration</div>
+        <div class="nav-item active" data-section="scanners">Scanners</div>
+        <div class="nav-item" data-section="scanBehavior">Scan Behavior</div>
+        <div class="nav-item" data-section="cve">CVE Lookup</div>
+        <div class="nav-item" data-section="ui">UI & Display</div>
         <div class="nav-item" data-section="notifications">Notifications</div>
-        <div class="nav-item" data-section="team">Team</div>
-        <div class="nav-item" data-section="advanced">Advanced</div>
+        <div class="nav-item" data-section="performance">Performance</div>
+        <div class="nav-item" data-section="explain">Explain & AI</div>
+        <div class="nav-item" data-section="providers">AI Providers</div>
     </div>
     <div class="main-content">
         <div class="content-header">
-            <h1 id="sectionTitle">Providers</h1>
-            <p id="sectionDescription">Configure AI providers and models</p>
+            <h1 id="sectionTitle">Scanners</h1>
+            <p id="sectionDescription">Enable or disable security scanners</p>
         </div>
         <div class="content-body">
-            <div class="section active" id="providers">
+            <div class="section active" id="scanners">
+                <div class="setting-group">
+                    <div class="setting-group-title">Core Scanners</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Dependency Scanner</div>
+                            <div class="setting-label-desc">Scan package.json, requirements.txt, and other dependency files for CVEs</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="scanners.enableDependency" ${settings.scanners?.enableDependency !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Secrets Scanner</div>
+                            <div class="setting-label-desc">Detect hardcoded API keys, passwords, and credentials</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="scanners.enableSecrets" ${settings.scanners?.enableSecrets !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Smart Contract Scanner</div>
+                            <div class="setting-label-desc">Scan Solidity files for blockchain vulnerabilities</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="scanners.enableSmartContract" ${settings.scanners?.enableSmartContract !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Code Pattern Scanner</div>
+                            <div class="setting-label-desc">Detect OWASP Top 10 vulnerabilities (SQL injection, XSS, etc.)</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="scanners.enableCodePattern" ${settings.scanners?.enableCodePattern !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <div class="setting-group-title">External Tools</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable Semgrep</div>
+                            <div class="setting-label-desc">Use Semgrep for advanced static analysis</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="enableSemgrep" ${settings.scanners?.enableSemgrep !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable Bandit</div>
+                            <div class="setting-label-desc">Use Bandit for Python-specific security scanning</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="enableBandit" ${settings.scanners?.enableBandit !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="scanBehavior">
+                <div class="setting-group">
+                    <div class="setting-group-title">Scan Behavior</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Scan on Save</div>
+                            <div class="setting-label-desc">Automatically scan files when saved</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="scanOnSave" ${settings.scanOnSave !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Scan on Startup</div>
+                            <div class="setting-label-desc">Run scan automatically when workspace opens</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="scanBehavior.scanOnStartup" ${settings.scanBehavior?.scanOnStartup ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Scan Mode</div>
+                            <div class="setting-label-desc">How to scan files</div>
+                        </div>
+                        <div class="setting-control">
+                            <select id="scanBehavior.scanMode">
+                                <option value="full" ${settings.scanBehavior?.scanMode === 'full' ? 'selected' : ''}>Full (scan everything)</option>
+                                <option value="incremental" ${settings.scanBehavior?.scanMode === 'incremental' || !settings.scanBehavior?.scanMode ? 'selected' : ''}>Incremental (changed files only)</option>
+                                <option value="changed-only" ${settings.scanBehavior?.scanMode === 'changed-only' ? 'selected' : ''}>Changed Only (currently modified)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Max File Size (bytes)</div>
+                            <div class="setting-label-desc">Skip files larger than this size</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="scanBehavior.maxFileSize" value="${settings.scanBehavior?.maxFileSize || 1048576}" min="1024" max="10485760" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Scan Interval</div>
+                            <div class="setting-label-desc">Number of saves before triggering full scan</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="scanInterval" value="${settings.scanInterval || 1}" min="1" max="100" />
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="cve">
+                <div class="setting-group">
+                    <div class="setting-group-title">CVE Lookup</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable CVE Enrichment</div>
+                            <div class="setting-label-desc">Automatically enrich vulnerabilities with CVE data</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="cve.enabled" ${settings.cve?.enabled !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable Caching</div>
+                            <div class="setting-label-desc">Cache CVE lookups to reduce API calls</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="cve.cacheEnabled" ${settings.cve?.cacheEnabled !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Cache TTL (hours)</div>
+                            <div class="setting-label-desc">How long to cache CVE data</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="cve.cacheTTLHours" value="${settings.cve?.cacheTTLHours || 24}" min="1" max="168" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">API Preference</div>
+                            <div class="setting-label-desc">Which CVE database to use</div>
+                        </div>
+                        <div class="setting-control">
+                            <select id="cve.apiPreference">
+                                <option value="nvd" ${settings.cve?.apiPreference === 'nvd' ? 'selected' : ''}>NVD Only</option>
+                                <option value="mitre" ${settings.cve?.apiPreference === 'mitre' ? 'selected' : ''}>MITRE Only</option>
+                                <option value="both" ${settings.cve?.apiPreference === 'both' || !settings.cve?.apiPreference ? 'selected' : ''}>Both (with fallback)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Rate Limit Delay (ms)</div>
+                            <div class="setting-label-desc">Delay between CVE lookups</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="cve.rateLimitDelay" value="${settings.cve?.rateLimitDelay || 200}" min="0" max="2000" />
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="ui">
+                <div class="setting-group">
+                    <div class="setting-group-title">UI & Display Settings</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Show CodeLens</div>
+                            <div class="setting-label-desc">Show Explain button above vulnerability lines</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="ui.showCodeLens" ${settings.ui?.showCodeLens !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Highlight Duration (seconds)</div>
+                            <div class="setting-label-desc">How long to keep lines highlighted</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="ui.highlightDuration" value="${settings.ui?.highlightDuration || 5}" min="1" max="60" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Show Gutter Icon</div>
+                            <div class="setting-label-desc">Show question mark icon in gutter</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="ui.showGutterIcon" ${settings.ui?.showGutterIcon !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Show Overview Ruler</div>
+                            <div class="setting-label-desc">Show indicators in scrollbar</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="ui.showOverviewRuler" ${settings.ui?.showOverviewRuler !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">CodeLens Position</div>
+                            <div class="setting-label-desc">Where to show Explain button</div>
+                        </div>
+                        <div class="setting-control">
+                            <select id="ui.codeLensPosition">
+                                <option value="above" ${settings.ui?.codeLensPosition === 'above' || !settings.ui?.codeLensPosition ? 'selected' : ''}>Above Line</option>
+                                <option value="inline" ${settings.ui?.codeLensPosition === 'inline' ? 'selected' : ''}>Inline</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Theme</div>
+                            <div class="setting-label-desc">UI theme preference</div>
+                        </div>
+                        <div class="setting-control">
+                            <select id="ui.theme">
+                                <option value="auto" ${settings.ui?.theme === 'auto' || !settings.ui?.theme ? 'selected' : ''}>Auto (match VS Code)</option>
+                                <option value="light" ${settings.ui?.theme === 'light' ? 'selected' : ''}>Light</option>
+                                <option value="dark" ${settings.ui?.theme === 'dark' ? 'selected' : ''}>Dark</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Compact Mode</div>
+                            <div class="setting-label-desc">Use compact UI layout</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="ui.compactMode" ${settings.ui?.compactMode ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="notifications">
+                <div class="setting-group">
+                    <div class="setting-group-title">Notification Settings</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable Notifications</div>
+                            <div class="setting-label-desc">Show notifications for scan results</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="notifications.enabled" ${settings.notifications?.enabled !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Minimum Severity</div>
+                            <div class="setting-label-desc">Only show notifications at or above this severity</div>
+                        </div>
+                        <div class="setting-control">
+                            <select id="notifications.minSeverity">
+                                <option value="info" ${settings.notifications?.minSeverity === 'info' ? 'selected' : ''}>Info (all)</option>
+                                <option value="low" ${settings.notifications?.minSeverity === 'low' ? 'selected' : ''}>Low</option>
+                                <option value="medium" ${settings.notifications?.minSeverity === 'medium' || !settings.notifications?.minSeverity ? 'selected' : ''}>Medium</option>
+                                <option value="high" ${settings.notifications?.minSeverity === 'high' ? 'selected' : ''}>High</option>
+                                <option value="critical" ${settings.notifications?.minSeverity === 'critical' ? 'selected' : ''}>Critical Only</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Show Popups</div>
+                            <div class="setting-label-desc">Show popup notifications</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="notifications.showPopups" ${settings.notifications?.showPopups !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Sound Alerts</div>
+                            <div class="setting-label-desc">Play sound for critical vulnerabilities</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="notifications.soundEnabled" ${settings.notifications?.soundEnabled ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="performance">
+                <div class="setting-group">
+                    <div class="setting-group-title">Performance Settings</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Max Concurrent Scans</div>
+                            <div class="setting-label-desc">Number of scanners that can run simultaneously</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="performance.maxConcurrentScans" value="${settings.performance?.maxConcurrentScans || 5}" min="1" max="20" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Scan Timeout (ms)</div>
+                            <div class="setting-label-desc">Maximum time to wait for scan completion</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="performance.scanTimeout" value="${settings.performance?.scanTimeout || 300000}" min="10000" max="1800000" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable Caching</div>
+                            <div class="setting-label-desc">Cache scan results to avoid re-scanning unchanged files</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="performance.cacheEnabled" ${settings.performance?.cacheEnabled !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Cache TTL (hours)</div>
+                            <div class="setting-label-desc">How long to cache scan results</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="performance.cacheTTLHours" value="${settings.performance?.cacheTTLHours || 24}" min="1" max="168" />
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="explain">
+                <div class="setting-group">
+                    <div class="setting-group-title">Explain & AI Settings</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Enable AI Explanations</div>
+                            <div class="setting-label-desc">Allow AI to generate vulnerability explanations</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="explain.enabled" ${settings.explain?.enabled !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">AI Provider</div>
+                            <div class="setting-label-desc">Which AI provider to use for explanations</div>
+                        </div>
+                        <div class="setting-control">
+                            <select id="explain.provider">
+                                <option value="same-as-chat" ${settings.explain?.provider === 'same-as-chat' || !settings.explain?.provider ? 'selected' : ''}>Same as Chat</option>
+                                <option value="openrouter" ${settings.explain?.provider === 'openrouter' ? 'selected' : ''}>OpenRouter</option>
+                                <option value="openai" ${settings.explain?.provider === 'openai' ? 'selected' : ''}>OpenAI</option>
+                                <option value="anthropic" ${settings.explain?.provider === 'anthropic' ? 'selected' : ''}>Anthropic</option>
+                                <option value="gemini" ${settings.explain?.provider === 'gemini' ? 'selected' : ''}>Google Gemini</option>
+                                <option value="ollama" ${settings.explain?.provider === 'ollama' ? 'selected' : ''}>Ollama</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Max Explanation Length</div>
+                            <div class="setting-label-desc">Maximum characters for brief explanations</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="explain.maxLength" value="${settings.explain?.maxLength || 500}" min="100" max="2000" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Include Code Context</div>
+                            <div class="setting-label-desc">Include surrounding code in explanations</div>
+                        </div>
+                        <div class="setting-control">
+                            <label class="checkbox-wrapper">
+                                <input type="checkbox" id="explain.includeCodeContext" ${settings.explain?.includeCodeContext !== false ? 'checked' : ''} />
+                                <span class="checkbox-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Code Context Lines</div>
+                            <div class="setting-label-desc">Number of lines before/after to include</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="number" id="explain.codeContextLines" value="${settings.explain?.codeContextLines || 5}" min="0" max="20" />
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="section" id="providers">
                 <div class="setting-group">
                     <div class="setting-group-title">API Provider</div>
                     <div class="setting-item">
@@ -12124,13 +13539,58 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
                         </div>
                         <div class="setting-control">
                             <select id="aiProvider">
-                                <option value="local" ${settings.aiProvider === 'local' ? 'selected' : ''}>Local (LM Studio/Ollama)</option>
-                                <option value="openrouter" ${settings.aiProvider === 'openrouter' ? 'selected' : ''}>OpenRouter</option>
+                                <option value="ollama" ${settings.aiProvider === 'ollama' ? 'selected' : ''}>Local (Ollama)</option>
+                                <option value="openrouter" ${settings.aiProvider === 'openrouter' ? 'selected' : ''}>OpenRouter (450+ models)</option>
                                 <option value="openai" ${settings.aiProvider === 'openai' ? 'selected' : ''}>OpenAI</option>
-                                <option value="anthropic" ${settings.aiProvider === 'anthropic' ? 'selected' : ''}>Anthropic</option>
+                                <option value="anthropic" ${settings.aiProvider === 'anthropic' ? 'selected' : ''}>Anthropic (Claude)</option>
                                 <option value="gemini" ${settings.aiProvider === 'gemini' ? 'selected' : ''}>Google Gemini</option>
                                 <option value="custom" ${settings.aiProvider === 'custom' ? 'selected' : ''}>Custom</option>
                             </select>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">OpenRouter API Key</div>
+                            <div class="setting-label-desc">Stored securely in system keychain. Get key at https://openrouter.ai</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="password" id="apiKey.openrouter" placeholder="${placeholder('openrouter')}" autocomplete="off" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">OpenRouter Model</div>
+                            <div class="setting-label-desc">Use <code>openrouter/free</code> (free, auto-selects models). Or see https://openrouter.ai/models for other models.</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="text" id="openrouterModel" value="${(settings.openrouterModel || 'openrouter/free').replace(/"/g, '&quot;')}" placeholder="openrouter/free" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">OpenAI API Key</div>
+                            <div class="setting-label-desc">Stored securely in system keychain</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="password" id="apiKey.openai" placeholder="${placeholder('openai')}" autocomplete="off" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Anthropic (Claude) API Key</div>
+                            <div class="setting-label-desc">Stored securely in system keychain</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="password" id="apiKey.anthropic" placeholder="${placeholder('anthropic')}" autocomplete="off" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Google Gemini API Key</div>
+                            <div class="setting-label-desc">Stored securely in system keychain</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="password" id="apiKey.gemini" placeholder="${placeholder('gemini')}" autocomplete="off" />
                         </div>
                     </div>
                 </div>
@@ -12259,12 +13719,14 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
     <script>
         const vscode = acquireVsCodeApi();
         const sections = {
-            providers: { title: 'Providers', desc: 'Configure AI providers and models' },
-            scanning: { title: 'Scanning', desc: 'Configure scanning tools and behavior' },
-            ai: { title: 'AI Configuration', desc: 'Configure AI settings' },
+            scanners: { title: 'Scanners', desc: 'Enable or disable security scanners' },
+            scanBehavior: { title: 'Scan Behavior', desc: 'Configure how scans are performed' },
+            cve: { title: 'CVE Lookup', desc: 'Configure CVE enrichment settings' },
+            ui: { title: 'UI & Display', desc: 'Customize the user interface' },
             notifications: { title: 'Notifications', desc: 'Configure notification preferences' },
-            team: { title: 'Team', desc: 'Configure team collaboration settings' },
-            advanced: { title: 'Advanced', desc: 'Advanced configuration options' }
+            performance: { title: 'Performance', desc: 'Performance and caching settings' },
+            explain: { title: 'Explain & AI', desc: 'AI-powered explanation settings' },
+            providers: { title: 'AI Providers', desc: 'Configure AI providers and models' }
         };
         document.querySelectorAll('.nav-item').forEach(item => {
             item.addEventListener('click', () => {
@@ -12280,16 +13742,75 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             document.getElementById('sectionTitle').textContent = sections[section].title;
             document.getElementById('sectionDescription').textContent = sections[section].desc;
         }
+        function navigateTo(command) {
+            vscode.postMessage({
+                command: 'navigateTo',
+                target: command
+            });
+        }
         function saveSettings() {
             const settings = {
-                aiProvider: document.getElementById('aiProvider').value,
-                lmStudioUrl: document.getElementById('lmStudioUrl').value,
-                ollamaUrl: document.getElementById('ollamaUrl').value,
-                enableSemgrep: document.getElementById('enableSemgrep').checked,
-                enableBandit: document.getElementById('enableBandit').checked,
+                scanners: {
+                    enableDependency: document.getElementById('scanners.enableDependency').checked,
+                    enableSecrets: document.getElementById('scanners.enableSecrets').checked,
+                    enableSmartContract: document.getElementById('scanners.enableSmartContract').checked,
+                    enableCodePattern: document.getElementById('scanners.enableCodePattern').checked,
+                    enableSemgrep: document.getElementById('enableSemgrep').checked,
+                    enableBandit: document.getElementById('enableBandit').checked
+                },
+                scanBehavior: {
+                    scanOnStartup: document.getElementById('scanBehavior.scanOnStartup').checked,
+                    scanMode: document.getElementById('scanBehavior.scanMode').value,
+                    maxFileSize: parseInt(document.getElementById('scanBehavior.maxFileSize').value) || 1048576
+                },
                 scanOnSave: document.getElementById('scanOnSave') ? document.getElementById('scanOnSave').checked : true,
-                useCloudAI: document.getElementById('useCloudAI').checked,
-                enableNotifications: document.getElementById('enableNotifications').checked
+                scanInterval: parseInt(document.getElementById('scanInterval').value) || 1,
+                cve: {
+                    enabled: document.getElementById('cve.enabled').checked,
+                    cacheEnabled: document.getElementById('cve.cacheEnabled').checked,
+                    cacheTTLHours: parseInt(document.getElementById('cve.cacheTTLHours').value) || 24,
+                    apiPreference: document.getElementById('cve.apiPreference').value,
+                    rateLimitDelay: parseInt(document.getElementById('cve.rateLimitDelay').value) || 200
+                },
+                ui: {
+                    showCodeLens: document.getElementById('ui.showCodeLens').checked,
+                    highlightDuration: parseInt(document.getElementById('ui.highlightDuration').value) || 5,
+                    showGutterIcon: document.getElementById('ui.showGutterIcon').checked,
+                    showOverviewRuler: document.getElementById('ui.showOverviewRuler').checked,
+                    codeLensPosition: document.getElementById('ui.codeLensPosition').value,
+                    theme: document.getElementById('ui.theme').value,
+                    compactMode: document.getElementById('ui.compactMode').checked
+                },
+                notifications: {
+                    enabled: document.getElementById('notifications.enabled').checked,
+                    minSeverity: document.getElementById('notifications.minSeverity').value,
+                    showPopups: document.getElementById('notifications.showPopups').checked,
+                    soundEnabled: document.getElementById('notifications.soundEnabled').checked
+                },
+                performance: {
+                    maxConcurrentScans: parseInt(document.getElementById('performance.maxConcurrentScans').value) || 5,
+                    scanTimeout: parseInt(document.getElementById('performance.scanTimeout').value) || 300000,
+                    cacheEnabled: document.getElementById('performance.cacheEnabled').checked,
+                    cacheTTLHours: parseInt(document.getElementById('performance.cacheTTLHours').value) || 24
+                },
+                explain: {
+                    enabled: document.getElementById('explain.enabled').checked,
+                    provider: document.getElementById('explain.provider').value,
+                    maxLength: parseInt(document.getElementById('explain.maxLength').value) || 500,
+                    includeCodeContext: document.getElementById('explain.includeCodeContext').checked,
+                    codeContextLines: parseInt(document.getElementById('explain.codeContextLines').value) || 5
+                },
+                aiProvider: document.getElementById('aiProvider') ? document.getElementById('aiProvider').value : 'openrouter',
+                openrouterModel: document.getElementById('openrouterModel') ? document.getElementById('openrouterModel').value?.trim() || 'openrouter/free' : 'openrouter/free',
+                lmStudioUrl: document.getElementById('lmStudioUrl') ? document.getElementById('lmStudioUrl').value : 'http://localhost:1234/v1/chat/completions',
+                ollamaUrl: document.getElementById('ollamaUrl') ? document.getElementById('ollamaUrl').value : 'http://localhost:11434/v1/chat/completions',
+                useCloudAI: document.getElementById('useCloudAI') ? document.getElementById('useCloudAI').checked : false,
+                apiKeys: {
+                    openrouter: document.getElementById('apiKey.openrouter')?.value?.trim() || '',
+                    openai: document.getElementById('apiKey.openai')?.value?.trim() || '',
+                    anthropic: document.getElementById('apiKey.anthropic')?.value?.trim() || '',
+                    gemini: document.getElementById('apiKey.gemini')?.value?.trim() || ''
+                }
             };
             vscode.postMessage({ command: 'saveSettings', settings: settings });
         }

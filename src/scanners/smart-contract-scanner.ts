@@ -41,8 +41,8 @@ export class SmartContractScanner extends BaseScanner {
   }
 
   async isAvailable(): Promise<boolean> {
-    // Always available - uses regex-based pattern matching
-    return true;
+    // Check if scanner is enabled in settings
+    return this.config.get<boolean>('scanners.enableSmartContract', true);
   }
 
   async scan(): Promise<ScanResult> {

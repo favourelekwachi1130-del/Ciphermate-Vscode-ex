@@ -82,33 +82,36 @@ export class FixValidator {
   }
 
   /**
-   * Validate fix syntax (ensure it's valid code)
+   * Validate fix syntax (ensure it's valid code).
+   * Use fullFileContent=true when validating the entire file after a replacement.
    */
   async validateSyntax(
     fixedCode: string,
-    language: string
+    language: string,
+    fullFileContent = false
   ): Promise<{ valid: boolean; errors: string[] }> {
     const errors: string[] = [];
+    const code = fixedCode;
 
-    // Basic syntax validation based on language
+    // Always run brace/paren/bracket checks (catches structural errors)
+    const braceResult = this.checkBalancedDelimiters(code);
+    if (!braceResult.valid) {
+      errors.push(...braceResult.errors);
+    }
+
     switch (language.toLowerCase()) {
       case 'javascript':
       case 'typescript':
-        try {
-          // Try to parse as JavaScript/TypeScript
-          // This is a basic check - more sophisticated validation
-          // would use the actual language parser
-          new Function(fixedCode);
-        } catch (error) {
-          if (error instanceof SyntaxError) {
-            errors.push(`Syntax error: ${error.message}`);
-          }
+        // Avoid new Function() - it fails for modules (import/export), 'use strict', etc.
+        // Brace matching above is the main check. Add: no obvious unterminated strings.
+        if (!this.checkUnterminatedStrings(code)) {
+          errors.push('Unterminated string literal');
         }
         break;
 
       case 'json':
         try {
-          JSON.parse(fixedCode);
+          JSON.parse(code);
         } catch (error) {
           if (error instanceof SyntaxError) {
             errors.push(`Invalid JSON: ${error.message}`);
@@ -116,32 +119,70 @@ export class FixValidator {
         }
         break;
 
-      // Add more language-specific validators as needed
+      case 'python':
+        if (!this.checkUnterminatedStrings(code)) {
+          errors.push('Unterminated string literal');
+        }
+        if (/^[\s]*$/.test(code) === false && !this.checkPythonBasicStructure(code)) {
+          errors.push('Python structure may be invalid (indentation or block)');
+        }
+        break;
+
+      case 'php':
+        if (!this.checkUnterminatedStrings(code)) {
+          errors.push('Unterminated string literal');
+        }
+        break;
+
       default:
-        // For unknown languages, perform basic checks
-        const openBraces = (fixedCode.match(/\{/g) || []).length;
-        const closeBraces = (fixedCode.match(/\}/g) || []).length;
-        if (openBraces !== closeBraces) {
-          errors.push('Mismatched braces');
-        }
-
-        const openParens = (fixedCode.match(/\(/g) || []).length;
-        const closeParens = (fixedCode.match(/\)/g) || []).length;
-        if (openParens !== closeParens) {
-          errors.push('Mismatched parentheses');
-        }
-
-        const openBrackets = (fixedCode.match(/\[/g) || []).length;
-        const closeBrackets = (fixedCode.match(/\]/g) || []).length;
-        if (openBrackets !== closeBrackets) {
-          errors.push('Mismatched brackets');
-        }
+        // Rely on brace check from above
+        break;
     }
 
     return {
       valid: errors.length === 0,
       errors
     };
+  }
+
+  private checkBalancedDelimiters(code: string): { valid: boolean; errors: string[] } {
+    const errors: string[] = [];
+    const openBraces = (code.match(/\{/g) || []).length;
+    const closeBraces = (code.match(/\}/g) || []).length;
+    if (openBraces !== closeBraces) errors.push(`Mismatched braces: ${openBraces} '{' vs ${closeBraces} '}'`);
+    const openParens = (code.match(/\(/g) || []).length;
+    const closeParens = (code.match(/\)/g) || []).length;
+    if (openParens !== closeParens) errors.push(`Mismatched parentheses`);
+    const openBrackets = (code.match(/\[/g) || []).length;
+    const closeBrackets = (code.match(/\]/g) || []).length;
+    if (openBrackets !== closeBrackets) errors.push(`Mismatched brackets`);
+    return { valid: errors.length === 0, errors };
+  }
+
+  private checkUnterminatedStrings(code: string): boolean {
+    // Simple heuristic: count " and ' - odd total suggests unterminated
+    let inSingle = false, inDouble = false, escaped = false;
+    for (let i = 0; i < code.length; i++) {
+      const c = code[i];
+      if (escaped) { escaped = false; continue; }
+      if (c === '\\') { escaped = true; continue; }
+      if (c === "'" && !inDouble) inSingle = !inSingle;
+      else if (c === '"' && !inSingle) inDouble = !inDouble;
+    }
+    return !inSingle && !inDouble;
+  }
+
+  private checkPythonBasicStructure(code: string): boolean {
+    // Basic check: no mix of tabs and spaces for indentation
+    const lines = code.split('\n');
+    let seenTabs = false, seenSpaces = false;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const indent = line.match(/^(\s*)/)?.[1] || '';
+      if (indent.includes('\t')) seenTabs = true;
+      if (indent.includes(' ')) seenSpaces = true;
+    }
+    return !(seenTabs && seenSpaces);
   }
 
   /**

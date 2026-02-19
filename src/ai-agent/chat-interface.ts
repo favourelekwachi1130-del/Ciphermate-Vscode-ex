@@ -1,8 +1,19 @@
 import * as vscode from 'vscode';
 import { AIAgentCore, AgentRequest, AgentResponse } from './core';
 import { AgenticCore } from './agentic-core';
+import { getIntentRecognizer } from './intent-recognizer';
 import { CyberAgentAdapter } from './cyber-agent-adapter';
-import { getScanDataService, setLastScanResults, postResultsToWebviewExported } from '../extension';
+import { getScanDataService, setLastScanResults, postResultsToWebviewExported, getLastScanResults } from '../extension';
+import { resolveAtMentions } from '../engine';
+
+// Optional Mastra import - will fail gracefully if packages not installed
+let MastraAdapter: any = null;
+try {
+  MastraAdapter = require('./mastra-adapter').MastraAdapter;
+} catch (error) {
+  // Mastra not available - will use AgenticCore instead
+  console.log('Mastra adapter not available, will use AgenticCore');
+}
 
 /**
  * Conversational Chat Interface - The only UI users need
@@ -25,22 +36,62 @@ export class ChatInterface {
   private agent: AIAgentCore;
   private agenticCore: AgenticCore;
   private cyberAgent: CyberAgentAdapter;
+  private mastraAdapter: any = null;
   private context: vscode.ExtensionContext;
   private messageHistory: Array<{role: 'user' | 'assistant', content: string, timestamp: Date}> = [];
   private useAgenticCore: boolean = true; // Use agentic core by default
   private useCyberAgent: boolean = true; // Use CyberAgent for conversational AI
+  private useMastra: boolean = false; // Use Mastra for memory management (can be enabled via settings)
   private currentSession: ChatSession | null = null;
   private chatSessions: ChatSession[] = [];
   private thinkingSteps: string[] = [];
   private messageHandlerDisposable: vscode.Disposable | undefined;
   private lastProcessedMessage: { text: string; timestamp: number } | null = null;
   private isProcessingMessage: boolean = false;
+  private lastSentMessageForRestore: string | undefined;
 
   constructor(context: vscode.ExtensionContext, agent: AIAgentCore) {
     this.context = context;
     this.agent = agent;
     this.agenticCore = new AgenticCore(context);
     this.cyberAgent = new CyberAgentAdapter(context, { mode: 'base' });
+    
+    // Check if Mastra should be enabled (via settings)
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    this.useMastra = config.get<boolean>('useMastraMemory', false);
+    
+    if (this.useMastra) {
+      if (!MastraAdapter) {
+        console.warn('⚠️ Mastra packages not installed, disabling Mastra memory management');
+        console.warn('⚠️ Falling back to AgenticCore (memory management still works, just manual)');
+        this.useMastra = false;
+        vscode.window.showWarningMessage(
+          'Mastra packages not installed. Memory management will use manual cleanup. Run "npm install" to enable full Mastra support.',
+          'Dismiss'
+        );
+      } else {
+        try {
+          this.mastraAdapter = new MastraAdapter(context);
+          // Defer "enabled" log until first successful agent creation (avoids false positive if Node version incompatible)
+          console.log('Mastra memory management configured (will verify on first use)');
+        } catch (error: any) {
+          console.warn('⚠️ Failed to initialize Mastra adapter:', error?.message || error);
+          console.warn('⚠️ Falling back to AgenticCore (memory management still works, just manual)');
+          this.useMastra = false;
+          this.mastraAdapter = null;
+          const isNodeVersion = error?.message?.includes('22.13') || error?.message?.includes('>=22');
+          if (error?.message?.includes('darwin-arm64') || error?.message?.includes('Cannot find module') || isNodeVersion) {
+            vscode.window.showWarningMessage(
+              isNodeVersion
+                ? 'Mastra requires Node.js 22.13+ but VS Code uses Node 20. Disabling useMastraMemory. Use AgenticCore for memory management.'
+                : 'Mastra native dependencies not available. Memory management will use manual cleanup. Run "npm install" to enable full Mastra support.',
+              'Dismiss'
+            );
+          }
+        }
+      }
+    }
+    
     this.loadChatSessions();
     this.createNewSession();
     
@@ -143,7 +194,23 @@ export class ChatInterface {
    */
   private loadChatSessions(): void {
     try {
-      const saved = this.context.globalState.get<ChatSession[]>('ciphermate.chatSessions', []);
+      const { DiskStorageService } = require('../storage/disk-storage-service');
+      const diskStorage = new DiskStorageService(this.context);
+      
+      // Try disk storage first, fallback to globalState for migration
+      let saved: ChatSession[] = [];
+      if (diskStorage.exists('ciphermate.chatSessions')) {
+        saved = diskStorage.get('ciphermate.chatSessions', []) as ChatSession[];
+      } else {
+        // Migrate from globalState if exists
+        saved = this.context.globalState.get<ChatSession[]>('ciphermate.chatSessions', []);
+        if (saved.length > 0) {
+          diskStorage.update('ciphermate.chatSessions', saved);
+          // Clear from globalState after migration
+          this.context.globalState.update('ciphermate.chatSessions', undefined);
+        }
+      }
+      
       this.chatSessions = saved.map(s => ({
         ...s,
         createdAt: new Date(s.createdAt),
@@ -168,7 +235,10 @@ export class ChatInterface {
       if (this.chatSessions.length > 50) {
         this.chatSessions = this.chatSessions.slice(-50);
       }
-      this.context.globalState.update('ciphermate.chatSessions', this.chatSessions);
+      
+      const { DiskStorageService } = require('../storage/disk-storage-service');
+      const diskStorage = new DiskStorageService(this.context);
+      diskStorage.update('ciphermate.chatSessions', this.chatSessions);
     } catch (error) {
       console.error('Failed to save chat sessions:', error);
     }
@@ -199,13 +269,24 @@ export class ChatInterface {
     const session = this.chatSessions.find(s => s.id === sessionId);
     if (session) {
       this.currentSession = session;
-      this.messageHistory = [...session.messages];
+      this.messageHistory = session.messages.map((m) => ({
+        ...m,
+        timestamp: m.timestamp instanceof Date ? m.timestamp : new Date(m.timestamp as string)
+      }));
       
       if (this.panel) {
+        const messages = session.messages.map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+          timestamp: msg.timestamp instanceof Date ? msg.timestamp.toISOString() : (msg as any).timestamp,
+          messageId: (msg as any).messageId,
+          reference: (msg as any).reference,
+          citations: (msg as any).citations || []
+        }));
         this.panel.webview.postMessage({
           command: 'loadSession',
           session: session,
-          messages: session.messages
+          messages
         });
       }
     }
@@ -276,6 +357,7 @@ export class ChatInterface {
 
   /**
    * Restore messages from messageHistory when webview is recreated
+   * Uses loadSession to clear existing messages first and re-add - prevents duplicates
    */
   private restoreMessages(): void {
     if (!this.panel) {
@@ -285,15 +367,19 @@ export class ChatInterface {
     // Wait for webview to be ready before sending messages
     setTimeout(() => {
       if (this.messageHistory.length > 0) {
-        // Restore all existing messages
+        // Use loadSession to clear + re-add (prevents duplicates from retainContextWhenHidden)
         console.log(`Restoring ${this.messageHistory.length} messages to webview`);
-        this.messageHistory.forEach((msg) => {
-          this.panel?.webview.postMessage({
-            command: 'addMessage',
-            role: msg.role,
-            content: msg.content,
-            timestamp: msg.timestamp.toISOString()
-          });
+        const messages = this.messageHistory.map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+          timestamp: msg.timestamp instanceof Date ? msg.timestamp.toISOString() : (msg as any).timestamp,
+          messageId: (msg as any).messageId,
+          reference: (msg as any).reference,
+          citations: (msg as any).citations || []
+        }));
+        this.panel?.webview.postMessage({
+          command: 'loadSession',
+          messages
         });
       } else {
         // No existing messages, send initial greeting
@@ -304,14 +390,55 @@ export class ChatInterface {
 
   /**
    * Process user message
+   * @param message - The user's message text
+   * @param replyContext - Optional context when replying to a message (replied content + surrounding messages)
+   * @param attachments - Optional image/file attachments (base64 data URLs) for AI vision processing
    */
-  async processUserMessage(message: string): Promise<void> {
+  async processUserMessage(
+    message: string,
+    replyContext?: { repliedToContent: string; repliedToRole: string; contextMessages: Array<{ role: string; content: string }> },
+    attachments?: Array<{ type: string; data: string; mimeType?: string; name?: string }>
+  ): Promise<void> {
     if (!this.panel) {
       this.show();
     }
 
-    // Add user message to chat
-    this.addMessage('user', message);
+    // If reply context provided, build context-enriched message for AI analysis
+    let messageToProcess = message;
+    if (replyContext && replyContext.repliedToContent) {
+      const ctxParts: string[] = [
+        '[Reply context - analyzing the following for your response]:',
+        `Replying to (${replyContext.repliedToRole}): "${replyContext.repliedToContent}"`
+      ];
+      if (replyContext.contextMessages && replyContext.contextMessages.length > 0) {
+        ctxParts.push('Prior conversation context:');
+        replyContext.contextMessages.forEach((m, i) => {
+          ctxParts.push(`  ${i + 1}. ${m.role}: ${m.content.substring(0, 300)}${m.content.length > 300 ? '...' : ''}`);
+        });
+      }
+      ctxParts.push('');
+      ctxParts.push('[User reply]:');
+      messageToProcess = ctxParts.join('\n') + message;
+    }
+
+    // Resolve @file mentions - inject file contents for AI context (Phase 3.1)
+    const { enriched, addedContext } = await resolveAtMentions(messageToProcess);
+    const hasFileContext = addedContext.length > 0;
+    if (hasFileContext) {
+      messageToProcess = enriched;
+    }
+
+    // Add user message to chat - include reply context summary when replying (same as shown in context panel)
+    let messageToDisplay = message;
+    if (replyContext && replyContext.repliedToContent) {
+      const replyLabel = replyContext.repliedToRole === 'assistant' ? 'CipherMate' : 'You';
+      let summary = `Replying to ${replyLabel} (message above)`;
+      if (replyContext.contextMessages && replyContext.contextMessages.length > 0) {
+        summary += ` - ${replyContext.contextMessages.length} prior message(s) for context`;
+      }
+      messageToDisplay = `${summary}\n\n${message}`;
+    }
+    this.addMessage('user', messageToDisplay);
 
     // Check for "who built you" / "who created you" type questions
     const creatorQuestionPatterns = [
@@ -329,6 +456,16 @@ export class ChatInterface {
       return;
     }
 
+    // Check for "what can you do" / "what else can you do" type questions
+    const capabilitiesQuestionPatterns = [
+      /what.*can.*you.*do|what.*else.*can.*you.*do|what.*are.*your.*capabilities|what.*do.*you.*do|tell.*me.*about.*yourself|what.*are.*you/i
+    ];
+    const isCapabilitiesQuestion = capabilitiesQuestionPatterns.some((pattern: RegExp) => pattern.test(message));
+    
+    // For capabilities questions, let CyberAgent handle it with the updated system prompt
+    // The system prompt now includes comprehensive CipherMate capabilities
+    // This ensures the AI responds accurately in context
+
     // Check for casual greetings - let AI handle with warm response, but show thinking
     const greetingPatterns = [
       /^hi$|^hello$|^hey$|^hi!$|^hello!$|^hey!$/i
@@ -343,14 +480,10 @@ export class ChatInterface {
       this.showThinkingStep('Thinking...');
     }
 
-    // Detect security-related requests (use agentic core) or conversational (use CyberAgent)
-    // Define patterns outside try block so they're accessible in catch block
-    const securityRequestPatterns: RegExp[] = [
-      /scan|find|check|analyze|detect|audit/i,
-      /secret|key|password|token|credential/i,
-      /vulnerabilit|dependenc|package/i
-    ];
-    const isSecurityRequest = securityRequestPatterns.some((pattern: RegExp) => pattern.test(message));
+    // Dynamic natural language intent recognition - understands what user wants across many phrasings
+    const intentRecognizer = getIntentRecognizer();
+    const recognizedIntent = intentRecognizer.recognize(message);
+    const isSecurityRequest = intentRecognizer.isSecurityRequest(message);
 
     try {
       // Get current context
@@ -372,7 +505,8 @@ export class ChatInterface {
       const isSmartContractRequest = /smart.?contract|solidity|\.sol|web3|blockchain/i.test(message);
       const isWebSecurityRequest = /web|http|api|endpoint|owasp|xss|sql.?injection/i.test(message);
 
-      if (isSecurityRequest && this.useAgenticCore) {
+      // When @file resolved: analyze the specific file(s) with AI, skip full repo scan
+      if (isSecurityRequest && this.useAgenticCore && !hasFileContext) {
         // Show thinking process
         this.showThinking();
         this.showThinkingStep('Analyzing your request...');
@@ -392,8 +526,54 @@ export class ChatInterface {
         }
         
         try {
-          // Use agentic core - true autonomous agent with tool calling
-          responseText = await this.agenticCore.processRequest(message, workspacePath);
+          // Get citations before processing (will be updated during processing)
+          const messageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          
+          // Mastra 0.24.x has AI SDK v4/v5 model classification conflicts with Ollama.
+          // When Ollama is the provider, use AgenticCore directly to avoid "streamLegacy" / "generateLegacy" ping-pong errors.
+          const workspaceFolders = vscode.workspace.workspaceFolders;
+          const configForProvider = workspacePath && workspaceFolders?.length
+            ? vscode.workspace.getConfiguration('ciphermate', vscode.Uri.file(workspacePath))
+            : vscode.workspace.getConfiguration('ciphermate');
+          const aiProvider = configForProvider.get<string>('ai.provider', 'openrouter');
+          const aiModel = configForProvider.get<string>('ai.model', '') || '';
+          // Skip Mastra for Ollama (connection/model issues) or models known to cause AI SDK v4/v5 conflicts
+          const skipMastraForOllama = aiProvider === 'ollama';
+          const skipMastraForV4Conflict = /openai\.responses|gpt-4o|gpt-4\.1/i.test(aiModel);
+          
+          // Use Mastra adapter if enabled (and not skipped), otherwise fall back to AgenticCore
+          if (this.useMastra && this.mastraAdapter && !skipMastraForOllama && !skipMastraForV4Conflict) {
+            try {
+              // Use Mastra with built-in memory management
+              responseText = await this.mastraAdapter.processRequest(messageToProcess, workspacePath, attachments);
+              const citations = this.mastraAdapter.getCitations();
+              const citationArray = citations && typeof citations === 'string' ? citations.split(' | ').filter(c => c.trim()) : [];
+              this.addMessageWithReference('assistant', responseText, { messageId }, citationArray);
+            } catch (mastraError: any) {
+              const errMsg = mastraError?.message || String(mastraError);
+              console.warn('Mastra adapter failed, falling back to AgenticCore:', errMsg);
+              // Disable Mastra to avoid retrying on every message if it's a persistent issue (Node version, missing deps)
+              if (errMsg.includes('packages not') || errMsg.includes('22.13') || errMsg.includes('>=22') || errMsg.includes('failed to load')) {
+                this.useMastra = false;
+                console.warn('Mastra disabled for this session. Use AgenticCore for memory management.');
+              }
+              // Fallback to AgenticCore
+              responseText = await this.agenticCore.processRequest(messageToProcess, workspacePath, { attachments });
+              const citations = this.agenticCore.getCitations();
+              const citationArray = citations ? citations.split(' | ').filter(c => c.trim()) : [];
+              this.addMessageWithReference('assistant', responseText, { messageId }, citationArray);
+            }
+          } else {
+            // Use agentic core - true autonomous agent with tool calling
+            responseText = await this.agenticCore.processRequest(messageToProcess, workspacePath, { attachments });
+            
+            // Get citations after processing
+            const citations = this.agenticCore.getCitations();
+            const citationArray = citations ? citations.split(' | ').filter(c => c.trim()) : [];
+            
+            // Add message with citations
+            this.addMessageWithReference('assistant', responseText, { messageId }, citationArray);
+          }
         } catch (error) {
           // If AI fails, use fallback - don't show error to user
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -406,7 +586,12 @@ export class ChatInterface {
               errorMessage.includes('API Error') ||
               errorMessage.includes('404') ||
               errorMessage.includes('timeout') ||
-              errorMessage.includes('Channel closed');
+              errorMessage.includes('Channel closed') ||
+              errorMessage.includes('fetch failed') ||
+              errorMessage.includes('ECONNREFUSED') ||
+              errorMessage.includes('Failed to connect to Ollama') ||
+              errorMessage.includes('streamLegacy') ||
+              errorMessage.includes('generateLegacy');
           
           if (isAIProviderError) {
             if (!hasWorkspace) {
@@ -423,30 +608,36 @@ export class ChatInterface {
                 responseText = `I completed the security scan successfully! However, I'm having trouble with the AI service for generating the detailed report.\n\n` +
                   `**Scan Results:**\n` +
                   `- Found ${state.vulnerabilities.length} potential issues\n` +
-                  `- Check the VS Code Problems panel for details\n\n` +
-                  `**To get AI-powered analysis:**\n` +
-                  `- Configure your AI provider in Settings (⚙ icon)\n` +
-                  `- Or pull the model: \`ollama pull deepseek-coder:latest\`\n\n` +
+                  `- Check the View Results panel for details\n\n` +
+                  `**Steps to run a new scan:**\n` +
+                  `1. Press **Ctrl+Shift+P** (Mac: **Cmd+Shift+P**) to open the Command Palette\n` +
+                  `2. Type **CipherMate: Intelligent Scan** or **CipherMate: Scan** and press Enter\n` +
+                  `3. Or say **"scan my repository"** in this chat\n` +
+                  `4. Or open View Results and click **Run Scan**\n\n` +
                   `**Note:** Security scans work independently of AI. The AI is only used for generating detailed reports.`;
               } else {
-                // For workspace requests, provide helpful guidance without showing the error
-                responseText = `I'm ready to help you ${message.toLowerCase()}, but I'm having trouble connecting to the AI service.\n\n` +
-                  `**Quick fixes:**\n` +
-                  `- Make sure your AI provider is configured (Settings ⚙ icon)\n` +
-                  `- If using Ollama, pull the model: \`ollama pull deepseek-coder:latest\`\n` +
-                  `- Or configure a different AI provider\n\n` +
-                  `**Good news:** Your repository scan can still work! The security scanners don't require AI. ` +
-                  `Try running the scan again once your AI provider is set up.`;
+                // For workspace requests, provide helpful guidance with concrete steps
+                responseText = `I'm ready to help, but I'm having trouble connecting to the AI service. Here's how to run a new scan anyway:\n\n` +
+                  `**Steps to run a new scan:**\n` +
+                  `1. Press **Ctrl+Shift+P** (Mac: **Cmd+Shift+P**) to open the Command Palette\n` +
+                  `2. Type **CipherMate: Intelligent Scan** or **CipherMate: Scan** and press Enter\n` +
+                  `3. Or say **"scan my repository"** in this chat\n` +
+                  `4. Results will appear in the View Results panel\n\n` +
+                  `**To fix the AI connection:**\n` +
+                  `- Open Settings (⚙ icon) and set **ciphermate.ai.provider** to **openrouter** (free tier)\n` +
+                  `- Add your OpenRouter API key in Settings\n` +
+                  `- The security scanners work without AI; AI is only used for detailed reports.`;
               }
             }
           } else {
             // Other errors - still provide helpful message
             if (!hasWorkspace) {
               responseText = this.getNoWorkspaceFallbackMessage(message);
-            } else {
-              responseText = `I encountered an issue while processing your request. Please try again. If the problem persists, check your AI provider configuration in Settings.`;
+          } else {
+            responseText = `I encountered an issue while processing your request. Please try again. If the problem persists, check your AI provider configuration in Settings.`;
             }
           }
+          this.addMessageWithReference('assistant', responseText);
         }
         
         // Clear thinking and show final result
@@ -478,48 +669,52 @@ export class ChatInterface {
             const workspaceFolders = vscode.workspace.workspaceFolders;
             const workspacePath = workspaceFolders?.[0]?.uri.fsPath || '';
             
-            if (scanDataService && workspacePath) {
-              // Convert vulnerabilities to the format expected by scanDataService
-              const vulnerabilities = vulnerabilitiesToSave.map((v: any) => ({
+            // Convert to format expected by View Results panel (path, start.line, extra.message)
+            const vulnerabilities = vulnerabilitiesToSave.map((v: any) => {
+              const path = v.path || v.file || v.location?.file || '';
+              const line = v.line || v.start?.line || v.location?.line || 0;
+              const msg = v.message || v.description || v.title || 'Security Issue';
+              return {
                 ...v,
                 tool: v.tool || v.scanner || 'AgenticCore',
-                path: v.path || v.file || v.location?.file || '',
-                line: v.line || v.start?.line || v.location?.line || 0,
-                severity: v.severity || 'medium',
-                title: v.title || v.message || 'Security Issue',
-                description: v.description || v.message || '',
+                path,
+                start: { line },
+                extra: { message: msg },
+                line,
+                severity: (v.severity || 'medium').toUpperCase(),
+                title: v.title || msg,
+                description: v.description || msg,
                 type: v.type || v.check_id || v.rule || 'Unknown'
-              }));
-              
-              // Update lastScanResults
-              setLastScanResults(vulnerabilities);
-              
-              // Save to database
+              };
+            });
+            
+            // Always update View Results panel - critical for pipeline
+            setLastScanResults(vulnerabilities);
+            // Open dashboard first so postResultsToWebview has a panel to send to
+            await vscode.commands.executeCommand('ciphermate.showResults');
+            await postResultsToWebviewExported();
+            console.log('AgenticCore: Results sent to View Results panel', { count: vulnerabilities.length });
+            
+            if (scanDataService && workspacePath) {
               await scanDataService.saveScan({
                 scanType: 'AgenticCore Scan',
                 workspacePath,
                 vulnerabilities: vulnerabilities,
-                duration: state.scanDuration || 0,
+                duration: (state as any).scanDuration || 0,
                 timestamp: new Date(),
                 metadata: { 
                   scanner: 'agentic-core',
                   scanResult: state.scanResults ? JSON.stringify(state.scanResults) : undefined
                 }
               });
-              
-              console.log('AgenticCore: Scan results saved to database', { 
-                vulnerabilityCount: vulnerabilities.length 
-              });
-              
-              // Update results dashboard
-              await postResultsToWebviewExported();
-              console.log('AgenticCore: Results dashboard updated');
+              console.log('AgenticCore: Scan results saved to database');
             }
           } catch (error) {
             console.error('AgenticCore: Failed to save scan results', error);
-            // Don't show error to user, just log it
           }
         }
+        // Security path: message already added in try block above - do NOT fall through to common add (would duplicate)
+        return;
       } else {
         // Use CyberAgent for conversational responses (regular human communication)
         // Set mode based on request type
@@ -531,12 +726,17 @@ export class ChatInterface {
           this.cyberAgent.setMode('base');
         }
 
-        // For regular human communication, use the message as-is
-        // Only add workspace context if it's relevant to the conversation
-        const needsWorkspaceContext = /code|file|project|repository|workspace/i.test(message);
-        const contextMessage = (workspacePath && needsWorkspaceContext)
-          ? `${message}\n\nContext: Working in repository at ${workspacePath}`
-          : message;
+        // For regular human communication: inject scan + conversation context so the AI has continuity
+        // (e.g. "is my security report bad?" after a scan - AI needs to know about the scan results)
+        const conversationContext = this.getConversationContextForAI();
+        const needsWorkspaceContext = /code|file|project|repository|workspace/i.test(messageToProcess);
+        let contextMessage = messageToProcess;
+        if (conversationContext) {
+          contextMessage = conversationContext + messageToProcess;
+        }
+        if (workspacePath && needsWorkspaceContext) {
+          contextMessage += `\n\n[Context: Working in repository at ${workspacePath}]`;
+        }
 
         // Show thinking for conversational requests
         this.showThinkingStep('Thinking...');
@@ -559,6 +759,10 @@ export class ChatInterface {
           console.log('ChatInterface: CyberAgent response received successfully, length:', responseText?.length);
           console.log('ChatInterface: Response preview:', responseText?.substring(0, 100));
           this.clearThinking();
+          
+          // Add message (regular conversation, no citations needed)
+          this.addMessage('assistant', responseText);
+          return; // Exit early since we've added the message
         } catch (chatError) {
           const chatErrorMessage = chatError instanceof Error ? chatError.message : String(chatError);
           console.log('CyberAgent chat failed:', chatErrorMessage);
@@ -608,18 +812,16 @@ export class ChatInterface {
             responseText += `\n**Good news:** Security scans work independently of AI! `;
             responseText += `Try asking "scan my repository" - it should work even without AI configured.`;
           } else {
-            // Generic error - provide helpful conversational response
-            responseText = `I encountered an issue while processing your request. ` +
-              `This might be due to AI provider configuration or network issues.\n\n` +
-              `**What I can help with:**\n` +
-              `- General questions and conversation (when AI is configured)\n` +
-              `- Security scans: "scan my repository" (works without AI)\n` +
-              `- Finding secrets: "find hardcoded secrets"\n` +
-              `- Checking dependencies: "check dependencies"\n` +
-              `- Smart contract analysis: "scan smart contracts"\n\n` +
-              `**To enable full conversational support:**\n` +
-              `Configure your AI provider in Settings (⚙ icon). ` +
-              `Security features work independently and don't require AI configuration.`;
+            // Generic error - include actual error for debugging, suggest fixes
+            const sanitizedError = chatErrorMessage.length > 300 ? chatErrorMessage.substring(0, 300) + '...' : chatErrorMessage;
+            responseText = `I encountered an issue while processing your request.\n\n` +
+              `**Error details:** \`${sanitizedError}\`\n\n` +
+              `**Common fixes:**\n` +
+              `- **OpenRouter users:** Try \`openrouter/free\` in Settings → AI Providers (free, auto-selects models)\n` +
+              `- **401/Invalid key:** Re-enter your API key in Settings\n` +
+              `- **402/Credits:** Your API credits may be exhausted; add credits or switch to a free model\n` +
+              `- **Network:** Check if you can reach https://openrouter.ai in a browser\n\n` +
+              `**What works without AI:** "scan my repository", "find hardcoded secrets", "check dependencies"`;
           }
         }
       }
@@ -627,10 +829,16 @@ export class ChatInterface {
       // Hide thinking indicator (if not already hidden)
       this.hideThinking();
 
-      // Add agent response
-      console.log('ChatInterface: About to add assistant message, responseText length:', responseText?.length);
-      this.addMessage('assistant', responseText);
-      console.log('ChatInterface: Assistant message added to chat');
+      // Add agent response (only if not already added by early return)
+      // Check if message was already added in the try block
+      if (responseText) {
+        console.log('ChatInterface: About to add assistant message, responseText length:', responseText?.length);
+        // Get citations if available
+        const citations = this.agenticCore?.getCitations?.() || '';
+        const citationArray = citations ? citations.split(' | ').filter(c => c.trim()) : [];
+        this.addMessageWithReference('assistant', responseText, undefined, citationArray);
+        console.log('ChatInterface: Assistant message added to chat');
+      }
 
       } catch (error) {
         this.hideThinking();
@@ -641,7 +849,7 @@ export class ChatInterface {
         console.log('Error caught in chat interface:', errorMessage);
         
         // Determine if this was a security request or regular conversation
-        const wasSecurityRequest = securityRequestPatterns.some((pattern: RegExp) => pattern.test(message));
+        const wasSecurityRequest = getIntentRecognizer().isSecurityRequest(message);
         
         // Check if it's an AI provider error - provide helpful guidance
         if (errorMessage.includes('All AI providers failed') || 
@@ -690,41 +898,96 @@ export class ChatInterface {
           }
           
           if (wasSecurityRequest) {
-          helpfulMessage += `**Good news:** Security scans don't require AI! They work independently. `;
-          helpfulMessage += `Try asking "scan my repository" - it should work even without AI configured.`;
+            helpfulMessage += `**Steps to run a new scan:**\n`;
+            helpfulMessage += `1. Press **Ctrl+Shift+P** (Mac: **Cmd+Shift+P**) and run **CipherMate: Intelligent Scan**\n`;
+            helpfulMessage += `2. Or say **"scan my repository"** in this chat\n`;
+            helpfulMessage += `3. Or open View Results and click **Run Scan**\n\n`;
+            helpfulMessage += `Security scans work independently of AI - they'll produce results even without AI configured.`;
           } else {
             helpfulMessage += `**Note:** Security scans (like "scan my repository") work independently of AI and don't require configuration.`;
           }
           
           this.addMessage('assistant', helpfulMessage);
         } else {
-          // Other errors - provide helpful message based on request type
+          // Other errors - include actual error for debugging, add OpenRouter-specific tips
+          const sanitizedError = errorMessage.length > 250 ? errorMessage.substring(0, 250) + '...' : errorMessage;
+          const openRouterTips = `**Common fixes:**\n` +
+            `- **OpenRouter:** Use \`openrouter/free\` in Settings → AI Providers → OpenRouter Model (free tier)\n` +
+            `- **401:** Re-enter your API key in Settings\n` +
+            `- **402:** API credits exhausted; switch to a free model or add credits\n` +
+            `- **Network:** Verify you can reach https://openrouter.ai in a browser\n\n`;
           if (wasSecurityRequest) {
           this.addMessage('assistant', 
               `I encountered an issue while processing your security request.\n\n` +
-            `**Try asking:**\n` +
-            `- "scan my repository" (works without AI)\n` +
-            `- "find hardcoded secrets"\n` +
-            `- "check dependencies"\n\n` +
+              `**Error:** \`${sanitizedError}\`\n\n` +
+              `**Try asking:**\n` +
+              `- "scan my repository" (works without AI)\n` +
+              `- "find hardcoded secrets"\n` +
+              `- "check dependencies"\n\n` +
+              openRouterTips +
               `Or configure your AI provider in Settings (⚙ icon) for detailed AI-powered analysis.`
             );
           } else {
             this.addMessage('assistant', 
-              `I encountered an issue while processing your request. ` +
-              `This might be due to AI provider configuration or network issues.\n\n` +
+              `I encountered an issue while processing your request.\n\n` +
+              `**Error:** \`${sanitizedError}\`\n\n` +
               `**What I can help with:**\n` +
               `- General questions and conversation (when AI is configured)\n` +
               `- Security scans: "scan my repository" (works without AI)\n` +
               `- Finding secrets: "find hardcoded secrets"\n` +
               `- Checking dependencies: "check dependencies"\n` +
               `- Smart contract analysis: "scan smart contracts"\n\n` +
-              `**To enable full conversational support:**\n` +
+              openRouterTips +
               `Configure your AI provider in Settings (⚙ icon). ` +
               `Security features work independently and don't require AI configuration.`
             );
           }
         }
       }
+  }
+
+  /**
+   * Build conversation context for AI - scan results + recent messages.
+   * Injects into the prompt so the AI has continuity (e.g. "is my security report bad?" after a scan).
+   */
+  private getConversationContextForAI(): string {
+    const parts: string[] = [];
+    const state = this.agenticCore.getState();
+    const vulns = state.vulnerabilities || state.scanResults || [];
+
+    // Scan context: if we have recent scan results, summarize for the AI
+    if (vulns.length > 0) {
+      const bySev: Record<string, number> = {};
+      const types = new Set<string>();
+      for (const v of vulns) {
+        const s = (v.severity || 'medium').toLowerCase();
+        bySev[s] = (bySev[s] || 0) + 1;
+        const t = v.type || v.title || v.message || 'issue';
+        types.add(typeof t === 'string' ? t : 'issue');
+      }
+      const sevLine = Object.entries(bySev)
+        .map(([s, n]) => `${s}: ${n}`)
+        .join(', ');
+      const typeSample = Array.from(types).slice(0, 6).join(', ');
+      parts.push(
+        `[Recent scan context: User ran a security scan. Found ${vulns.length} vulnerabilities (${sevLine}). ` +
+        `Finding types include: ${typeSample}. Use this when they ask about the report, results, or whether things look bad.]`
+      );
+    }
+
+    // Recent conversation: last few messages so the AI knows what was just discussed
+    const recent = this.messageHistory.slice(-6);
+    if (recent.length > 0) {
+      const lines = recent.map(m => {
+        const role = m.role === 'user' ? 'User' : 'CipherMate';
+        const content = m.content.length > 400 ? m.content.substring(0, 400) + '...' : m.content;
+        return `  ${role}: ${content.replace(/\n/g, ' ')}`;
+      });
+      parts.push('[Recent conversation for context:\n' + lines.join('\n') + ']');
+    }
+
+    if (parts.length === 0) return '';
+    return parts.join('\n\n') + '\n\n';
   }
 
   /**
@@ -761,12 +1024,35 @@ export class ChatInterface {
    * Made public to allow external components (like AgenticCore) to send messages
    */
   public addMessage(role: 'user' | 'assistant', content: string): void {
-    console.log('ChatInterface: addMessage() called', { role, contentLength: content?.length });
+    this.addMessageWithReference(role, content);
+  }
 
+  /**
+   * Add a message with reference data (for reply/reference functionality)
+   */
+  public addMessageWithReference(
+    role: 'user' | 'assistant',
+    content: string,
+    reference?: {
+      messageId: string;
+      filePath?: string;
+      line?: number;
+      type?: 'analysis' | 'adjustment';
+      data?: any;
+    },
+    citations?: string[]
+  ): void {
+    console.log('ChatInterface: addMessageWithReference() called', { role, contentLength: content?.length, hasReference: !!reference, citationsCount: citations?.length });
+
+    const messageId = reference?.messageId || `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
     const message = {
       role,
       content,
-      timestamp: new Date()
+      timestamp: new Date(),
+      messageId,
+      reference,
+      citations: citations || []
     };
 
     this.messageHistory.push(message);
@@ -801,10 +1087,51 @@ export class ChatInterface {
         command: 'addMessage',
         role,
         content,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        messageId,
+        reference,
+        citations: citations || []
       });
     } else {
       console.error('ChatInterface: Cannot add message - panel is null');
+    }
+  }
+
+  /**
+   * Update citations for a message (for dynamic citation display)
+   */
+  public updateCitations(messageId: string, citations: string[]): void {
+    if (this.panel) {
+      this.panel.webview.postMessage({
+        command: 'updateCitations',
+        messageId,
+        citations
+      });
+    }
+  }
+
+  /**
+   * Show citations during thinking process (appears dynamically)
+   */
+  public showThinkingCitations(citations: string[]): void {
+    if (this.panel && citations.length > 0) {
+      this.panel.webview.postMessage({
+        command: 'showThinkingCitations',
+        citations
+      });
+    }
+  }
+
+  /**
+   * Show action taken during thinking process (appears dynamically)
+   */
+  public showThinkingAction(action: string, details?: string): void {
+    if (this.panel) {
+      this.panel.webview.postMessage({
+        command: 'showThinkingAction',
+        action,
+        details
+      });
     }
   }
 
@@ -904,8 +1231,10 @@ export class ChatInterface {
           }
           return;
         } else if (message.command === 'sendMessage') {
-          const messageText = message.text?.trim();
-          console.log('ChatInterface: Processing sendMessage with text:', messageText);
+          const messageText = message.text?.trim() || '';
+          const replyContext = message.replyContext as { repliedToContent: string; repliedToRole: string; contextMessages: Array<{ role: string; content: string }> } | undefined;
+          const attachments = (message.attachments || []) as Array<{ type: string; data: string; mimeType?: string; name?: string }>;
+          console.log('ChatInterface: Processing sendMessage with text:', messageText, 'attachments:', attachments.length, 'replyContext:', !!replyContext);
 
           // Prevent duplicate message processing
           const now = Date.now();
@@ -928,14 +1257,36 @@ export class ChatInterface {
             this.currentSession!.messages = [...this.messageHistory];
           }
 
-          // Mark as processing and save last message
+          // Mark as processing and save last message (for stop/restore)
           this.isProcessingMessage = true;
           this.lastProcessedMessage = { text: messageText, timestamp: now };
+          this.lastSentMessageForRestore = messageText;
 
           try {
-            await this.processUserMessage(messageText);
+            await this.processUserMessage(messageText, replyContext, attachments);
           } finally {
             this.isProcessingMessage = false;
+            this.lastSentMessageForRestore = undefined;
+          }
+        } else if (message.command === 'stopMessage') {
+          // Stop processing and return message to input for editing
+          if (this.isProcessingMessage && this.lastSentMessageForRestore) {
+            this.isProcessingMessage = false;
+            // Remove the user message we just added (since we're undoing the send)
+            if (this.messageHistory.length > 0 && this.messageHistory[this.messageHistory.length - 1].role === 'user') {
+              this.messageHistory.pop();
+              if (this.currentSession) {
+                this.currentSession.messages = [...this.messageHistory];
+                this.saveChatSessions();
+              }
+            }
+            this.panel?.webview.postMessage({
+              command: 'restoreMessageToInput',
+              message: this.lastSentMessageForRestore
+            });
+            this.hideThinking();
+            this.clearThinking();
+            this.lastSentMessageForRestore = undefined;
           }
         } else if (message.command === 'clearChat') {
           this.messageHistory = [];
@@ -944,6 +1295,12 @@ export class ChatInterface {
           this.cyberAgent.clearHistory();
           this.panel?.webview.postMessage({ command: 'clearMessages' });
           this.addMessage('assistant', 'Chat cleared. How can I help secure your code?');
+        } else if (message.command === 'codingModelChanged') {
+          const config = vscode.workspace.getConfiguration('ciphermate');
+          await config.update('ai.codingModel', message.model, vscode.ConfigurationTarget.Global);
+          // Update AgenticCore's provider model for subsequent coding requests
+          this.agenticCore.updateCodingModel?.(message.model);
+          vscode.window.showInformationMessage(`Coding model set to ${message.model}`);
         } else if (message.command === 'openSettings') {
           vscode.commands.executeCommand('ciphermate.advancedSettings');
         } else if (message.command === 'showResults') {
@@ -970,19 +1327,28 @@ export class ChatInterface {
           // Switch to welcome mode
           this.panel?.webview.postMessage({ command: 'switchToWelcome' });
         } else if (message.command === 'restoreChat') {
-          // Restore chat messages when user clicks "Continue Chat"
-          // Ensure current session exists and sync messageHistory with session
-          if (!this.currentSession && this.messageHistory.length > 0) {
-            // Create session from existing messages
-            this.createNewSession();
+          // Restore to most recent session when user clicks "Continue Chat"
+          // Prioritize sessions with fixes/scan results (most recently updated)
+          const sessions = this.getChatSessions();
+          if (sessions.length > 0) {
+            const mostRecent = sessions[0];
+            this.currentSession = mostRecent;
+            this.messageHistory = mostRecent.messages.map((m) => ({
+              ...m,
+              timestamp: m.timestamp instanceof Date ? m.timestamp : new Date(m.timestamp as string)
+            }));
+            this.loadSession(mostRecent.id);
+          } else if (this.messageHistory.length > 0) {
+            if (!this.currentSession) {
+              this.createNewSession();
+            }
+            if (this.currentSession) {
+              this.currentSession.messages = [...this.messageHistory];
+              this.currentSession.updatedAt = new Date();
+              this.saveChatSessions();
+            }
+            this.restoreMessages();
           }
-          if (this.currentSession && this.messageHistory.length > 0) {
-            // Sync session with current messageHistory
-            this.currentSession.messages = [...this.messageHistory];
-            this.currentSession.updatedAt = new Date();
-            this.saveChatSessions();
-          }
-          this.restoreMessages();
         } else if (message.command === 'getMessageCount') {
           // Send message count to show/hide continue chat button
           this.panel?.webview.postMessage({
@@ -1075,6 +1441,20 @@ export class ChatInterface {
   }
 
   private getChatHtml(): string {
+    const config = vscode.workspace.getConfiguration('ciphermate');
+    const currentCodingModel = config.get<string>('ai.codingModel', 'anthropic/claude-sonnet-4');
+    const codingModels = [
+      { id: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4' },
+      { id: 'openrouter/free', label: 'OpenRouter Free (free tier)' },
+      { id: 'deepseek/deepseek-chat-v3', label: 'DeepSeek V3 (budget)' },
+      { id: 'openai/gpt-4o', label: 'GPT-4o (balanced)' },
+      { id: 'openai/gpt-4-turbo', label: 'GPT-4 Turbo' },
+      { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+      { id: 'meta-llama/llama-3.1-70b-instruct', label: 'Llama 3.1 70B' },
+    ];
+    const codingModelOptions = codingModels.map(m =>
+      `<option value="${m.id}" ${m.id === currentCodingModel ? 'selected' : ''}>${m.label}</option>`
+    ).join('');
     // Load the cm 3.jpg logo (will be styled grey with no background)
     const logoJpgUri = this.panel?.webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'images', 'cm 3.png')
@@ -1525,6 +1905,83 @@ export class ChatInterface {
             display: flex;
             gap: 12px;
             max-width: 85%;
+            position: relative;
+            padding: 4px 0;
+        }
+
+        /* Tool-like styling - more compact, professional */
+        .message-content {
+            background: var(--vscode-editor-background) !important;
+            border: 1px solid var(--vscode-panel-border) !important;
+            border-radius: 6px !important;
+            padding: 10px 14px !important;
+            font-family: var(--vscode-editor-font-family) !important;
+            font-size: var(--vscode-editor-font-size) !important;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .message.user .message-content {
+            background: var(--vscode-button-background) !important;
+            color: var(--vscode-button-foreground) !important;
+            border-color: var(--vscode-button-border) !important;
+        }
+
+        /* Citations - tool-like, appears dynamically */
+        .message-citations {
+            margin-top: 6px;
+            padding: 6px 10px;
+            background: var(--vscode-textBlockQuote-background);
+            border-left: 2px solid var(--vscode-textLink-foreground);
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            font-family: var(--vscode-editor-font-family);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            max-height: 0;
+            overflow: hidden;
+        }
+
+        .message-citations.show {
+            opacity: 1;
+            max-height: 100px;
+            margin-top: 8px;
+        }
+
+        .message-citations strong {
+            color: var(--vscode-textLink-foreground);
+            margin-right: 6px;
+        }
+
+        /* Message actions - tool buttons */
+        .message-actions {
+            display: flex;
+            gap: 4px;
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .message:hover .message-actions {
+            opacity: 1;
+        }
+
+        .message-action-btn {
+            background: var(--vscode-button-secondaryBackground) !important;
+            color: var(--vscode-button-secondaryForeground) !important;
+            border: 1px solid var(--vscode-button-border) !important;
+            border-radius: 4px !important;
+            padding: 4px 8px !important;
+            font-size: 12px !important;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .message-action-btn:hover {
+            background: var(--vscode-button-secondaryHoverBackground) !important;
+            transform: scale(1.05);
         }
 
         .message.user {
@@ -1772,13 +2229,13 @@ export class ChatInterface {
 
         .thinking {
             display: none;
+            flex-direction: column;
             padding: 16px 20px;
             background: var(--vscode-input-background);
             border: 1px solid var(--vscode-panel-border);
             border-left: 3px solid var(--vscode-textLink-foreground);
             margin: 8px 0;
-            align-items: center;
-            gap: 12px;
+            gap: 8px;
             font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
             font-size: 13px;
             color: var(--vscode-foreground);
@@ -1790,6 +2247,69 @@ export class ChatInterface {
             display: flex !important;
             opacity: 1 !important;
             visibility: visible !important;
+        }
+
+        .thinking-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .thinking-citations {
+            display: none;
+            margin-top: 4px;
+            padding: 8px 12px;
+            background: var(--vscode-textBlockQuote-background);
+            border-left: 3px solid var(--vscode-textLink-foreground);
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            transition: opacity 0.3s;
+        }
+
+        .thinking-citations.show {
+            display: block;
+            opacity: 1;
+        }
+
+        .thinking-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-top: 4px;
+        }
+
+        .thinking-action {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 6px 10px;
+            background: var(--vscode-textBlockQuote-background);
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .thinking-action-icon {
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        .thinking-action-text {
+            flex: 1;
+        }
+
+        .thinking-action-details {
+            font-size: 10px;
+            opacity: 0.7;
+            margin-left: 20px;
+            margin-top: 2px;
         }
 
         .thinking-gear {
@@ -1882,10 +2402,14 @@ export class ChatInterface {
         .input-wrapper {
             flex: 1;
             position: relative;
+            display: flex;
+            align-items: center;
+            gap: 4px;
         }
 
         #messageInput {
-            width: 100%;
+            flex: 1;
+            min-width: 0;
             padding: 10px 16px;
             background: var(--vscode-input-background);
             color: var(--vscode-input-foreground);
@@ -1999,6 +2523,14 @@ export class ChatInterface {
     <script>
         // DIAGNOSTIC: Immediate DOM check before any other scripts
         (function() {
+            // Acquire VS Code API once (can only be called once per document) and share via window
+            try {
+                window.__ciphermateVscodeApi = typeof acquireVsCodeApi !== 'undefined' ? acquireVsCodeApi() : null;
+            } catch (e) {
+                window.__ciphermateVscodeApi = null;
+            }
+            const api = window.__ciphermateVscodeApi;
+
             const runDiagnostic = function() {
                 const diagnostic = {
                     timestamp: new Date().toISOString(),
@@ -2026,26 +2558,23 @@ export class ChatInterface {
                 console.log('=== CIPHERMATE WEBVIEW DIAGNOSTIC ===');
                 console.log(JSON.stringify(diagnostic, null, 2));
 
-                // Send to extension host
                 try {
-                    const vscode = acquireVsCodeApi();
-                    vscode.postMessage({
-                        command: 'diagnostic',
-                        data: diagnostic
-                    });
+                    if (api && typeof api.postMessage === 'function') {
+                        api.postMessage({
+                            command: 'diagnostic',
+                            data: diagnostic
+                        });
+                    }
                 } catch (e) {
                     console.error('Failed to send diagnostic:', e);
                 }
             };
 
-            // Run diagnostic after DOM is fully loaded
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', runDiagnostic);
             } else {
                 runDiagnostic();
             }
-
-            // Also run after a short delay to catch any async issues
             setTimeout(runDiagnostic, 500);
         })();
     </script>
@@ -2092,6 +2621,9 @@ export class ChatInterface {
             <div class="welcome-quick-actions">
                 <div class="quick-action" data-action="scan my repository">Scan Repository</div>
                 <div class="quick-action" data-action="find hardcoded secrets">Find Secrets</div>
+                <div class="quick-action" data-action="scan infrastructure as code">Scan IaC</div>
+                <div class="quick-action" data-action="scan containers">Scan Containers</div>
+                <div class="quick-action" data-action="run pentest">Run Pentest</div>
                 <div class="quick-action" data-action="scan smart contracts">Scan Contracts</div>
                 <div class="quick-action" data-action="check dependencies">Check Dependencies</div>
                 <div class="quick-action" data-action="fix vulnerabilities">Fix Vulnerabilities</div>
@@ -2125,19 +2657,35 @@ export class ChatInterface {
 
     <div class="messages" id="messages">
         <div class="thinking" id="thinking">
-            <div class="thinking-gear">
-                <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/>
-                </svg>
+            <div class="thinking-header">
+                <div class="thinking-gear">
+                    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/>
+                    </svg>
+                </div>
+                <span class="thinking-text">Processing<span class="thinking-dots">...</span></span>
             </div>
-            <span class="thinking-text">Processing<span class="thinking-dots">...</span></span>
+            <div class="thinking-citations" id="thinkingCitations"></div>
+            <div class="thinking-actions" id="thinkingActions"></div>
         </div>
     </div>
 
     <div class="input-area">
+        <div id="replyContextPanel" style="display: none; margin-bottom: 8px; padding: 10px 12px; background: var(--vscode-textBlockQuote-background); border-left: 4px solid var(--vscode-textLink-foreground); border-radius: 4px; font-size: 12px; color: var(--vscode-descriptionForeground);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <strong>Replying with context</strong>
+                <button id="cancelReplyBtn" type="button" style="background: transparent; border: none; cursor: pointer; color: var(--vscode-foreground); font-size: 11px;">Cancel</button>
+            </div>
+            <div id="replyContextSummary" style="max-height: 60px; overflow-y: auto;"></div>
+        </div>
         <form id="chatForm">
+        <div id="attachmentPreview" style="display: none; margin-bottom: 8px; padding: 8px; background: var(--vscode-textBlockQuote-background); border-radius: 4px; flex-wrap: wrap; gap: 8px; align-items: center;"></div>
         <div class="input-container">
             <div class="input-wrapper">
+                    <input type="file" id="attachmentInput" accept="image/*,.png,.jpg,.jpeg,.gif,.webp" multiple style="display: none;" />
+                    <button type="button" id="attachmentButton" aria-label="Attach image" title="Attach image for AI analysis" style="background: transparent; border: none; padding: 6px 8px; cursor: pointer; color: var(--vscode-foreground); opacity: 0.8;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" xmlns="http://www.w3.org/2000/svg"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                    </button>
                     <input 
                         type="text"
                     id="messageInput" 
@@ -2145,14 +2693,26 @@ export class ChatInterface {
                         autocomplete="off"
                     />
             </div>
+                <button id="stopButton" type="button" aria-label="Stop and return message to input" title="Stop reply process and return message to input for editing" style="display: none; padding: 8px 12px; background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-button-border); border-radius: 4px; cursor: pointer; font-size: 12px; align-items: center; color: var(--vscode-button-foreground);">
+                <span style="font-size: 14px;">⏹ Stop</span>
+            </button>
                 <button id="sendButton" type="submit" aria-label="Send message">
                 <span style="font-size: 18px;">→</span>
             </button>
         </div>
         </form>
+        <div class="coding-model-selector" style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 12px; color: var(--vscode-descriptionForeground);">
+            <label for="codingModelSelect">Coding model:</label>
+            <select id="codingModelSelect" style="flex: 1; max-width: 280px; padding: 6px 8px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); font-size: 12px;">
+                ${codingModelOptions}
+            </select>
+        </div>
         <div class="quick-actions">
             <div class="quick-action" data-action="scan my repository">Scan Repository</div>
             <div class="quick-action" data-action="find hardcoded secrets">Find Secrets</div>
+            <div class="quick-action" data-action="scan infrastructure as code">Scan IaC</div>
+            <div class="quick-action" data-action="scan containers">Scan Containers</div>
+            <div class="quick-action" data-action="run pentest">Run Pentest</div>
             <div class="quick-action" data-action="scan smart contracts">Scan Contracts</div>
             <div class="quick-action" data-action="check dependencies">Check Dependencies</div>
             <div class="quick-action" data-action="fix vulnerabilities">Fix Vulnerabilities</div>
@@ -2161,17 +2721,16 @@ export class ChatInterface {
     </div>
 
     <script>
-        // Acquire VS Code API once at the top level (can only be called once)
-        let vscode = null;
-        try {
-            if (typeof acquireVsCodeApi !== 'undefined') {
-                vscode = acquireVsCodeApi();
-                console.log('=== VS Code API acquired successfully ===');
-            } else {
-                console.error('=== ERROR: acquireVsCodeApi is not available ===');
-            }
-        } catch (e) {
-            console.error('=== ERROR: Failed to acquire VS Code API:', e, '===');
+        // Backslash constant for building regex strings (avoids template literal double-escaping)
+        var BS = String.fromCharCode(92);
+        var NL = String.fromCharCode(10);
+
+        // Use shared API from first script (acquireVsCodeApi can only be called once per document)
+        var vscode = window.__ciphermateVscodeApi || null;
+        if (vscode) {
+            console.log('=== VS Code API available (shared) ===');
+        } else {
+            console.warn('=== VS Code API not yet available ===');
         }
         
         // Helper function to send errors to extension host
@@ -2251,7 +2810,16 @@ export class ChatInterface {
             const useOwnModel = document.getElementById('useOwnModel');
             const continueChatBtn = document.getElementById('continueChat');
             const backButton = document.getElementById('backButton');
+            const codingModelSelect = document.getElementById('codingModelSelect');
             const body = document.body;
+            
+            if (codingModelSelect) {
+                codingModelSelect.addEventListener('change', function() {
+                    if (vscode && typeof vscode.postMessage === 'function') {
+                        vscode.postMessage({ command: 'codingModelChanged', model: codingModelSelect.value });
+                    }
+                });
+            }
             
             console.log('=== Elements found ===');
             console.log('messagesContainer:', !!messagesContainer, messagesContainer);
@@ -2354,12 +2922,13 @@ export class ChatInterface {
                 var target = e.target;
 
                 // Handle quick action clicks (both welcome screen and chat mode)
-                if (target.classList && target.classList.contains('quick-action')) {
+                var quickActionEl = target.closest ? target.closest('.quick-action') : (target.classList && target.classList.contains('quick-action') ? target : null);
+                if (quickActionEl) {
                     e.preventDefault();
                     e.stopPropagation();
-                    var actionText = target.getAttribute('data-action');
+                    var actionText = quickActionEl.getAttribute('data-action');
                     console.log('[DELEGATE] Quick action clicked via delegation:', actionText);
-                    handleQuickActionClick(target, actionText);
+                    handleQuickActionClick(quickActionEl, actionText);
                     return;
                 }
 
@@ -2454,8 +3023,8 @@ export class ChatInterface {
                 }
             }
 
-            // Mode switching guard to prevent rapid/duplicate mode switches
-            let isModeSwitching = false;
+            // Mode switching guard to prevent rapid/duplicate mode switches (var for hoisting)
+            var isModeSwitching = false;
 
             function switchToWelcomeMode() {
             console.log('[MODE] ========================================');
@@ -2578,7 +3147,7 @@ export class ChatInterface {
         function setupWelcomeScreenButtons() {
             console.log('[SETUP] ========================================');
             console.log('[SETUP] setupWelcomeScreenButtons() CALLED');
-            console.log('[SETUP] Event delegation handles button clicks - only setting up form handlers');
+            console.log('[SETUP] Setting up form handlers and direct click handlers for quick actions');
             console.log('[SETUP] ========================================');
 
             // Get references to form elements only - buttons are handled by event delegation
@@ -2587,11 +3156,23 @@ export class ChatInterface {
             const sendButtonMain = document.getElementById('sendButtonMain');
             const welcomeForm = document.getElementById('welcomeForm');
 
-            // Just set cursor style for quick actions (no event handlers - delegation handles clicks)
+            // Direct click handlers for welcome quick actions (fallback when delegation fails)
             if (welcomeQuickActions && welcomeQuickActions.length > 0) {
-                console.log('[SETUP] Found', welcomeQuickActions.length, 'welcome quick action buttons - setting cursor style only');
+                console.log('[SETUP] Found', welcomeQuickActions.length, 'welcome quick action buttons - attaching direct handlers');
                 welcomeQuickActions.forEach(function(action) {
                     action.style.cursor = 'pointer';
+                    if (!action.hasAttribute('data-click-bound')) {
+                        action.setAttribute('data-click-bound', 'true');
+                        action.addEventListener('click', function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            var actionText = action.getAttribute('data-action') || (action.textContent && action.textContent.trim()) || '';
+                            if (actionText) {
+                                console.log('[SETUP] Welcome quick action clicked (direct):', actionText);
+                                handleQuickActionClick(action, actionText);
+                            }
+                        });
+                    }
                 });
             }
 
@@ -2692,6 +3273,62 @@ export class ChatInterface {
                 });
             }
 
+            // Attachment button and file input
+            var attachmentButton = document.getElementById('attachmentButton');
+            var attachmentInput = document.getElementById('attachmentInput');
+            var attachmentPreview = document.getElementById('attachmentPreview');
+            if (attachmentButton && attachmentInput && !attachmentButton.hasAttribute('data-setup')) {
+                attachmentButton.setAttribute('data-setup', 'true');
+                window.pendingAttachments = window.pendingAttachments || [];
+                attachmentButton.addEventListener('click', function() { attachmentInput.click(); });
+                attachmentInput.addEventListener('change', function() {
+                    var files = attachmentInput.files;
+                    if (!files || files.length === 0) return;
+                    for (var i = 0; i < files.length; i++) {
+                        var f = files[i];
+                        if (!f.type.match(/^image[/]/)) continue;
+                        var reader = new FileReader();
+                        reader.onload = (function(file) {
+                            return function(e) {
+                                var data = e.target.result;
+                                window.pendingAttachments.push({ type: 'image', data: data, mimeType: file.type, name: file.name });
+                                renderAttachmentPreview();
+                            };
+                        })(f);
+                        reader.readAsDataURL(f);
+                    }
+                    attachmentInput.value = '';
+                });
+            }
+            function renderAttachmentPreview() {
+                if (!attachmentPreview) return;
+                attachmentPreview.innerHTML = '';
+                var atts = window.pendingAttachments || [];
+                if (atts.length === 0) {
+                    attachmentPreview.style.display = 'none';
+                    return;
+                }
+                attachmentPreview.style.display = 'flex';
+                atts.forEach(function(a, idx) {
+                    var wrap = document.createElement('div');
+                    wrap.style.cssText = 'position:relative;display:inline-block;';
+                    var img = document.createElement('img');
+                    img.src = a.data;
+                    img.style.cssText = 'max-width:60px;max-height:60px;object-fit:cover;border-radius:4px;';
+                    var rm = document.createElement('button');
+                    rm.type = 'button';
+                    rm.textContent = '×';
+                    rm.style.cssText = 'position:absolute;top:-6px;right:-6px;width:18px;height:18px;padding:0;font-size:14px;line-height:1;background:var(--vscode-errorForeground);color:white;border:none;border-radius:50%;cursor:pointer;';
+                    rm.onclick = (function(i) { return function() {
+                        window.pendingAttachments.splice(i, 1);
+                        renderAttachmentPreview();
+                    }; })(idx);
+                    wrap.appendChild(img);
+                    wrap.appendChild(rm);
+                    attachmentPreview.appendChild(wrap);
+                });
+            }
+
             // Back button is handled by global event delegation
 
             console.log('Chat mode listeners setup complete');
@@ -2699,6 +3336,7 @@ export class ChatInterface {
 
         function switchToChatMode(text) {
             if (!text) text = undefined;
+            var body = document.body;
             body.classList.add('chat-mode');
 
             // CRITICAL: Show chat UI elements that were hidden by switchToWelcomeMode
@@ -2775,7 +3413,7 @@ export class ChatInterface {
         }
 
             // Prevent duplicate submissions
-            let isSubmittingWelcome = false;
+            var isSubmittingWelcome = false;
 
             function sendWelcomeMessage() {
             console.log('sendWelcomeMessage CALLED');
@@ -3038,7 +3676,7 @@ export class ChatInterface {
                 var tripleBacktick = backtick + backtick + backtick;
 
                 // Code blocks (triple backticks)
-                var codeBlockRegex = new RegExp(tripleBacktick + '(\\\\w*)\\n([\\\\s\\\\S]*?)' + tripleBacktick, 'g');
+                var codeBlockRegex = new RegExp(tripleBacktick + '(' + BS + 'w*)' + NL + '([' + BS + 's' + BS + 'S]*?)' + tripleBacktick, 'g');
                 html = html.replace(codeBlockRegex, function(match, lang, code) {
                     return '<pre class="code-block"><code class="language-' + (lang || 'plaintext') + '">' + (code ? code.trim() : '') + '</code></pre>';
                 });
@@ -3047,11 +3685,13 @@ export class ChatInterface {
                 var inlineCodeRegex = new RegExp(backtick + '([^' + backtick + ']+)' + backtick, 'g');
                 html = html.replace(inlineCodeRegex, '<code class="inline-code">$1</code>');
 
-                // Bold (**text**)
-                html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+                // Bold (**text**) - use array join to build regex string and avoid template escaping
+                var BOLD_RE = new RegExp(['[*][*]([^*]+)[*][*]'].join(''), 'g');
+                html = html.replace(BOLD_RE, '<strong>$1</strong>');
 
                 // Italic (*text*)
-                html = html.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
+                var ITALIC_RE = new RegExp(['[*]([^*]+)[*]'].join(''), 'g');
+                html = html.replace(ITALIC_RE, '<em>$1</em>');
 
                 // Headers (## text) - process longer patterns first
                 html = html.replace(/^#### (.+)$/gm, '<h5>$1</h5>');
@@ -3060,23 +3700,27 @@ export class ChatInterface {
                 html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
 
                 // Bullet lists - wrap consecutive items in <ul>
-                html = html.replace(/((?:^- .+$\\n?)+)/gm, function(match) {
-                    var items = match.trim().split('\\n')
+                var BULLET_LIST_RE = new RegExp('((?:^- .+$' + NL + '?)+)', 'gm');
+                html = html.replace(BULLET_LIST_RE, function(match) {
+                    var items = match.trim().split(NL)
                         .map(function(item) { return item.replace(/^- (.+)$/, '<li>$1</li>'); })
                         .join('');
                     return '<ul>' + items + '</ul>';
                 });
 
                 // Numbered lists - wrap consecutive items in <ol>
-                html = html.replace(/((?:^\\d+\\. .+$\\n?)+)/gm, function(match) {
-                    var items = match.trim().split('\\n')
-                        .map(function(item) { return item.replace(/^\\d+\\. (.+)$/, '<li>$1</li>'); })
+                var NUM_LIST_RE = new RegExp('((?:^' + BS + 'd+' + BS + '. .+$' + NL + '?)+)', 'gm');
+                html = html.replace(NUM_LIST_RE, function(match) {
+                    var NUM_ITEM_RE = new RegExp('^' + BS + 'd+' + BS + '. (.+)$');
+                    var items = match.trim().split(NL)
+                        .map(function(item) { return item.replace(NUM_ITEM_RE, '<li>$1</li>'); })
                         .join('');
                     return '<ol>' + items + '</ol>';
                 });
 
                 // Links [text](url)
-                html = html.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+                var LINK_RE = new RegExp(BS + '[([^' + BS + ']]+)' + BS + ']' + BS + '(([^)]+)' + BS + ')', 'g');
+                html = html.replace(LINK_RE, '<a href="$2">$1</a>');
 
                 // Horizontal rules (---) - before line breaks
                 html = html.replace(/^---$/gm, '<hr class="section-divider">');
@@ -3084,7 +3728,8 @@ export class ChatInterface {
                 // Vulnerability findings with Fix buttons
                 // Pattern: "1. **[SEVERITY]** file.js:123 - Description"
                 // First, detect and enhance numbered vulnerability findings with fix buttons
-                html = html.replace(/(\\d+)\\.\\s*\\*\\*\\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\\]\\*\\*\\s*([^:]+):(\\d+)\\s*-\\s*([^\\n<]+)/gi, function(match, num, severity, filePath, lineNum, description) {
+                var VULN_RE = new RegExp('(' + BS + 'd+)' + BS + '.' + BS + 's*' + BS + '*' + BS + '*' + BS + '[(CRITICAL|HIGH|MEDIUM|LOW|INFO)' + BS + ']' + BS + '*' + BS + '*' + BS + 's*([^:]+):(' + BS + 'd+)' + BS + 's*-' + BS + 's*([^' + BS + 'n<]+)', 'gi');
+                html = html.replace(VULN_RE, function(match, num, severity, filePath, lineNum, description) {
                     var severityLower = severity.toLowerCase();
                     var escapedPath = filePath.replace(/"/g, '&quot;').trim();
                     var escapedDesc = description.replace(/"/g, '&quot;').trim();
@@ -3109,19 +3754,28 @@ export class ChatInterface {
                 });
 
                 // Severity badges with colors (for non-finding uses)
-                html = html.replace(/\\[CRITICAL\\]/g, '<span class="severity-badge critical">CRITICAL</span>');
-                html = html.replace(/\\[HIGH\\]/g, '<span class="severity-badge high">HIGH</span>');
-                html = html.replace(/\\[MEDIUM\\]/g, '<span class="severity-badge medium">MEDIUM</span>');
-                html = html.replace(/\\[LOW\\]/g, '<span class="severity-badge low">LOW</span>');
-                html = html.replace(/\\[INFO\\]/g, '<span class="severity-badge info">INFO</span>');
+                var SEV_CRIT_RE = new RegExp(BS + '[CRITICAL' + BS + ']', 'g');
+                var SEV_HIGH_RE = new RegExp(BS + '[HIGH' + BS + ']', 'g');
+                var SEV_MED_RE = new RegExp(BS + '[MEDIUM' + BS + ']', 'g');
+                var SEV_LOW_RE = new RegExp(BS + '[LOW' + BS + ']', 'g');
+                var SEV_INFO_RE = new RegExp(BS + '[INFO' + BS + ']', 'g');
+                html = html.replace(SEV_CRIT_RE, '<span class="severity-badge critical">CRITICAL</span>');
+                html = html.replace(SEV_HIGH_RE, '<span class="severity-badge high">HIGH</span>');
+                html = html.replace(SEV_MED_RE, '<span class="severity-badge medium">MEDIUM</span>');
+                html = html.replace(SEV_LOW_RE, '<span class="severity-badge low">LOW</span>');
+                html = html.replace(SEV_INFO_RE, '<span class="severity-badge info">INFO</span>');
 
                 // Stats with colored numbers (Critical: 2696)
-                html = html.replace(/Critical:\\s*(\\d+)/gi, 'Critical: <span class="stat-critical">$1</span>');
-                html = html.replace(/High:\\s*(\\d+)/gi, 'High: <span class="stat-high">$1</span>');
-                html = html.replace(/Medium:\\s*(\\d+)/gi, 'Medium: <span class="stat-medium">$1</span>');
+                var STAT_CRIT_RE = new RegExp('Critical:' + BS + 's*(' + BS + 'd+)', 'gi');
+                var STAT_HIGH_RE = new RegExp('High:' + BS + 's*(' + BS + 'd+)', 'gi');
+                var STAT_MED_RE = new RegExp('Medium:' + BS + 's*(' + BS + 'd+)', 'gi');
+                html = html.replace(STAT_CRIT_RE, 'Critical: <span class="stat-critical">$1</span>');
+                html = html.replace(STAT_HIGH_RE, 'High: <span class="stat-high">$1</span>');
+                html = html.replace(STAT_MED_RE, 'Medium: <span class="stat-medium">$1</span>');
 
                 // File paths with line numbers (Windows style c:\path:123) - clickable
-                html = html.replace(/([A-Za-z]:\\\\[^\\s:]+):(\\d+)/g, function(match, filePath, lineNum) {
+                var WIN_PATH_RE = new RegExp('([A-Za-z]:' + BS + BS + '[^' + BS + 's:]+):(' + BS + 'd+)', 'g');
+                html = html.replace(WIN_PATH_RE, function(match, filePath, lineNum) {
                     var escapedPath = filePath.replace(/"/g, '&quot;');
                     return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
                            '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
@@ -3129,18 +3783,17 @@ export class ChatInterface {
                 });
 
                 // File paths with line numbers (Unix/Mac absolute paths /path/to/file.ts:123) - clickable
-                // Match paths starting with / that have a file extension and line number
-                html = html.replace(/(\\/(?:[^\\s:&<>]+\\/)*[^\\s:&<>]+\\.[a-zA-Z0-9]+):(\\d+)(?![^<]*<\\/a>)/g, function(match, filePath, lineNum) {
+                var UNIX_PATH_RE = new RegExp('(' + BS + '/(?:[^' + BS + 's:&<>]+' + BS + '/)*[^' + BS + 's:&<>]+' + BS + '.[a-zA-Z0-9]+):(' + BS + 'd+)(?![^<]*<' + BS + '/a>)', 'g');
+                html = html.replace(UNIX_PATH_RE, function(match, filePath, lineNum) {
                     var escapedPath = filePath.replace(/"/g, '&quot;');
                     return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
                            '" data-line-number="' + lineNum + '" title="Click to open at line ' + lineNum + '">' +
                            match + '</a>';
                 });
 
-                // File paths with line numbers (relative paths like src/file.ts:123 or ./src/file.ts:123) - clickable
-                // Match paths that look like relative file paths with extensions and line numbers
-                // Negative lookbehind equivalent: ensure not already wrapped in an <a> tag
-                html = html.replace(/(?<!["\\/])(\\.?\\.?\\/)?([a-zA-Z0-9_][a-zA-Z0-9_.-]*(?:\\/[a-zA-Z0-9_][a-zA-Z0-9_.-]*)+\\.[a-zA-Z0-9]+):(\\d+)(?![^<]*<\\/a>)/g, function(match, prefix, filePath, lineNum) {
+                // File paths with line numbers (relative paths like src/file.ts:123) - clickable
+                var REL_PATH_RE = new RegExp('(?<!["\\/])(' + BS + '.?' + BS + '.?' + BS + '/)?([a-zA-Z0-9_][a-zA-Z0-9_.-]*(?:' + BS + '/[a-zA-Z0-9_][a-zA-Z0-9_.-]*)+' + BS + '.[a-zA-Z0-9]+):(' + BS + 'd+)(?![^<]*<' + BS + '/a>)', 'g');
+                html = html.replace(REL_PATH_RE, function(match, prefix, filePath, lineNum) {
                     var fullPath = (prefix || '') + filePath;
                     var escapedPath = fullPath.replace(/"/g, '&quot;');
                     return '<a class="file-path-link" href="#" data-file-path="' + escapedPath +
@@ -3149,14 +3802,16 @@ export class ChatInterface {
                 });
 
                 // Line breaks
-                html = html.replace(/\\n\\n/g, '</p><p>');
-                html = html.replace(/\\n/g, '<br>');
+                var DOUBLE_NL_RE = new RegExp(BS + 'n' + BS + 'n', 'g');
+                var SINGLE_NL_RE = new RegExp(BS + 'n', 'g');
+                html = html.replace(DOUBLE_NL_RE, '</p><p>');
+                html = html.replace(SINGLE_NL_RE, '<br>');
 
                 return html;
             }
 
-            function addMessage(role, content, timestamp) {
-            console.log('addMessage called:', role, content ? content.substring(0, 50) : '');
+            function addMessage(role, content, timestamp, messageId, reference, citations) {
+            console.log('addMessage called:', role, content ? content.substring(0, 50) : '', 'messageId:', messageId);
             const container = document.getElementById('messages');
             if (!container) {
                 console.error(' addMessage: messages container not found!');
@@ -3166,12 +3821,21 @@ export class ChatInterface {
             try {
             const messageDiv = document.createElement('div');
                 messageDiv.className = 'message ' + role;
-                messageDiv.style.cssText = 'display: flex; gap: 12px; max-width: 85%; margin: 8px 0;';
+                messageDiv.setAttribute('data-message-id', messageId || 'msg-' + Date.now());
+                messageDiv.setAttribute('data-role', role);
+                messageDiv.setAttribute('data-raw-content', (content || '').replace(/"/g, '&quot;'));
+                messageDiv.style.cssText = 'display: flex; gap: 12px; max-width: 85%; margin: 8px 0; position: relative;';
             
             const avatar = document.createElement('div');
             avatar.className = 'message-avatar';
             avatar.textContent = role === 'user' ? 'You' : 'CM';
                 avatar.style.cssText = 'width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-weight: 500; font-size: 13px; flex-shrink: 0; border: 1px solid var(--vscode-panel-border); background: var(--vscode-button-background); color: var(--vscode-button-foreground);';
+            
+            const contentWrapper = document.createElement('div');
+            contentWrapper.style.cssText = 'flex: 1; position: relative; display: flex; flex-direction: column; gap: 4px;';
+            
+            const contentRow = document.createElement('div');
+            contentRow.style.cssText = 'display: flex; align-items: flex-start; gap: 8px;';
             
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
@@ -3181,14 +3845,71 @@ export class ChatInterface {
             } else {
                 contentDiv.textContent = content;
             }
-                contentDiv.style.cssText = 'background: var(--vscode-input-background); border: 1px solid var(--vscode-panel-border); padding: 12px 16px; line-height: 1.5; word-wrap: break-word; color: var(--vscode-editor-foreground);';
+                contentDiv.style.cssText = 'background: var(--vscode-input-background); border: 1px solid var(--vscode-panel-border); padding: 12px 16px; line-height: 1.5; word-wrap: break-word; color: var(--vscode-editor-foreground); border-radius: 8px;';
 
                 if (role === 'user') {
                     contentDiv.style.cssText += 'background: var(--vscode-button-background); color: var(--vscode-button-foreground);';
                 }
+            contentDiv.style.flex = '1';
+            
+            const citationsDiv = document.createElement('div');
+            citationsDiv.className = 'message-citations';
+            citationsDiv.setAttribute('data-message-id', messageId);
+            citationsDiv.style.cssText = 'display: none; margin-top: 8px; padding: 8px 12px; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textLink-foreground); border-radius: 4px; font-size: 11px; color: var(--vscode-descriptionForeground); transition: opacity 0.3s;';
+            
+            if (citations && citations.length > 0) {
+                citationsDiv.style.display = 'block';
+                citationsDiv.style.opacity = '1';
+                var citationLinks = citations.map(function(c) {
+                    var trimmed = (c || '').trim();
+                    var pathLineMatch = trimmed.match(/^(.+\\.[a-zA-Z0-9]+):(\\d+)$/);
+                    if (pathLineMatch) {
+                        var path = pathLineMatch[1];
+                        var line = pathLineMatch[2];
+                        return '<a class="file-path-link" href="#" data-file-path="' + path.replace(/"/g, '&quot;') + '" data-line-number="' + line + '" title="Open at line ' + line + '">' + trimmed + '</a>';
+                    }
+                    return trimmed;
+                });
+                citationsDiv.innerHTML = '<strong>📚 Sources:</strong> ' + citationLinks.join(' | ');
+            }
+            
+            // Reply/Reference buttons - outside the chat box, aligned to the side
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'message-actions';
+            actionsDiv.style.cssText = 'display: flex; flex-direction: column; gap: 4px; align-self: flex-start; flex-shrink: 0; margin-left: 8px;';
+            
+            const replyBtn = document.createElement('button');
+            replyBtn.className = 'message-action-btn reply-btn';
+            replyBtn.innerHTML = '↩ Reply';
+            replyBtn.title = 'Reply to this message (includes context analysis)';
+            replyBtn.style.cssText = 'background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-button-border); cursor: pointer; padding: 4px 10px; color: var(--vscode-button-foreground); font-size: 12px; border-radius: 4px; white-space: nowrap;';
+            replyBtn.onclick = function(e) {
+                e.stopPropagation();
+                handleReply(messageId, content, role, messageDiv);
+            };
+            
+            const refBtn = document.createElement('button');
+            refBtn.className = 'message-action-btn ref-btn';
+            refBtn.innerHTML = '↪';
+            refBtn.title = 'Reference this message';
+            refBtn.style.cssText = 'background: transparent; border: none; cursor: pointer; padding: 4px 8px; color: var(--vscode-foreground); font-size: 14px; border-radius: 4px;';
+            refBtn.onclick = function(e) {
+                e.stopPropagation();
+                handleReference(messageId, reference);
+            };
+            
+            if (reference && reference.filePath) {
+                actionsDiv.appendChild(refBtn);
+            }
+            actionsDiv.appendChild(replyBtn);
+            
+            contentRow.appendChild(contentDiv);
+            contentWrapper.appendChild(contentRow);
+            contentWrapper.appendChild(citationsDiv);
             
             messageDiv.appendChild(avatar);
-            messageDiv.appendChild(contentDiv);
+            messageDiv.appendChild(contentWrapper);
+            messageDiv.appendChild(actionsDiv);
             
                 // Insert before thinking element if it exists, otherwise append
                 const thinkingEl = document.getElementById('thinking');
@@ -3209,9 +3930,78 @@ export class ChatInterface {
                 container.appendChild(fallback);
             }
         }
+        
+        // Pending reply context (set when user clicks Reply, cleared on send or cancel)
+        var pendingReplyContext = null;
+        
+        // Handle reply to message - with context analysis
+        function handleReply(messageId, content, role, messageDiv) {
+            const messageInput = document.getElementById('messageInput');
+            const replyContextPanel = document.getElementById('replyContextPanel');
+            const replyContextSummary = document.getElementById('replyContextSummary');
+            if (!messageInput) return;
+            
+            // Collect surrounding context (up to 3 previous messages)
+            var contextMessages = [];
+            var sibling = messageDiv.previousElementSibling;
+            var count = 0;
+            while (sibling && count < 3) {
+                if (sibling.classList && sibling.classList.contains('message') && sibling.id !== 'thinking') {
+                    var prevRole = sibling.getAttribute('data-role') || (sibling.classList.contains('user') ? 'user' : 'assistant');
+                    var prevContent = sibling.getAttribute('data-raw-content') || '';
+                    if (prevContent) prevContent = prevContent.replace(/&quot;/g, '"');
+                    contextMessages.unshift({ role: prevRole, content: prevContent.substring(0, 500) });
+                    count++;
+                }
+                sibling = sibling.previousElementSibling;
+            }
+            
+            var repliedToContent = (content || '').substring(0, 600);
+            pendingReplyContext = {
+                repliedToMessageId: messageId,
+                repliedToContent: repliedToContent,
+                repliedToRole: role,
+                contextMessages: contextMessages
+            };
+            
+            // Show context panel - reference only, no full quote (avoids flooding chat)
+            if (replyContextPanel && replyContextSummary) {
+                var summary = 'Replying to ' + (role === 'assistant' ? 'CipherMate' : 'You') + ' (message above)';
+                if (contextMessages.length > 0) {
+                    summary += ' - ' + contextMessages.length + ' prior message(s) for context';
+                }
+                replyContextSummary.textContent = summary;
+                replyContextPanel.style.display = 'block';
+            }
+            
+            // Leave input empty - user types their own message (context is sent to AI behind the scenes)
+            messageInput.value = '';
+            messageInput.placeholder = 'Type your reply...';
+            messageInput.focus();
+        }
+        
+        function clearReplyContext() {
+            pendingReplyContext = null;
+            var panel = document.getElementById('replyContextPanel');
+            if (panel) panel.style.display = 'none';
+            var input = document.getElementById('messageInput');
+            if (input) input.placeholder = 'Type your request... ';
+        }
+        
+        // Handle reference to message
+        function handleReference(messageId, reference) {
+            if (reference && reference.filePath) {
+                // Open file at referenced line
+                vscode.postMessage({
+                    command: 'openFile',
+                    filePath: reference.filePath,
+                    lineNumber: reference.line || 1
+                });
+            }
+        }
 
             // Prevent duplicate submissions
-            let isSubmittingChat = false;
+            var isSubmittingChat = false;
 
             function sendMessage() {
             console.log(' sendMessage CALLED ');
@@ -3231,9 +4021,10 @@ export class ChatInterface {
             }
             
             const text = messageInputEl.value.trim();
-            console.log('sendMessage: Input value:', text);
-            if (!text) {
-                console.log('sendMessage: Empty message, not sending');
+            const attachments = (window.pendingAttachments || []).slice();
+            console.log('sendMessage: Input value:', text, 'attachments:', attachments.length);
+            if (!text && attachments.length === 0) {
+                console.log('sendMessage: Empty message and no attachments, not sending');
                 isSubmittingChat = false;
                 return;
             }
@@ -3241,24 +4032,30 @@ export class ChatInterface {
             console.log('sendMessage: Processing message:', text);
 
             // Store text before clearing
-            const messageText = text;
+            const messageText = text || (attachments.length > 0 ? 'Analyze the attached image(s)' : '');
 
-            // Clear input immediately to prevent double submission
+            // Clear input and attachments immediately to prevent double submission
             messageInputEl.value = '';
+            window.pendingAttachments = [];
+            var attachmentPreviewEl = document.getElementById('attachmentPreview');
+            if (attachmentPreviewEl) { attachmentPreviewEl.style.display = 'none'; attachmentPreviewEl.innerHTML = ''; }
             
             // Don't add message here - let the extension handle it to avoid duplicates
             
-            // Send to extension
+            // Send to extension (with reply context and attachments if present)
             console.log('sendMessage: Sending message to extension:', messageText);
             try {
                 if (!vscode || typeof vscode.postMessage !== 'function') {
                     console.error('sendMessage: vscode.postMessage not available');
                     return;
                 }
-                vscode.postMessage({
-                    command: 'sendMessage',
-                    text: messageText
-                });
+                var payload = { command: 'sendMessage', text: messageText };
+                if (pendingReplyContext) {
+                    payload.replyContext = pendingReplyContext;
+                    clearReplyContext();
+                }
+                if (attachments.length > 0) payload.attachments = attachments;
+                vscode.postMessage(payload);
                 console.log('sendMessage: Message sent successfully');
             } catch (error) {
                 console.error('sendMessage: Error sending message:', error);
@@ -3334,6 +4131,9 @@ export class ChatInterface {
             }
         }
 
+            // Initial setup for welcome quick actions (runs on first load - page starts in welcome mode)
+            setupWelcomeScreenButtons();
+
             // Continue chat button - initial setup (will be re-setup in setupWelcomeScreenButtons when needed)
             if (continueChatBtn && !continueChatBtn.hasAttribute('data-initial-handler')) {
                 continueChatBtn.setAttribute('data-initial-handler', 'true');
@@ -3375,6 +4175,24 @@ export class ChatInterface {
                 console.error('=== ERROR: useOwnModel button not found! ===');
             }
 
+            // Cancel reply button
+            var cancelReplyBtn = document.getElementById('cancelReplyBtn');
+            if (cancelReplyBtn) {
+                cancelReplyBtn.addEventListener('click', function() {
+                    clearReplyContext();
+                });
+            }
+            
+            // Stop button - stops processing and returns message to input for editing
+            var stopBtn = document.getElementById('stopButton');
+            if (stopBtn) {
+                stopBtn.addEventListener('click', function() {
+                    if (vscode && typeof vscode.postMessage === 'function') {
+                        vscode.postMessage({ command: 'stopMessage' });
+                    }
+                });
+            }
+            
             // Chat mode message input handlers
             if (sendButton) {
                 console.log('=== Setting up sendButton ===');
@@ -3433,6 +4251,7 @@ export class ChatInterface {
 
             // Helper function to handle quick action clicks
             function handleQuickActionClick(action, actionText) {
+                var body = document.body;
                 console.log('[HANDLE] ========================================');
                 console.log('[HANDLE] handleQuickActionClick() CALLED');
                 console.log('[HANDLE] actionText:', actionText);
@@ -3455,15 +4274,29 @@ export class ChatInterface {
                     try {
                         if (!vscode || typeof vscode.postMessage !== 'function') {
                             console.error('vscode.postMessage not available');
-                        return;
+                            return;
                         }
-                        vscode.postMessage({
-                            command: 'showResults'
-                        });
-                        console.log(' showResults command sent');
+                        vscode.postMessage({ command: 'showResults' });
+                        console.log('[HANDLE] showResults command sent');
                         return; // Don't send as chat message
                     } catch (error) {
                         console.error('Error executing showResults:', error);
+                    }
+                }
+
+                // Special handling for "settings" / "configure" - open settings directly
+                if (actionText.toLowerCase() === 'settings' || actionText.toLowerCase().includes('configure settings') || actionText.toLowerCase().includes('configure ai')) {
+                    console.log('[HANDLE] Detected openSettings action');
+                    try {
+                        if (!vscode || typeof vscode.postMessage !== 'function') {
+                            console.error('vscode.postMessage not available');
+                            return;
+                        }
+                        vscode.postMessage({ command: 'openSettings' });
+                        console.log('[HANDLE] openSettings command sent');
+                        return; // Don't send as chat message
+                    } catch (error) {
+                        console.error('Error executing openSettings:', error);
                     }
                 }
 
@@ -3585,7 +4418,7 @@ export class ChatInterface {
                         }
                         // Add all session messages
                         message.messages.forEach((msg) => {
-                            addMessage(msg.role, msg.content, msg.timestamp);
+                            addMessage(msg.role, msg.content, msg.timestamp, msg.messageId, msg.reference, msg.citations);
                         });
                         // Switch to chat mode if there are messages
                         if (message.messages.length > 0) {
@@ -3620,7 +4453,7 @@ export class ChatInterface {
                     if (!container) {
                         console.error('addMessage: messages container not found!');
                     }
-                    addMessage(message.role, message.content, message.timestamp);
+                    addMessage(message.role, message.content, message.timestamp, message.messageId, message.reference, message.citations);
                 } else if (message.command === 'switchToWelcome') {
                     switchToWelcomeMode();
                 } else if (message.command === 'messageCount') {
@@ -3670,6 +4503,8 @@ export class ChatInterface {
                     }
                     const container = document.getElementById('messages');
                     if (container) container.scrollTop = container.scrollHeight;
+                    var stopBtn = document.getElementById('stopButton');
+                    if (stopBtn) stopBtn.style.display = 'inline-flex';
                 } else if (message.command === 'hideThinking') {
                     // Re-query the thinking element
                     const thinkingEl = document.getElementById('thinking');
@@ -3683,6 +4518,30 @@ export class ChatInterface {
                                 el.style.display = 'none';
                             }
                         }, 200);
+                    }
+                    var stopBtn = document.getElementById('stopButton');
+                    if (stopBtn) stopBtn.style.display = 'none';
+                } else if (message.command === 'restoreMessageToInput') {
+                    var input = document.getElementById('messageInput');
+                    if (input && message.message) {
+                        input.value = message.message;
+                        input.placeholder = 'Type your request... ';
+                        input.focus();
+                    }
+                    var stopBtn = document.getElementById('stopButton');
+                    if (stopBtn) stopBtn.style.display = 'none';
+                    var thinkingEl = document.getElementById('thinking');
+                    if (thinkingEl) {
+                        thinkingEl.classList.remove('active');
+                        thinkingEl.style.display = 'none';
+                    }
+                    var container = document.getElementById('messages');
+                    if (container) {
+                        var msgs = container.querySelectorAll('.message.user');
+                        if (msgs.length > 0) {
+                            var lastUser = msgs[msgs.length - 1];
+                            lastUser.remove();
+                        }
                     }
                 } else if (message.command === 'thinkingStep') {
                     // Re-query the thinking element
@@ -3699,8 +4558,68 @@ export class ChatInterface {
                             thinkingEl.innerHTML = '<div class="thinking-gear"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.4-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z"/></svg></div><span class="thinking-text">' + stepText + '<span class="thinking-dots">...</span></span>';
                         }
                     }
+                    var stopBtn = document.getElementById('stopButton');
+                    if (stopBtn) stopBtn.style.display = 'inline-flex';
                     const container = document.getElementById('messages');
                     if (container) container.scrollTop = container.scrollHeight;
+                } else if (message.command === 'showThinkingCitations') {
+                    // Show citations during thinking
+                    const thinkingEl = document.getElementById('thinking');
+                    let citationsEl = document.getElementById('thinkingCitations');
+                    
+                    // Create citations container if it doesn't exist
+                    if (thinkingEl && !citationsEl) {
+                        citationsEl = document.createElement('div');
+                        citationsEl.className = 'thinking-citations';
+                        citationsEl.id = 'thinkingCitations';
+                        // Insert after thinking-header
+                        const header = thinkingEl.querySelector('.thinking-header');
+                        if (header && header.nextSibling) {
+                            thinkingEl.insertBefore(citationsEl, header.nextSibling);
+                        } else {
+                            thinkingEl.appendChild(citationsEl);
+                        }
+                    }
+                    
+                    if (thinkingEl && citationsEl && message.citations && message.citations.length > 0) {
+                        citationsEl.innerHTML = '<strong>References:</strong> ' + message.citations.join(' | ');
+                        citationsEl.classList.add('show');
+                        thinkingEl.style.display = 'flex';
+                        thinkingEl.classList.add('active');
+                        const container = document.getElementById('messages');
+                        if (container) container.scrollTop = container.scrollHeight;
+                    }
+                } else if (message.command === 'showThinkingAction') {
+                    // Show action during thinking
+                    const thinkingEl = document.getElementById('thinking');
+                    let actionsEl = document.getElementById('thinkingActions');
+                    
+                    // Create actions container if it doesn't exist
+                    if (thinkingEl && !actionsEl) {
+                        actionsEl = document.createElement('div');
+                        actionsEl.className = 'thinking-actions';
+                        actionsEl.id = 'thinkingActions';
+                        thinkingEl.appendChild(actionsEl);
+                    }
+                    
+                    if (thinkingEl && actionsEl) {
+                        const actionDiv = document.createElement('div');
+                        actionDiv.className = 'thinking-action';
+                        actionDiv.innerHTML = \`
+                            <span class="thinking-action-text">\${message.action}</span>
+                        \`;
+                        if (message.details) {
+                            const detailsDiv = document.createElement('div');
+                            detailsDiv.className = 'thinking-action-details';
+                            detailsDiv.textContent = message.details;
+                            actionDiv.appendChild(detailsDiv);
+                        }
+                        actionsEl.appendChild(actionDiv);
+                        thinkingEl.style.display = 'flex';
+                        thinkingEl.classList.add('active');
+                        const container = document.getElementById('messages');
+                        if (container) container.scrollTop = container.scrollHeight;
+                    }
                 } else if (message.command === 'clearThinking') {
                     // Re-query the thinking element
                     const thinkingEl = document.getElementById('thinking');
@@ -3710,6 +4629,16 @@ export class ChatInterface {
                         const textSpan = thinkingEl.querySelector('.thinking-text');
                         if (textSpan) {
                             textSpan.textContent = '';
+                        }
+                        // Clear citations and actions
+                        const citationsEl = document.getElementById('thinkingCitations');
+                        const actionsEl = document.getElementById('thinkingActions');
+                        if (citationsEl) {
+                            citationsEl.innerHTML = '';
+                            citationsEl.classList.remove('show');
+                        }
+                        if (actionsEl) {
+                            actionsEl.innerHTML = '';
                         }
                         // Ensure it's completely hidden
                         setTimeout(function() {

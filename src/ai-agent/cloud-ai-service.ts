@@ -95,17 +95,19 @@ export class CloudAIService {
   }
 
   /**
-   * Save configuration to VS Code settings
+   * Save configuration to VS Code settings.
+   * VS Code does not allow updating nested properties of object configs; we must update the whole cloudAI object.
    */
   private saveConfig(): void {
     const config = vscode.workspace.getConfiguration('ciphermate');
-    config.update('cloudAI.apiUrl', this.config.apiUrl, vscode.ConfigurationTarget.Global);
-    if (this.config.apiKey) {
-      config.update('cloudAI.apiKey', this.config.apiKey, vscode.ConfigurationTarget.Global);
-    }
-    if (this.config.modelName) {
-      config.update('cloudAI.modelName', this.config.modelName, vscode.ConfigurationTarget.Global);
-    }
+    const cloudAI = config.get<Record<string, unknown>>('cloudAI') || {};
+    const updated = {
+      ...cloudAI,
+      apiUrl: this.config.apiUrl,
+      ...(this.config.apiKey && { apiKey: this.config.apiKey }),
+      ...(this.config.modelName && { modelName: this.config.modelName }),
+    };
+    config.update('cloudAI', updated, vscode.ConfigurationTarget.Global);
   }
 
   /**
@@ -174,7 +176,7 @@ export class CloudAIService {
         messages: request.messages,
         ...(request.tools && { tools: request.tools }),
         temperature: request.temperature || 0.7,
-        max_tokens: request.max_tokens || 2000,
+        max_tokens: request.max_tokens || 8192,
         ...(request.stream !== undefined && { stream: request.stream })
       };
 

@@ -31,7 +31,8 @@ export class OpenRouterProvider extends BaseAIProvider {
       'openai/gpt-4',
       'openai/gpt-3.5-turbo',
       // Anthropic
-      'anthropic/claude-sonnet-4-20250514',
+      'anthropic/claude-sonnet-4',
+      'anthropic/claude-sonnet-4.5',
       'anthropic/claude-3.5-sonnet',
       'anthropic/claude-3-opus',
       // Google
@@ -107,7 +108,7 @@ export class OpenRouterProvider extends BaseAIProvider {
         messages: request.messages,
         ...(request.tools && { tools: request.tools }),
         temperature: request.temperature || 0.7,
-        max_tokens: request.max_tokens || 2000,
+        max_tokens: request.max_tokens || 8192,
         ...(request.stream !== undefined && { stream: request.stream })
       };
 
