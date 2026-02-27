@@ -2,22 +2,22 @@
 
 Enterprise-grade security analysis extension for VS Code
 
-CipherMate is a comprehensive security extension that combines static analysis tools with AI-powered vulnerability detection to help developers write more secure code.
+CipherMate combines static analysis tools with AI-powered vulnerability detection and dynamic penetration testing to help developers write more secure code.
 
 ---
 
-##  GET STARTED IN 3 STEPS
+## GET STARTED IN 3 STEPS
 
 ### Step 1: Open CipherMate
-1. **Look for the CipherMate icon** in the left sidebar (Activity Bar)
-2. **Click the icon** - Welcome screen will open automatically
-3. **OR** Press `Cmd+Shift+P` (Mac) / `Ctrl+Shift+P` (Windows) and type `CipherMate`
+1. Look for the CipherMate icon in the left sidebar (Activity Bar)
+2. Click the icon - Welcome screen will open automatically
+3. OR Press `Cmd+Shift+P` (Mac) / `Ctrl+Shift+P` (Windows) and type `CipherMate`
 
 ### Step 2: Configure Your AI (Required First Step)
 1. On the welcome screen, click **"Step 1: Configure API Key"**
 2. Choose your AI provider:
-   - **Local Models**: Ollama or LM Studio (free, runs on your machine)
-   - **Cloud APIs**: OpenAI, Anthropic, OpenRouter (requires API key)
+   - Local Models: Ollama or LM Studio (free, runs on your machine)
+   - Cloud APIs: OpenAI, Anthropic, OpenRouter (requires API key)
 3. Enter your API key or local endpoint URL
 4. Click **"Save"**
 
@@ -34,56 +34,73 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 ---
 
-## 📖 QUICK GUIDE
+## QUICK GUIDE
 
 ### Where to Find Everything
 
 **Activity Bar (Left Sidebar)**:
-- Click **CipherMate icon** → See Welcome section with quick actions
-- Click **"Get Started"** → Opens welcome screen
-- Click **"Configure Settings"** → Opens settings panel
+- Click **CipherMate icon** - See Welcome section with quick actions
+- Click **"Get Started"** - Opens welcome screen
+- Click **"Configure Settings"** - Opens settings panel
 
 **Command Palette** (`Cmd+Shift+P` / `Ctrl+Shift+P`):
-- Type `CipherMate` → Open welcome screen
-- Type `CipherMate: Advanced Settings` → Configure API keys
-- Type `CipherMate: Show Results Panel` → View scan results
-- Type `CipherMate: Scan Code` → Run security scan
+- Type `CipherMate` - Open welcome screen
+- Type `CipherMate: Advanced Settings` - Configure API keys
+- Type `CipherMate: Show Results Panel` - View scan results
+- Type `CipherMate: Red Team Operations Center` - Open pentest interface
 
 **Welcome Screen** (Opens automatically):
-- **Configure API Key** → Set up your AI provider (required first)
-- **Start Chatting** → Begin using CipherMate
-- **Quick Input** → Type directly to start
+- **Configure API Key** - Set up your AI provider (required first)
+- **Start Chatting** - Begin using CipherMate
+- **Quick Input** - Type directly to start
+
+---
+
+## RED TEAM AND PENTEST
+
+### Run a Pentest
+1. Open **Red Team Operations Center** (`Cmd+Shift+P` - `CipherMate: Red Team Operations Center`)
+2. Enter target URL (e.g. `https://api.example.com` or `http://localhost:3000`)
+3. Click **Start Pentest**
+4. View findings in the Live Activity Feed (terminal-style, black and green)
+5. Use **View Results** or **War Room Live** for full dashboard
+
+**Pentest features**:
+- WAF/Cloudflare evasion: rotating User-Agents, browser headers, 403 retries
+- Unrestricted mode: high concurrency (80), 1000 endpoints, 12 retries, no artificial time limits
+- Optional Nuclei integration when installed in PATH
+- AI-powered attack Q&A: ask questions about findings when the scan completes
+
+### Export Findings
+- Export to local file (JSON or ZIP) with full vulnerability data
+- Available from pentest results panel and Red Team quick access
 
 ---
 
 ## COMMON TASKS
 
 ### Scan Your Code
-1. Open CipherMate (click icon or `Cmd+Shift+P` → `CipherMate`)
+1. Open CipherMate (click icon or `Cmd+Shift+P` - `CipherMate`)
 2. Type: `"scan my code"` or `"find vulnerabilities"`
 3. Press Enter
 4. View results in the Results Panel
 
 ### Configure Settings
 1. Click **"Configure API Key"** on welcome screen
-2. OR: `Cmd+Shift+P` → `CipherMate: Advanced Settings`
+2. OR: `Cmd+Shift+P` - `CipherMate: Advanced Settings`
 3. Choose provider and enter API key
 4. Click **Save**
 
 ### View Results
 1. After scanning, click **"Show Results"** on welcome screen
-2. OR: `Cmd+Shift+P` → `CipherMate: Show Results Panel`
-3. See all vulnerabilities with severity levels
-4. Click **"Fix"** or **"Explain"** for each issue
-
-### Get Help
-- Welcome screen shows Quick Start Guide
-- Activity bar has clickable quick actions
-- All commands available via Command Palette
+2. OR: `Cmd+Shift+P` - `CipherMate: Show Results Panel`
+3. Pentest results open in a dedicated Pentest Results panel
+4. See all vulnerabilities with severity levels
+5. Click **"Fix"** or **"Explain"** for each issue
 
 ---
 
-## ⚙️ SETUP OPTIONS
+## SETUP OPTIONS
 
 ### Option 1: Self-Hosted (Free) - Recommended for Privacy
 **Use Ollama with DeepSeek Coder**:
@@ -100,7 +117,7 @@ CipherMate is a comprehensive security extension that combines static analysis t
 
 **Setup**:
 1. Get API key from provider
-2. Open Settings (`Cmd+Shift+P` → `CipherMate: Advanced Settings`)
+2. Open Settings (`Cmd+Shift+P` - `CipherMate: Advanced Settings`)
 3. Select provider
 4. Enter API key
 5. Save
@@ -109,263 +126,142 @@ CipherMate is a comprehensive security extension that combines static analysis t
 **LM Studio or Ollama**:
 - Download and install locally
 - Start server on port 1234 (LM Studio) or 11434 (Ollama)
-- Configure in Settings → Providers → Local AI
+- Configure in Settings - Providers - Local AI
 
 ---
 
-##  TROUBLESHOOTING
+## TROUBLESHOOTING
 
-### "I don't see the CipherMate icon"
+**"I don't see the CipherMate icon"**
 - Check Extensions view (`Cmd+Shift+X`)
 - Make sure CipherMate is installed and enabled
 - Reload VS Code window
 
-### "Welcome screen doesn't open"
+**"Welcome screen doesn't open"**
 - Click CipherMate icon in activity bar
-- OR: `Cmd+Shift+P` → `CipherMate`
-- Check Output panel for errors: `View → Output → CipherMate`
+- OR: `Cmd+Shift+P` - `CipherMate`
+- Check Output panel for errors: `View - Output - CipherMate`
 
-### "AI not responding"
-- Check Settings → Configure API Key
+**"AI not responding"**
+- Check Settings - Configure API Key
 - Verify API key is correct
 - Test connection in Settings panel
 - For local models, ensure server is running
 
-### "How do I scan my code?"
-1. Open CipherMate welcome screen
-2. Click "Start Chatting"
-3. Type: `"scan my code"`
-4. Press Enter
-5. View results in Results Panel
-
 ---
 
-##  LEARN MORE
-
-**Documentation**: All guides in [`docs/`](docs/) folder
-
-**Quick Links**:
-- [Getting Started Guide](docs/setup/START_HERE.md)
-- [Ollama Setup (Free Self-Hosted)](docs/setup/OLLAMA_QUICK_START.md)
-- [Settings Guide](docs/setup/MULTI_PROVIDER_GUIDE.md)
-- [How to Test](docs/HOW_TO_TEST.md)
-
----
-
-##  FOR DEVELOPERS
-
-### Installation for Development
-
-## Features
+## FEATURES
 
 ### Intelligent Security Scanning
-- **Multi-tool Integration**: Combines Semgrep, Bandit, and AI analysis
-- **Real-time Detection**: Scans code on save with configurable intervals
-- **Smart Prioritization**: Automatically prioritizes vulnerabilities by severity
-- **Cross-language Support**: JavaScript, TypeScript, Python, PHP, Java, C/C++, Go, Rust, Ruby, Shell
-- **Background Processing**: Non-blocking scans with progress indicators
-- **Intelligent Caching**: 24-hour cache system for faster repeated scans
-- **Incremental Scanning**: Only scans changed files for maximum efficiency
+- Multi-tool Integration: Semgrep, Bandit, retire.js, and AI analysis
+- Dependency scanning: package.json, requirements.txt, Cargo.toml, go.mod, and more
+- Hardcoded secrets detection: AWS keys, API tokens, OAuth, database credentials
+- Smart contract scanning (Solidity)
+- Real-time detection: scans on save with configurable intervals
+- Cross-language support: JavaScript, TypeScript, Python, PHP, Java, C/C++, Go, Rust, Ruby, Shell
+- Intelligent caching, incremental scanning, background processing
+
+### Dynamic Testing and Pentest
+- Red Team Operations Center: unified pentest interface
+- DAST: SQL injection, XSS, SSRF, path traversal, command injection, and more
+- WAF/Cloudflare evasion: rotating User-Agents, browser-like headers, 403 retries
+- Unrestricted mode: high concurrency, extended retries, no time limits
+- Optional Nuclei integration when in PATH
+- War Room: live dashboard of pentest activity
+- AI pentest Q&A: ask questions about findings in natural language
 
 ### AI-Powered Analysis
-- **LM Studio Integration**: Uses local AI models for advanced pattern detection
-- **Personalized Learning**: Tracks your security learning progress and adapts suggestions
-- **Intelligent Fixes**: AI-generated code fixes and detailed explanations
-- **Memory System**: Remembers your common mistakes and provides targeted guidance
+- Multi-provider support: OpenRouter, OpenAI, Anthropic, Gemini, Ollama
+- Intelligent fixes: AI-generated code fixes and explanations
+- Memory system: encrypted storage for developer profiles
+- Context-aware filtering and exploitability scoring
 
 ### Team Collaboration
-- **Team Dashboard**: Track team member security progress and vulnerabilities
-- **Automated Reporting**: Real-time vulnerability reports to team leads
-- **Progress Tracking**: Monitor individual and team security learning
-- **Policy Management**: Enforce security policies across the team
+- Team Dashboard: track progress and vulnerabilities
+- Automated reporting to team leads
+- Policy management
 
-### Security & Privacy
-- **Encrypted Storage**: All data encrypted with AES-256-CBC
-- **Local Processing**: AI analysis runs locally via LM Studio
-- **Secure Memory**: Developer profiles and team data encrypted at rest
-- **Privacy First**: No data sent to external services
-
-### User Interface
-- **Interactive Results Panel**: Beautiful, VSCode-themed interface
-- **Real-time Notifications**: Contextual alerts with severity indicators
-- **Settings Management**: Easy configuration through webview interface
-- **Export Capabilities**: Export scan results in multiple formats
-
-## Installation
-
-### For End Users
-
-**Install from VSIX file:**
-```bash
-code --install-extension ciphermate-1.0.2.vsix
-```
-
-**Or from VS Code:**
-1. Open Extensions view (`Cmd+Shift+X`)
-2. Click "..." menu → "Install from VSIX..."
-3. Select `ciphermate-1.0.2.vsix`
-
-### For Developers
-
-See [Development Setup](docs/setup/START_HERE.md) for development instructions.
+### Security and Privacy
+- Encrypted storage: AES-256-CBC for sensitive data
+- Local export: JSON or ZIP for pentest findings (no external upload)
+- Configurable: full control over AI providers and data
 
 ---
 
-## Prerequisites (Optional)
-
-**For AI Features:**
-- AI Provider API key (OpenAI, Anthropic, etc.) OR
-- Local AI server (Ollama, LM Studio)
-
-**For Static Analysis (Optional):**
-- Python 3.7+ (for Semgrep/Bandit)
-- `pip install semgrep` (for Semgrep)
-- `pip install bandit` (for Python security scanning)
-
-**Note:** CipherMate works without these, but AI features require an AI provider configured.
-
-## Commands
+## COMMANDS
 
 | Command | Description |
 |---------|-------------|
 | `CipherMate: Scan Code` | Quick security scan |
 | `CipherMate: Intelligent Repository Scan` | Comprehensive AI-powered scan |
-| `CipherMate: Scan with Semgrep` | Semgrep-only scan with AI enhancement |
+| `CipherMate: Red Team Operations Center` | Open pentest interface |
+| `CipherMate: Run Pentest` | Launch pentest on target URL |
+| `CipherMate: Show Results Panel` | Open results viewer |
+| `CipherMate: View Pentest Improvements` | Open pentest results |
+| `CipherMate: Extract & Upload Pentest Findings` | Export findings locally |
+| `CipherMate: Advanced Settings` | Configure API keys and options |
+| `CipherMate: Scan with Semgrep` | Semgrep-only scan |
 | `CipherMate: Scan with Bandit` | Python security scan |
-| `CipherMate: Show Results Panel` | Open interactive results viewer |
-| `CipherMate: Settings` | Open settings interface |
-| `CipherMate: Show Developer Profile` | View your security learning progress |
-| `CipherMate: Setup Team Collaboration` | Configure team features |
-| `CipherMate: Team Dashboard` | View team security dashboard |
-| `CipherMate: View Team Reports` | Check team vulnerability reports |
-| `CipherMate: Clear Encrypted Data` | Clear stored scan results |
-| `CipherMate: Test Encrypted Storage` | Test encryption functionality |
-| `CipherMate: Incremental Scan` | Scan only changed files since last scan |
-| `CipherMate: Clear Scan Cache` | Clear the scan results cache |
-| `CipherMate: Show Cache Status` | View cache statistics and recent entries |
-| `CipherMate: Background Scan Status` | Check status of background scans |
+| `CipherMate: Incremental Scan` | Scan changed files only |
 
-## Configuration
+---
 
-### Settings Options
-- **Enable Semgrep**: Toggle Semgrep static analysis
-- **Enable Bandit**: Toggle Python security scanning
-- **Scan on Save**: Automatically scan when files are saved
-- **Scan Interval**: Number of saves before full scan (default: 1)
+## CONFIGURATION
 
-### Team Settings
-- **Reporting Threshold**: Minimum severity to report (Critical/High/Medium/Low/All)
-- **Report Frequency**: How often to send reports (Real-time/Daily/Weekly/Monthly)
-- **Team Members**: Manage team member access and roles
+### DAST / Pentest Settings
+- **dast.wafEvasion**: Rotate User-Agents and retry 403 with evasion headers (default: true)
+- **dast.unrestrictedMode**: High concurrency, 1000 endpoints, 12 retries (default: true)
+- **dast.enableExternalTools**: Run Nuclei when in PATH (default: true)
 
-## Testing
+### General Settings
+- Enable Semgrep, Bandit: toggle static analysis
+- Scan on Save: automatic scans
+- Team reporting threshold and frequency
 
+---
+
+## DEVELOPMENT
+
+### Build
 ```bash
-# Run all tests
+npm install
+npm run compile
+```
+
+### Test
+```bash
 npm test
-
-# Run tests in watch mode
 npm run watch-tests
-
-# Run linting
 npm run lint
 ```
 
-## Architecture
+### Architecture
+- Scanner Engine: orchestrates dependency, secrets, code-pattern, smart-contract scanners
+- Agent Orchestrator: DAST and pentest pipeline with AI strategist
+- Red Team Operations Center: webview-based pentest UI
+- War Room Server: live event stream for pentest visualization
 
-### Core Components
-- **Scanner Engine**: Orchestrates multiple security tools
-- **AI Integration**: LM Studio client for intelligent analysis
-- **Memory System**: Encrypted storage for developer profiles
-- **Team Management**: Collaboration and reporting features
-- **UI Components**: Modern webview-based interfaces
+---
 
-### Data Flow
-1. **File Change Detection**  �  Trigger scan
-2. **Multi-tool Scanning**  �  Semgrep, Bandit, AI analysis
-3. **Result Processing**  �  Prioritization and deduplication
-4. **AI Enhancement**  �  Personalized explanations and fixes
-5. **Team Reporting**  �  Automated vulnerability notifications
-6. **Encrypted Storage**  �  Secure result persistence
+## DOCUMENTATION
 
-## Security Features
+All guides in [`docs/`](docs/):
 
-### Encryption
-- **AES-256-CBC**: All sensitive data encrypted
-- **Unique Keys**: Per-installation encryption keys
-- **Secure Storage**: VS Code global state with encryption
+- [Getting Started](docs/setup/START_HERE.md)
+- [Ollama Setup (Self-Hosted AI)](docs/setup/OLLAMA_QUICK_START.md)
+- [Multi-Provider Guide](docs/setup/MULTI_PROVIDER_GUIDE.md)
 
-### Privacy
-- **Local Processing**: No external API calls for analysis
-- **Encrypted Memory**: Developer profiles and team data protected
-- **Configurable**: Full control over data sharing
+---
 
-## Roadmap
+## LICENSE
 
-### Completed
-- [x] Basic insecure code detection
-- [x] AI integration (LM Studio)
-- [x] Full codebase scanning with Semgrep
-- [x] Dashboard UI panel
-- [x] Encrypted memory system
-- [x] Team collaboration features
-- [x] Comprehensive error handling
-- [x] Unit testing framework
-- [x] Background processing system
-- [x] Intelligent caching system
-- [x] Progress indicators and UX improvements
-- [x] Incremental scanning capabilities
+MIT License - see LICENSE file.
 
-### In Progress
-- [ ] Results export functionality
-- [ ] Performance optimization
-- [ ] VS Code Marketplace publication
+---
 
-### Planned
-- [ ] Custom security rules engine
-- [ ] Integration with CI/CD pipelines
-- [ ] Advanced reporting and analytics
-- [ ] Offline mode improvements
-- [ ] Additional AI model support
+## ACKNOWLEDGMENTS
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Run the test suite
-6. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Documentation
-
-     **All documentation has been organized into the [`docs/`](./docs/) folder:**
-
-- **[Setup Guides](./docs/setup/)** - Quick start guides, deployment, and configuration
-- **[Training Guides](./docs/training/)** - AI model training and development guides
-- **[Architecture](./docs/architecture/)** - System design and architecture documentation
-- **[Cost & Strategy](./docs/cost-strategy/)** - Cost management and strategic planning
-- **[Integration](./docs/integration/)** - Integration guides and feature documentation
-
-**Quick Links:**
--      [Getting Started](./docs/setup/START_HERE.md)
--      [Ollama Setup (Self-Hosted AI)](./docs/setup/OLLAMA_QUICK_START.md)
--        [Cloud AI Setup](./docs/setup/CLOUD_AI_SETUP.md)
--      [Training Guide](./docs/training/TRAINING_GUIDE.md)
-
-## Support
-
-- **Issues**: Report bugs and request features on GitHub
-- **Documentation**: See [docs/](./docs/) folder for comprehensive guides
-- **Community**: Join discussions in GitHub Discussions
-
-## Acknowledgments
-
-- **Semgrep**: Static analysis engine
-- **Bandit**: Python security linter
-- **LM Studio**: Local AI model hosting
-- **VS Code**: Extension platform
+- Semgrep: static analysis
+- Bandit: Python security linter
+- Nuclei: optional vulnerability scanning (ProjectDiscovery)
+- VS Code: extension platform
