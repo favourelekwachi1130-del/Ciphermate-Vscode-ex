@@ -15,6 +15,10 @@ const DEFAULT_PORT = 38521;
 let server: http.Server | null = null;
 let sseClients: { res: http.ServerResponse }[] = [];
 let unsubscribe: (() => void) | null = null;
+let fontConfig: { fontFamily: string; fontFamilyCode: string } = {
+  fontFamily: '-apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, sans-serif',
+  fontFamilyCode: '\'Consolas\', \'Monaco\', monospace',
+};
 
 function getDashboardHtml(): string {
   return `<!DOCTYPE html>
@@ -23,7 +27,6 @@ function getDashboardHtml(): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CipherMate DAST War Room</title>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -35,9 +38,11 @@ function getDashboardHtml(): string {
       --amber: #ffb020;
       --cyan: #00d4ff;
       --muted: #6b7280;
+      --font: ${fontConfig.fontFamily};
+      --font-code: ${fontConfig.fontFamilyCode};
     }
     body {
-      font-family: 'JetBrains Mono', 'Share Tech Mono', monospace;
+      font-family: var(--font-code);
       background: var(--bg);
       color: var(--green);
       min-height: 100vh;
@@ -63,6 +68,7 @@ function getDashboardHtml(): string {
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.1em;
+      font-family: var(--font-code);
     }
     .panel-body {
       flex: 1;
@@ -70,6 +76,7 @@ function getDashboardHtml(): string {
       padding: 8px;
       font-size: 11px;
       line-height: 1.5;
+      font-family: var(--font-code);
     }
     .event { margin-bottom: 6px; padding: 6px 8px; border-left: 3px solid var(--muted); background: rgba(0,0,0,0.2); border-radius: 0 4px 4px 0; }
     .event.strategist { border-color: var(--cyan); }
@@ -81,11 +88,11 @@ function getDashboardHtml(): string {
     .event.deepdive { border-color: var(--cyan); }
     .event.completed { border-color: var(--green); }
     .event.error { border-color: var(--red); }
-    .ts { color: var(--muted); font-size: 10px; }
-    .type { color: var(--cyan); }
-    .data { color: #e5e7eb; word-break: break-all; margin-top: 4px; }
-    .header-row { display: flex; justify-content: space-between; padding: 12px 16px; background: rgba(0,0,0,0.3); border-bottom: 1px solid var(--border); }
-    .header-row h1 { font-size: 14px; }
+    .ts { color: var(--muted); font-size: 10px; font-family: var(--font-code); }
+    .type { color: var(--cyan); font-family: var(--font-code); }
+    .data { color: #e5e7eb; word-break: break-all; margin-top: 4px; font-family: var(--font-code); }
+    .header-row { display: flex; justify-content: space-between; padding: 12px 16px; background: rgba(0,0,0,0.3); border-bottom: 1px solid var(--border); font-family: var(--font-code); }
+    .header-row h1 { font-size: 14px; font-family: var(--font-code); }
     .timeline { height: 60px; display: flex; align-items: center; padding: 0 12px; gap: 4px; background: rgba(0,0,0,0.3); }
     .timeline-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); cursor: pointer; }
     .timeline-dot.active { background: var(--green); box-shadow: 0 0 8px var(--green); }
@@ -94,20 +101,20 @@ function getDashboardHtml(): string {
     .sessions-list li { padding: 8px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
     .sessions-list li:hover { background: rgba(0,255,136,0.1); }
     .replay-bar { padding: 8px 12px; display: flex; gap: 8px; align-items: center; }
-    .replay-bar button { padding: 4px 12px; background: var(--border); border: none; color: var(--green); border-radius: 4px; cursor: pointer; font-family: inherit; }
+    .replay-bar button { padding: 4px 12px; background: var(--border); border: none; color: var(--green); border-radius: 4px; cursor: pointer; font-family: var(--font-code); }
     .replay-bar button:hover { background: #374151; }
     .replay-bar input[type="range"] { flex: 1; }
-    select { background: var(--surface); color: var(--green); border: 1px solid var(--border); padding: 4px 8px; border-radius: 4px; font-family: inherit; }
+    select { background: var(--surface); color: var(--green); border: 1px solid var(--border); padding: 4px 8px; border-radius: 4px; font-family: var(--font-code); }
   </style>
 </head>
 <body>
   <div class="scan-line"></div>
   <div class="header-row">
-    <h1>🔓 CipherMate DAST War Room</h1>
+    <h1>CipherMate DAST War Room</h1>
     <div>
       <label>Session: <select id="sessionSelect"></select></label>
       <button id="liveBtn">LIVE</button>
-      <button id="recordBtn">⏺ Record Video</button>
+      <button id="recordBtn">Record Video</button>
       <span id="recordStatus"></span>
     </div>
   </div>
@@ -127,8 +134,8 @@ function getDashboardHtml(): string {
     <div class="panel full">
       <div class="panel-tit">Timeline (screen-record style)</div>
       <div class="replay-bar">
-        <button id="playBtn">▶ Play</button>
-        <button id="pauseBtn">⏸ Pause</button>
+        <button id="playBtn">Play</button>
+        <button id="pauseBtn">Pause</button>
         <input type="range" id="scrubber" min="0" max="100" value="0">
         <span id="replayProgress">0 / 0</span>
       </div>
@@ -154,13 +161,23 @@ function getDashboardHtml(): string {
     let replayTimer = null;
     const MAX_EVENTS = 500;
 
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function addEvent(panel, ev, cls = '') {
       const d = ev.data || {};
       const dataStr = Object.keys(d).length ? JSON.stringify(d).slice(0, 280) : '';
       const time = new Date(ev.ts).toLocaleTimeString();
       const div = document.createElement('div');
       div.className = 'event ' + cls + (d.isHighPlus ? ' high-plus' : '');
-      div.innerHTML = '<span class="ts">' + time + '</span> <span class="type">' + ev.type + '</span>' + (d.isHighPlus ? ' <strong>⚠ HIGH+</strong>' : '') + '<div class="data">' + dataStr + '</div>';
+      div.innerHTML = '<span class="ts">' + escapeHtml(time) + '</span> <span class="type">' + escapeHtml(ev.type) + '</span>' + (d.isHighPlus ? ' <strong>HIGH+</strong>' : '') + '<div class="data">' + escapeHtml(dataStr) + '</div>';
       panel.appendChild(div);
       panel.scrollTop = panel.scrollHeight;
       while (panel.children.length > MAX_EVENTS) panel.removeChild(panel.firstChild);
@@ -189,7 +206,7 @@ function getDashboardHtml(): string {
     async function loadSessions() {
       const r = await fetch('/api/sessions');
       const ids = await r.json();
-      sessionSelect.innerHTML = '<option value="">-- Select --</option>' + ids.map(id => '<option value="' + id + '">' + id + '</option>').join('');
+      sessionSelect.innerHTML = '<option value="">-- Select --</option>' + ids.map(id => '<option value="' + escapeHtml(id) + '">' + escapeHtml(id) + '</option>').join('');
     }
     loadSessions();
 
@@ -205,7 +222,7 @@ function getDashboardHtml(): string {
       scrubber.value = 0;
       replayIndex = 0;
       replayProgress.textContent = '0 / ' + events.length;
-      timelinePanel.innerHTML = events.slice(0, 150).map((e, i) => '<span class="timeline-dot ' + (e.type === 'vuln_confirmed' ? 'vuln' : '') + '" data-i="' + i + '" title="' + e.type + '"></span>').join('');
+      timelinePanel.innerHTML = events.slice(0, 150).map((e, i) => '<span class="timeline-dot ' + (e.type === 'vuln_confirmed' ? 'vuln' : '') + '" data-i="' + i + '" title="' + escapeHtml(e.type) + '"></span>').join('');
     };
 
     scrubber.oninput = () => {
@@ -257,11 +274,11 @@ function getDashboardHtml(): string {
           a.click();
           URL.revokeObjectURL(a.href);
           recordStatus.textContent = 'Saved.';
-          recordBtn.textContent = '⏺ Record Video';
+          recordBtn.textContent = 'Record Video';
           setTimeout(() => recordStatus.textContent = '', 2000);
         };
         mediaRecorder.start();
-        recordBtn.textContent = '⏹ Stop & Save';
+        recordBtn.textContent = 'Stop & Save';
         recordStatus.textContent = 'Recording...';
       } catch (e) {
         recordStatus.textContent = 'Denied or unavailable';
@@ -285,8 +302,10 @@ function sendSse(ev: DastEvent): void {
   });
 }
 
-export function startWarRoomServer(port: number = DEFAULT_PORT): Promise<number> {
+export function startWarRoomServer(port: number = DEFAULT_PORT, opts?: { fontFamily?: string; fontFamilyCode?: string }): Promise<number> {
   return new Promise((resolve, reject) => {
+    if (opts?.fontFamily) fontConfig.fontFamily = opts.fontFamily;
+    if (opts?.fontFamilyCode) fontConfig.fontFamilyCode = opts.fontFamilyCode;
     if (server) {
       resolve(port);
       return;

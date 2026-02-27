@@ -110,6 +110,12 @@ export interface DastScanConfig {
   enableFileUploadTests?: boolean;
   /** PENTEST MODE: Max endpoints, concurrency, brutal payloads, agent swarm. Replaces Cobalt/XBOW. */
   pentestMode?: boolean;
+  /** WAF/Cloudflare evasion: rotating UAs, browser headers, 403 retries with header rotation */
+  wafEvasion?: boolean;
+  /** UNRESTRICTED: no delay, high concurrency, 1000 endpoints, 12 retries, circuit breaker disabled. No time limit. */
+  unrestrictedMode?: boolean;
+  /** Run nuclei (and optionally ffuf) when in PATH; merge findings. No time limit for external tools. */
+  enableExternalTools?: boolean;
   /** Max deep-dive agents to spawn for promising findings (default 10, pentest 100) */
   maxDeepDiveAgents?: number;
   /** 10x: Agents per promising finding - spawn N agents with different strategies (default 1, pentest 4) */

@@ -3,6 +3,10 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PenetrationTestingEngine } from './penetration-testing';
+import { AgentOrchestrator } from '../dast/agent-orchestrator';
+import { startWarRoomServer } from '../dast/war-room-server';
+import { dastEventBus } from '../dast/dast-event-bus';
+import { getFontConfig, getFontConfigCss, getFontConfigRaw } from '../core/font-config';
 
 // Red Team Operations Center
 export class RedTeamOperationsCenter {
@@ -13,6 +17,8 @@ export class RedTeamOperationsCenter {
   private socialEngineeringToolkit: SocialEngineeringToolkit;
   private codeObfuscator: CodeObfuscator;
   private payloadGenerator: PayloadGenerator;
+  private eventBusUnsubscribe: (() => void) | null = null;
+  private lastPentestResult: { vulnerabilities: any[]; targetUrl?: string } | null = null;
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
@@ -41,6 +47,30 @@ export class RedTeamOperationsCenter {
 
     this.panel.webview.html = this.getOperationsCenterHtml();
     this.setupMessageHandlers();
+    this.subscribeToEventBus();
+    this.panel.onDidDispose(() => {
+      if (this.eventBusUnsubscribe) {
+        this.eventBusUnsubscribe();
+        this.eventBusUnsubscribe = null;
+      }
+    });
+  }
+
+  private subscribeToEventBus(): void {
+    if (this.eventBusUnsubscribe) return;
+    this.eventBusUnsubscribe = dastEventBus.onEvent((ev) => {
+      if (this.panel) {
+        this.panel.webview.postMessage({
+          command: 'dastEvent',
+          event: {
+            type: ev.type,
+            ts: ev.ts,
+            sessionId: ev.sessionId,
+            data: ev.data
+          }
+        });
+      }
+    });
   }
 
   private getOperationsCenterHtml(): string {
@@ -52,6 +82,7 @@ export class RedTeamOperationsCenter {
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <title>Red Team Operations Center</title>
           <style>
+              :root { ${getFontConfigCss()} }
               * {
                   margin: 0;
                   padding: 0;
@@ -59,7 +90,7 @@ export class RedTeamOperationsCenter {
               }
               
               body {
-                  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                  font-family: var(--ciphermate-font-code);
                   background: var(--vscode-editor-background);
                   color: var(--vscode-foreground);
                   height: 100vh;
@@ -69,188 +100,260 @@ export class RedTeamOperationsCenter {
               
               .main-container {
                   display: flex;
+                  flex-direction: column;
                   width: 100%;
                   height: 100vh;
               }
               
-              .sidebar {
-                  width: 300px;
-                  background: var(--vscode-sideBar-background);
-                  border-right: 1px solid var(--vscode-panel-border);
-                  display: flex;
-                  flex-direction: column;
-              }
-              
-              .sidebar-header {
-                  padding: 15px;
+              .browser-bar {
                   background: var(--vscode-titleBar-activeBackground);
                   border-bottom: 1px solid var(--vscode-panel-border);
+                  padding: 12px 16px;
+                  flex-shrink: 0;
               }
               
-              .sidebar-header h2 {
-                  color: var(--vscode-textLink-foreground);
-                  font-size: 16px;
-                  margin-bottom: 5px;
-              }
-              
-              .sidebar-header p {
-                  color: var(--vscode-descriptionForeground);
-                  font-size: 12px;
-              }
-              
-              .module-list {
-                  flex: 1;
-                  overflow-y: auto;
-                  padding: 10px;
-              }
-              
-              .module-item {
-                  padding: 12px;
+              .url-bar {
+                  display: flex;
+                  align-items: center;
+                  gap: 10px;
                   margin-bottom: 8px;
-                  background: var(--vscode-list-hoverBackground);
-                  border: 1px solid var(--vscode-panel-border);
-                  cursor: pointer;
-                  transition: all 0.2s;
               }
               
-              .module-item:hover {
-                  background: var(--vscode-list-activeSelectionBackground);
-                  border-color: var(--vscode-textLink-foreground);
-              }
+              .url-icon { font-size: 16px; }
               
-              .module-item.active {
-                  background: var(--vscode-list-activeSelectionBackground);
-                  border-color: var(--vscode-textLink-foreground);
-              }
-              
-              .module-title {
-                  font-weight: bold;
-                  color: var(--vscode-foreground);
-                  margin-bottom: 4px;
-              }
-              
-              .module-description {
-                  font-size: 11px;
-                  color: var(--vscode-descriptionForeground);
-              }
-              
-              .main-content {
+              .url-input {
                   flex: 1;
-                  display: flex;
-                  flex-direction: column;
+                  padding: 10px 14px;
+                  background: var(--vscode-input-background);
+                  color: var(--vscode-input-foreground);
+                  border: 1px solid var(--vscode-input-border);
+                  border-radius: 6px;
+                  font-family: inherit;
+                  font-size: 13px;
               }
               
-              .content-header {
-                  padding: 15px;
-                  background: var(--vscode-titleBar-activeBackground);
-                  border-bottom: 1px solid var(--vscode-panel-border);
+              .url-input:focus {
+                  outline: none;
+                  border-color: var(--vscode-focusBorder);
+              }
+              
+              .url-input::placeholder {
+                  color: var(--vscode-input-placeholderForeground);
+              }
+              
+              .btn-pentest {
+                  background: var(--vscode-button-background);
+                  color: var(--vscode-button-foreground);
+                  font-weight: 600;
+              }
+              
+              .btn-pentest:disabled {
+                  opacity: 0.6;
+                  cursor: not-allowed;
+              }
+              
+              .btn-warroom {
+                  background: var(--vscode-button-secondaryBackground);
+                  color: var(--vscode-button-secondaryForeground);
+              }
+              
+              .status-row {
                   display: flex;
-                  justify-content: space-between;
                   align-items: center;
-              }
-              
-              .content-title {
-                  color: var(--vscode-foreground);
-                  font-size: 18px;
-                  font-weight: bold;
-              }
-              
-              .status-indicator {
-                  display: flex;
-                  align-items: center;
-                  gap: 8px;
-              }
-              
-              .status-dot {
-                  width: 8px;
-                  height: 8px;
-                  border-radius: 50%;
-                  background: var(--vscode-charts-green);
-              }
-              
-              .status-text {
+                  gap: 12px;
                   font-size: 12px;
                   color: var(--vscode-descriptionForeground);
               }
               
-              .content-area {
-                  flex: 1;
-                  display: flex;
-                  flex-direction: column;
-                  overflow: hidden;
+              .status-badge {
+                  padding: 2px 8px;
+                  border-radius: 4px;
+                  background: var(--vscode-badge-background);
+                  color: var(--vscode-badge-foreground);
               }
               
-              .chat-container {
+              .status-badge.running {
+                  background: var(--vscode-charts-orange);
+                  color: #fff;
+              }
+              
+              .status-badge.complete {
+                  background: var(--vscode-charts-green);
+                  color: #fff;
+              }
+              
+              .feed-container {
                   flex: 1;
                   display: flex;
                   flex-direction: column;
                   min-height: 0;
+                  overflow: hidden;
+                  background: #000;
               }
               
-              .chat-messages {
+              .feed-header {
+                  padding: 10px 16px;
+                  background: #000;
+                  border-bottom: 1px solid #0a3d0a;
+                  flex-shrink: 0;
+              }
+              
+              .feed-title {
+                  font-weight: 600;
+                  font-size: 13px;
+                  color: #00ff00;
+              }
+              
+              .feed-subtitle {
+                  font-size: 11px;
+                  color: #00aa00;
+                  margin-left: 8px;
+              }
+              
+              .activity-feed {
                   flex: 1;
                   overflow-y: auto;
-                  padding: 15px;
-                  background: var(--vscode-editor-background);
+                  padding: 12px 16px;
+                  background: #000;
+                  cursor: default;
+                  outline: none;
               }
               
-              .message {
-                  margin-bottom: 15px;
-                  padding: 10px;
-                  border-radius: 4px;
-                  max-width: 80%;
+              .feed-item {
+                  margin-bottom: 10px;
+                  padding: 10px 12px;
+                  border-radius: 2px;
+                  border-left: 4px solid #0a5c0a;
+                  background: #000;
               }
               
-              .message.user {
-                  background: var(--vscode-input-background);
-                  margin-left: auto;
-                  border: 1px solid var(--vscode-input-border);
+              .feed-item.vuln, .feed-item.vuln_confirmed {
+                  border-color: #00ff00;
+                  background: #000;
               }
               
-              .message.system {
-                  background: var(--vscode-textBlockQuote-background);
-                  border: 1px solid var(--vscode-textBlockQuote-border);
+              .feed-item.promising_finding {
+                  border-color: #00cc00;
               }
               
-              .message.ai {
-                  background: var(--vscode-textCodeBlock-background);
-                  border: 1px solid var(--vscode-textCodeBlock-border);
+              .feed-item.scan_started, .feed-item.strategist_started {
+                  border-color: #00dd00;
               }
               
-              .message-header {
+              .feed-item.scan_completed {
+                  border-color: #00ff00;
+              }
+              
+              .feed-item.welcome {
+                  border-color: #00aa00;
+              }
+              
+              .feed-time, .feed-type, .feed-content {
+                  font-family: var(--ciphermate-font-code);
+              }
+              .feed-time {
+                  font-size: 10px;
+                  color: #008800;
+                  margin-right: 8px;
+              }
+              
+              .feed-type {
                   font-size: 11px;
-                  color: var(--vscode-descriptionForeground);
-                  margin-bottom: 5px;
+                  font-weight: 600;
+                  text-transform: uppercase;
+                  color: #00ff00;
               }
               
-              .message-content {
-                  font-size: 13px;
-                  line-height: 1.4;
+              .feed-content {
+                  margin-top: 6px;
+                  font-size: 12px;
+                  line-height: 1.5;
+                  word-break: break-word;
+                  color: #00cc00;
               }
               
-              .chat-input-container {
-                  padding: 15px;
+              .feed-content strong {
+                  color: #00ff00;
+              }
+              
+              .feed-item small {
+                  color: #00aa00;
+              }
+              
+              .btn-terminal {
+                  background: #000 !important;
+                  color: #00ff00 !important;
+                  border: 1px solid #0a5c0a !important;
+              }
+              .btn-terminal:hover {
+                  background: #0a3d0a !important;
+                  color: #00ff00 !important;
+              }
+              
+              .activity-feed::-webkit-scrollbar {
+                  width: 8px;
+              }
+              .activity-feed::-webkit-scrollbar-track {
+                  background: #000;
+              }
+              .activity-feed::-webkit-scrollbar-thumb {
+                  background: #0a5c0a;
+                  border-radius: 2px;
+              }
+              
+              .qa-container {
+                  flex-shrink: 0;
+                  padding: 12px 16px;
                   background: var(--vscode-input-background);
                   border-top: 1px solid var(--vscode-panel-border);
               }
               
-              .chat-input {
-                  width: 100%;
-                  padding: 10px;
+              .qa-header {
+                  font-size: 12px;
+                  font-weight: 600;
+                  color: var(--vscode-foreground);
+                  margin-bottom: 8px;
+              }
+              
+              .qa-input-row {
+                  display: flex;
+                  gap: 8px;
+              }
+              
+              .qa-input {
+                  flex: 1;
+                  padding: 8px 12px;
                   background: var(--vscode-input-background);
                   color: var(--vscode-input-foreground);
                   border: 1px solid var(--vscode-input-border);
                   border-radius: 4px;
                   font-family: inherit;
-                  font-size: 13px;
-                  resize: none;
-                  min-height: 40px;
-                  max-height: 120px;
+                  font-size: 12px;
               }
               
-              .chat-input:focus {
+              .qa-input:focus {
                   outline: none;
                   border-color: var(--vscode-focusBorder);
+              }
+              
+              .btn-qa {
+                  padding: 8px 16px;
+              }
+              
+              .qa-responses {
+                  margin-top: 10px;
+                  max-height: 120px;
+                  overflow-y: auto;
+              }
+              
+              .qa-response {
+                  padding: 8px 10px;
+                  margin-bottom: 6px;
+                  background: var(--vscode-editor-background);
+                  border-radius: 4px;
+                  font-size: 12px;
+                  line-height: 1.4;
+                  font-family: var(--ciphermate-font-code);
               }
               
               .input-actions {
@@ -289,7 +392,7 @@ export class RedTeamOperationsCenter {
                   border-radius: 4px;
                   padding: 10px;
                   margin: 10px 0;
-                  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                  font-family: var(--ciphermate-font-code);
                   font-size: 12px;
                   overflow-x: auto;
               }
@@ -334,630 +437,206 @@ export class RedTeamOperationsCenter {
                   color: var(--vscode-terminal-foreground);
                   padding: 10px;
                   border-radius: 4px;
-                  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                  font-family: var(--ciphermate-font-code);
                   font-size: 11px;
                   max-height: 200px;
                   overflow-y: auto;
                   border: 1px solid var(--vscode-panel-border);
               }
+              
+              .quick-access {
+                  display: flex;
+                  align-items: center;
+                  gap: 6px;
+                  margin-top: 6px;
+                  font-size: 11px;
+                  color: var(--vscode-descriptionForeground);
+              }
+              .quick-access .qa-label { margin-right: 4px; }
+              .quick-access a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+              .quick-access a:hover { text-decoration: underline; }
+              .quick-access .qa-sep { color: var(--vscode-panel-border); }
           </style>
       </head>
       <body>
           <div class="main-container">
-              <div class="sidebar">
-                  <div class="sidebar-header">
-                      <h2>Red Team Operations</h2>
-                      <p>Advanced Penetration Testing Platform</p>
+              <div class="browser-bar">
+                  <div class="url-bar">
+                      <span class="url-icon"></span>
+                      <input type="text" id="targetUrl" class="url-input" placeholder="Enter URL or API endpoint (e.g. https://api.example.com)" />
+                      <button class="btn btn-pentest" id="startPentestBtn" onclick="startPentest()">Start Pentest</button>
+                      <button class="btn btn-warroom" id="warRoomBtn" onclick="openWarRoomLive()">War Room Live</button>
                   </div>
-                  <div class="module-list">
-                      <div class="module-item active" data-module="command-center">
-                          <div class="module-title">Command & Control</div>
-                          <div class="module-description">AI-powered attack coordination</div>
+                  <div class="status-row">
+                      <span class="status-badge" id="statusBadge">Ready</span>
+                      <span class="target-display" id="targetDisplay"></span>
                       </div>
-                      <div class="module-item" data-module="penetration-testing">
-                          <div class="module-title">Penetration Testing</div>
-                          <div class="module-description">Automated vulnerability exploitation</div>
+                  <div class="quick-access">
+                      <span class="qa-label">Quick access:</span>
+                      <a href="#" id="linkViewResults">View Results</a>
+                      <span class="qa-sep">|</span>
+                      <a href="#" id="linkViewImprovements">View Improvements</a>
+                      <span class="qa-sep">|</span>
+                      <a href="#" id="linkLoadLastPentest">Load Last Pentest</a>
+                      <span class="qa-sep">|</span>
+                      <a href="#" id="linkExport0x0">Export</a>
                       </div>
-                      <div class="module-item" data-module="network-security">
-                          <div class="module-title">Network Security</div>
-                          <div class="module-description">Network reconnaissance & attacks</div>
                       </div>
-                      <div class="module-item" data-module="web-security">
-                          <div class="module-title">Web Security</div>
-                          <div class="module-description">Web application testing</div>
+              
+              <div class="feed-container">
+                  <div class="feed-header">
+                      <span class="feed-title">Live Activity Feed</span>
+                      <span class="feed-subtitle">Findings and reports stream in as the pentest runs</span>
                       </div>
-                      <div class="module-item" data-module="mobile-security">
-                          <div class="module-title">Mobile Security</div>
-                          <div class="module-description">Mobile app penetration testing</div>
+                  <div class="activity-feed" id="activityFeed" tabindex="-1" role="log" aria-live="polite">
+                      <div class="feed-item welcome" id="welcomeMsg">
+                          <span class="feed-type">System</span>
+                          <div class="feed-content">
+                              Enter a URL above and click <strong>Start Pentest</strong> to launch the attack.
+                              Click <strong>War Room Live</strong> to open the full live dashboard in your browser.
+                              Findings will stream here as they are discovered.
                       </div>
-                      <div class="module-item" data-module="social-engineering">
-                          <div class="module-title">Social Engineering</div>
-                          <div class="module-description">Phishing & social attack tools</div>
-                      </div>
-                      <div class="module-item" data-module="code-obfuscation">
-                          <div class="module-title">Code Obfuscation</div>
-                          <div class="module-description">Payload generation & obfuscation</div>
-                      </div>
-                      <div class="module-item" data-module="ai-learning">
-                          <div class="module-title">AI Learning Engine</div>
-                          <div class="module-description">Self-improving attack algorithms</div>
                       </div>
                   </div>
               </div>
               
-              <div class="main-content">
-                  <div class="content-header">
-                      <div class="content-title">Command & Control Center</div>
-                      <div class="status-indicator">
-                          <div class="status-dot"></div>
-                          <div class="status-text">Operational</div>
+              <div class="qa-container">
+                  <div class="qa-header">Ask about the attack (when complete)</div>
+                  <div class="qa-input-row">
+                      <input type="text" id="qaInput" class="qa-input" placeholder="e.g. What was the most critical finding? How do I fix the SQL injection?" />
+                      <button class="btn btn-qa" id="askBtn" onclick="askAboutAttack()">Ask</button>
                       </div>
+                  <div class="qa-responses" id="qaResponses"></div>
                   </div>
                   
-                  <div class="content-area">
-                      <div class="chat-container">
-                          <div class="chat-messages" id="chatMessages">
-                              <div class="message system">
-                                  <div class="message-header">System</div>
-                                  <div class="message-content">
-                                      Red Team Operations Center initialized. AI attack engine ready.
-                                      <br><br>
-                                      Available commands:
-                                      <div class="code-block">
-                                          • scan [target] - Perform reconnaissance<br>
-                                          • exploit [vulnerability] - Launch targeted attack<br>
-                                          • generate [payload] - Create custom payload<br>
-                                          • obfuscate [code] - Obfuscate code for stealth<br>
-                                          • social [target] - Generate social engineering campaign<br>
-                                          • learn [data] - Train AI on new attack patterns<br>
-                                          • secure [code] - Test code for vulnerabilities<br>
-                                          • network [target] - Network penetration testing<br>
-                                          • web [url] - Web application security testing<br>
-                                          • mobile [app] - Mobile app security analysis
-                                      </div>
-                                  </div>
-                              </div>
-                          </div>
-                          
-                          <div class="chat-input-container">
-                              <textarea 
-                                  class="chat-input" 
-                                  id="chatInput" 
-                                  placeholder="Enter command or describe attack objective..."
-                                  rows="2"
-                              ></textarea>
-                              <div class="input-actions">
-                                  <button class="btn" onclick="sendMessage()">Execute</button>
-                                  <button class="btn secondary" onclick="clearChat()">Clear</button>
-                                  <button class="btn secondary" onclick="showHelp()">Help</button>
-                              </div>
-                          </div>
-                      </div>
-                  </div>
-              </div>
           </div>
           
           <script>
               const vscode = acquireVsCodeApi();
-              let currentModule = 'command-center';
+              const MAX_FEED_ITEMS = 300;
               
-              // Module switching
-              document.querySelectorAll('.module-item').forEach(item => {
-                  item.addEventListener('click', () => {
-                      document.querySelectorAll('.module-item').forEach(i => i.classList.remove('active'));
-                      item.classList.add('active');
-                      currentModule = item.dataset.module;
-                      switchModule(currentModule);
-                  });
-              });
-              
-              function switchModule(module) {
-                  const title = document.querySelector('.content-title');
-                  switch(module) {
-                      case 'command-center':
-                          title.textContent = 'Command & Control Center';
-                          break;
-                      case 'penetration-testing':
-                          title.textContent = 'Penetration Testing Module';
-                          break;
-                      case 'network-security':
-                          title.textContent = 'Network Security Testing';
-                          break;
-                      case 'web-security':
-                          title.textContent = 'Web Application Security';
-                          break;
-                      case 'mobile-security':
-                          title.textContent = 'Mobile Security Testing';
-                          break;
-                      case 'social-engineering':
-                          title.textContent = 'Social Engineering Toolkit';
-                          break;
-                      case 'code-obfuscation':
-                          title.textContent = 'Code Obfuscation Engine';
-                          break;
-                      case 'ai-learning':
-                          title.textContent = 'AI Learning Engine';
-                          break;
+              function startPentest() {
+                  const url = (document.getElementById('targetUrl').value || '').trim();
+                  if (!url) {
+                      addFeedItem({ type: 'error', content: 'Please enter a URL or API endpoint.' });
+                      return;
                   }
-              }
-              
-              function sendMessage() {
-                  const input = document.getElementById('chatInput');
-                  const message = input.value.trim();
-                  if (!message) return;
-                  
-                  addMessage('user', message);
-                  input.value = '';
-                  
-                  // Process command
-                  processCommand(message);
-              }
-              
-              function addMessage(type, content, metadata = {}) {
-                  const messagesContainer = document.getElementById('chatMessages');
-                  const messageDiv = document.createElement('div');
-                  messageDiv.className = \`message \${type}\`;
-                  
-                  const header = document.createElement('div');
-                  header.className = 'message-header';
-                  header.textContent = type === 'user' ? 'Operator' : type === 'ai' ? 'AI Engine' : 'System';
-                  
-                  const contentDiv = document.createElement('div');
-                  contentDiv.className = 'message-content';
-                  contentDiv.innerHTML = content;
-                  
-                  messageDiv.appendChild(header);
-                  messageDiv.appendChild(contentDiv);
-                  messagesContainer.appendChild(messageDiv);
-                  messagesContainer.scrollTop = messagesContainer.scrollHeight;
-              }
-              
-              function processCommand(command) {
-                  const lowerCommand = command.toLowerCase();
-                  
-                  if (lowerCommand.startsWith('scan ')) {
-                      const target = command.substring(5);
-                      executeScan(target);
-                  } else if (lowerCommand.startsWith('exploit ')) {
-                      const vulnerability = command.substring(8);
-                      executeExploit(vulnerability);
-                  } else if (lowerCommand.startsWith('generate ')) {
-                      const payload = command.substring(9);
-                      generatePayload(payload);
-                  } else if (lowerCommand.startsWith('obfuscate ')) {
-                      const code = command.substring(10);
-                      obfuscateCode(code);
-                  } else if (lowerCommand.startsWith('social ')) {
-                      const target = command.substring(7);
-                      generateSocialEngineering(target);
-                  } else if (lowerCommand.startsWith('learn ')) {
-                      const data = command.substring(6);
-                      trainAI(data);
-                  } else if (lowerCommand.startsWith('secure ')) {
-                      const code = command.substring(7);
-                      testCodeSecurity(code);
-                  } else if (lowerCommand.startsWith('network ')) {
-                      const target = command.substring(8);
-                      networkPenetrationTest(target);
-                  } else if (lowerCommand.startsWith('web ')) {
-                      const url = command.substring(4);
-                      webSecurityTest(url);
-                  } else if (lowerCommand.startsWith('mobile ')) {
-                      const app = command.substring(7);
-                      mobileSecurityTest(app);
-                  } else {
-                      // General AI response
-                      generateAIResponse(command);
+                  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                      addFeedItem({ type: 'error', content: 'URL must start with http:// or https://' });
+                      return;
                   }
+                  document.getElementById('startPentestBtn').disabled = true;
+                  document.getElementById('statusBadge').textContent = 'Running';
+                  document.getElementById('statusBadge').className = 'status-badge running';
+                  document.getElementById('targetDisplay').textContent = 'Target: ' + url;
+                  const welcome = document.getElementById('welcomeMsg');
+                  if (welcome) welcome.remove();
+                  addFeedItem({ type: 'scan_started', content: 'Pentest started for ' + url, data: { targetUrl: url } });
+                  vscode.postMessage({ command: 'startPentest', targetUrl: url });
               }
               
-              function executeScan(target) {
-                  addMessage('ai', \`Initiating reconnaissance on target: <strong>\${target}</strong><br><br>
-                      <div class="attack-status running">Status: Scanning in progress...</div>
-                      <div class="progress-bar">
-                          <div class="progress-fill" style="width: 0%" id="scanProgress"></div>
-                      </div>
-                      <div class="terminal-output" id="scanOutput"></div>
-                  \`);
-                  
-                  // Perform actual scanning
-                  performActualScan(target);
+              function openWarRoomLive() {
+                  vscode.postMessage({ command: 'openWarRoomLive' });
               }
               
-              async function performActualScan(target) {
-                  try {
-                      // Send scan request to extension
-                      vscode.postMessage({
-                          command: 'executeActualScan',
-                          target: target
-                      });
-                  } catch (error) {
-                      addMessage('system', \`Scan failed: \${error.message}\`);
-                  }
+              document.getElementById('linkViewResults')?.addEventListener('click', function(e) { e.preventDefault(); vscode.postMessage({ command: 'viewResults' }); });
+              document.getElementById('linkViewImprovements')?.addEventListener('click', function(e) { e.preventDefault(); vscode.postMessage({ command: 'viewResults', focusImprovements: true }); });
+              document.getElementById('linkLoadLastPentest')?.addEventListener('click', function(e) { e.preventDefault(); vscode.postMessage({ command: 'viewLastPentest' }); });
+              document.getElementById('linkExport0x0')?.addEventListener('click', function(e) { e.preventDefault(); vscode.postMessage({ command: 'exportTo0x0' }); });
+              
+              function askAboutAttack() {
+                  const q = (document.getElementById('qaInput').value || '').trim();
+                  if (!q) return;
+                  document.getElementById('qaInput').value = '';
+                  const el = document.createElement('div');
+                  el.className = 'qa-response';
+                  el.innerHTML = '<strong>You:</strong> ' + escapeHtml(q);
+                  document.getElementById('qaResponses').appendChild(el);
+                  vscode.postMessage({ command: 'askAboutAttack', question: q });
               }
               
-              function completeScan(target) {
-                  const output = document.getElementById('scanOutput');
-                  output.innerHTML = \`
-                      [INFO] Target: \${target}<br>
-                      [INFO] Port scan completed<br>
-                      [INFO] Service enumeration finished<br>
-                      [INFO] Vulnerability assessment done<br>
-                      [WARN] Found 3 potential attack vectors<br>
-                      [SUCCESS] Reconnaissance phase complete
-                  \`;
-                  
-                  addMessage('ai', \`Reconnaissance completed for <strong>\${target}</strong><br><br>
-                      <div class="attack-status success">Status: Scan completed successfully</div>
-                      <div class="code-block">
-                          <strong>Discovered Services:</strong><br>
-                          • HTTP (Port 80) - Apache 2.4.41<br>
-                          • HTTPS (Port 443) - Apache 2.4.41<br>
-                          • SSH (Port 22) - OpenSSH 8.0<br>
-                          • MySQL (Port 3306) - MySQL 8.0.19<br><br>
-                          <strong>Potential Vulnerabilities:</strong><br>
-                          • CVE-2021-44228 (Log4j)<br>
-                          • Weak SSH configuration<br>
-                          • Outdated Apache version
-                      </div>
-                  \`);
+              function escapeHtml(s) {
+                  const d = document.createElement('div');
+                  d.textContent = s;
+                  return d.innerHTML;
               }
               
-              function executeExploit(vulnerability) {
-                  addMessage('ai', \`Launching exploit for: <strong>\${vulnerability}</strong><br><br>
-                      <div class="attack-status running">Status: Exploitation in progress...</div>
-                      <div class="progress-bar">
-                          <div class="progress-fill" style="width: 0%" id="exploitProgress"></div>
-                      </div>
-                  \`);
-                  
-                  // Simulate exploitation
-                  let progress = 0;
-                  const interval = setInterval(() => {
-                      progress += Math.random() * 15;
-                      if (progress >= 100) {
-                          progress = 100;
-                          clearInterval(interval);
-                          addMessage('ai', \`Exploitation completed for <strong>\${vulnerability}</strong><br><br>
-                              <div class="attack-status success">Status: Exploit successful</div>
-                              <div class="code-block">
-                                  <strong>Exploit Results:</strong><br>
-                                  • Payload delivered successfully<br>
-                                  • Shell access obtained<br>
-                                  • Privilege escalation attempted<br>
-                                  • Persistence mechanism installed<br>
-                                  • Data exfiltration initiated
-                              </div>
-                          \`);
-                      }
-                      document.getElementById('exploitProgress').style.width = progress + '%';
-                  }, 800);
+              function addFeedItem(ev) {
+                  const feed = document.getElementById('activityFeed');
+                  const div = document.createElement('div');
+                  div.className = 'feed-item ' + (ev.type || 'info');
+                  const time = new Date().toLocaleTimeString();
+                  const dataStr = ev.data && Object.keys(ev.data).length ? JSON.stringify(ev.data).slice(0, 200) : '';
+                  div.innerHTML = '<span class="feed-time">' + time + '</span><span class="feed-type">' + (ev.type || 'Event') + '</span><div class="feed-content">' + escapeHtml(ev.content || '') + (dataStr ? '<br><small>' + escapeHtml(dataStr) + '</small>' : '') + '</div>';
+                  feed.appendChild(div);
+                  feed.scrollTop = feed.scrollHeight;
+                  while (feed.children.length > MAX_FEED_ITEMS) feed.removeChild(feed.firstChild);
               }
               
-              function generatePayload(payload) {
-                  addMessage('ai', \`Generating custom payload: <strong>\${payload}</strong><br><br>
-                      <div class="code-block">
-                          <strong>Generated Payload:</strong><br>
-                          <pre>\${generateObfuscatedCode(payload)}</pre>
-                      </div>
-                      <div class="attack-status success">Status: Payload generated and obfuscated</div>
-                  \`);
-              }
-              
-              function obfuscateCode(code) {
-                  addMessage('ai', \`Obfuscating code for stealth operations...<br><br>
-                      <div class="code-block">
-                          <strong>Original Code:</strong><br>
-                          <pre>\${code}</pre><br>
-                          <strong>Obfuscated Code:</strong><br>
-                          <pre>\${generateObfuscatedCode(code)}</pre>
-                      </div>
-                      <div class="attack-status success">Status: Code obfuscated successfully</div>
-                  \`);
-              }
-              
-              function generateSocialEngineering(target) {
-                  addMessage('ai', \`Generating social engineering campaign for: <strong>\${target}</strong><br><br>
-                      <div class="code-block">
-                          <strong>Campaign Strategy:</strong><br>
-                          • Phishing email template generated<br>
-                          • Fake website cloned<br>
-                          • Credential harvesting page created<br>
-                          • Social media reconnaissance completed<br>
-                          • Psychological profiling done<br><br>
-                          <strong>Attack Vectors:</strong><br>
-                          • Email phishing<br>
-                          • SMS phishing (SMiShing)<br>
-                          • Voice phishing (Vishing)<br>
-                          • Social media manipulation
-                      </div>
-                      <div class="attack-status success">Status: Social engineering toolkit ready</div>
-                  \`);
-              }
-              
-              function trainAI(data) {
-                  addMessage('ai', \`Training AI engine with new data: <strong>\${data}</strong><br><br>
-                      <div class="attack-status running">Status: Learning in progress...</div>
-                      <div class="progress-bar">
-                          <div class="progress-fill" style="width: 0%" id="learnProgress"></div>
-                      </div>
-                  \`);
-                  
-                  // Simulate learning
-                  let progress = 0;
-                  const interval = setInterval(() => {
-                      progress += Math.random() * 10;
-                      if (progress >= 100) {
-                          progress = 100;
-                          clearInterval(interval);
-                          addMessage('ai', \`AI learning completed for: <strong>\${data}</strong><br><br>
-                              <div class="attack-status success">Status: AI model updated</div>
-                              <div class="code-block">
-                                  <strong>Learning Results:</strong><br>
-                                  • Attack patterns analyzed<br>
-                                  • New techniques integrated<br>
-                                  • Success rate improved by 15%<br>
-                                  • False positive rate reduced by 8%<br>
-                                  • Response time optimized
-                              </div>
-                          \`);
-                      }
-                      document.getElementById('learnProgress').style.width = progress + '%';
-                  }, 1000);
-              }
-              
-              function testCodeSecurity(code) {
-                  addMessage('ai', \`Testing code security: <strong>\${code}</strong><br><br>
-                      <div class="code-block">
-                          <strong>Security Analysis Results:</strong><br>
-                          • SQL Injection: <span style="color: var(--vscode-charts-red)">VULNERABLE</span><br>
-                          • XSS: <span style="color: var(--vscode-charts-green)">SECURE</span><br>
-                          • CSRF: <span style="color: var(--vscode-charts-orange)">WARNING</span><br>
-                          • Authentication: <span style="color: var(--vscode-charts-red)">WEAK</span><br>
-                          • Authorization: <span style="color: var(--vscode-charts-orange)">ISSUES FOUND</span><br><br>
-                          <strong>Recommendations:</strong><br>
-                          • Implement parameterized queries<br>
-                          • Add CSRF tokens<br>
-                          • Strengthen authentication mechanism<br>
-                          • Review authorization logic
-                      </div>
-                      <div class="attack-status success">Status: Security analysis completed</div>
-                  \`);
-              }
-              
-              function networkPenetrationTest(target) {
-                  addMessage('ai', \`Initiating network penetration test: <strong>\${target}</strong><br><br>
-                      <div class="attack-status running">Status: Network testing in progress...</div>
-                      <div class="progress-bar">
-                          <div class="progress-fill" style="width: 0%" id="networkProgress"></div>
-                      </div>
-                  \`);
-                  
-                  // Simulate network testing
-                  let progress = 0;
-                  const interval = setInterval(() => {
-                      progress += Math.random() * 12;
-                      if (progress >= 100) {
-                          progress = 100;
-                          clearInterval(interval);
-                          addMessage('ai', \`Network penetration test completed: <strong>\${target}</strong><br><br>
-                              <div class="attack-status success">Status: Network test completed</div>
-                              <div class="code-block">
-                                  <strong>Network Security Assessment:</strong><br>
-                                  • Firewall bypass attempted<br>
-                                  • Intrusion detection evasion tested<br>
-                                  • Network segmentation analyzed<br>
-                                  • Wireless security assessed<br>
-                                  • VPN vulnerabilities identified<br><br>
-                                  <strong>Critical Findings:</strong><br>
-                                  • Weak WPA2 configuration<br>
-                                  • Unpatched network devices<br>
-                                  • Misconfigured firewall rules
-                              </div>
-                          \`);
-                      }
-                      document.getElementById('networkProgress').style.width = progress + '%';
-                  }, 600);
-              }
-              
-              function webSecurityTest(url) {
-                  addMessage('ai', \`Web application security testing: <strong>\${url}</strong><br><br>
-                      <div class="attack-status running">Status: Web testing in progress...</div>
-                      <div class="progress-bar">
-                          <div class="progress-fill" style="width: 0%" id="webProgress"></div>
-                      </div>
-                  \`);
-                  
-                  // Simulate web testing
-                  let progress = 0;
-                  const interval = setInterval(() => {
-                      progress += Math.random() * 18;
-                      if (progress >= 100) {
-                          progress = 100;
-                          clearInterval(interval);
-                          addMessage('ai', \`Web security test completed: <strong>\${url}</strong><br><br>
-                              <div class="attack-status success">Status: Web test completed</div>
-                              <div class="code-block">
-                                  <strong>Web Application Vulnerabilities:</strong><br>
-                                  • OWASP Top 10 assessment completed<br>
-                                  • Authentication bypass attempted<br>
-                                  • Session management tested<br>
-                                  • Input validation analyzed<br>
-                                  • Business logic flaws identified<br><br>
-                                  <strong>High Priority Issues:</strong><br>
-                                  • SQL injection in login form<br>
-                                  • XSS in user comments<br>
-                                  • Insecure direct object references
-                              </div>
-                          \`);
-                      }
-                      document.getElementById('webProgress').style.width = progress + '%';
-                  }, 400);
-              }
-              
-              function mobileSecurityTest(app) {
-                  addMessage('ai', \`Mobile application security testing: <strong>\${app}</strong><br><br>
-                      <div class="attack-status running">Status: Mobile testing in progress...</div>
-                      <div class="progress-bar">
-                          <div class="progress-fill" style="width: 0%" id="mobileProgress"></div>
-                      </div>
-                  \`);
-                  
-                  // Simulate mobile testing
-                  let progress = 0;
-                  const interval = setInterval(() => {
-                      progress += Math.random() * 14;
-                      if (progress >= 100) {
-                          progress = 100;
-                          clearInterval(interval);
-                          addMessage('ai', \`Mobile security test completed: <strong>\${app}</strong><br><br>
-                              <div class="attack-status success">Status: Mobile test completed</div>
-                              <div class="code-block">
-                                  <strong>Mobile Security Assessment:</strong><br>
-                                  • Static analysis completed<br>
-                                  • Dynamic analysis performed<br>
-                                  • Runtime application self-protection tested<br>
-                                  • Data storage security analyzed<br>
-                                  • Network communication assessed<br><br>
-                                  <strong>Critical Issues:</strong><br>
-                                  • Insecure data storage<br>
-                                  • Weak certificate pinning<br>
-                                  • Insufficient transport layer protection
-                              </div>
-                          \`);
-                      }
-                      document.getElementById('mobileProgress').style.width = progress + '%';
-                  }, 700);
-              }
-              
-              function generateAIResponse(command) {
-                  addMessage('ai', \`Processing command: <strong>\${command}</strong><br><br>
-                      <div class="code-block">
-                          <strong>AI Analysis:</strong><br>
-                          • Command parsed and understood<br>
-                          • Context analyzed<br>
-                          • Best approach determined<br>
-                          • Attack strategy formulated<br><br>
-                          <strong>Recommended Actions:</strong><br>
-                          • Perform reconnaissance first<br>
-                          • Identify attack surface<br>
-                          • Select appropriate tools<br>
-                          • Execute with stealth<br>
-                          • Maintain persistence
-                      </div>
-                      <div class="attack-status success">Status: AI analysis completed</div>
-                  \`);
-              }
-              
-              function generateObfuscatedCode(code) {
-                  // Simple obfuscation simulation
-                  const obfuscated = code
-                      .replace(/var/g, 'var _0x' + Math.random().toString(16).substr(2, 4))
-                      .replace(/function/g, 'function _0x' + Math.random().toString(16).substr(2, 4))
-                      .replace(/if/g, 'if(_0x' + Math.random().toString(16).substr(2, 4) + ')')
-                      .replace(/for/g, 'for(_0x' + Math.random().toString(16).substr(2, 4) + ')');
-                  
-                  return obfuscated || '// Obfuscated payload code would appear here';
-              }
-              
-              function clearChat() {
-                  document.getElementById('chatMessages').innerHTML = '';
-                  addMessage('system', 'Chat cleared. Red Team Operations Center ready for new commands.');
-              }
-              
-              function showHelp() {
-                  addMessage('system', \`
-                      <strong>Red Team Operations Center - Help</strong><br><br>
-                      <div class="code-block">
-                          <strong>Available Commands:</strong><br><br>
-                          <strong>Reconnaissance:</strong><br>
-                          • scan [target] - Perform target reconnaissance<br>
-                          • network [target] - Network penetration testing<br><br>
-                          <strong>Exploitation:</strong><br>
-                          • exploit [vulnerability] - Launch targeted exploit<br>
-                          • web [url] - Web application security testing<br>
-                          • mobile [app] - Mobile app security analysis<br><br>
-                          <strong>Payload Generation:</strong><br>
-                          • generate [payload] - Create custom payload<br>
-                          • obfuscate [code] - Obfuscate code for stealth<br><br>
-                          <strong>Social Engineering:</strong><br>
-                          • social [target] - Generate social engineering campaign<br><br>
-                          <strong>AI Learning:</strong><br>
-                          • learn [data] - Train AI on new attack patterns<br>
-                          • secure [code] - Test code for vulnerabilities<br><br>
-                          <strong>General:</strong><br>
-                          • help - Show this help message<br>
-                          • clear - Clear chat history
-                      </div>
-                  \`);
-              }
-              
-              // Handle Enter key in chat input
-              document.getElementById('chatInput').addEventListener('keydown', (e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      sendMessage();
-                  }
-              });
-              
-              // Handle scan results from extension
               window.addEventListener('message', event => {
-                  const message = event.data;
-                  if (message.command === 'scanResults') {
-                      displayActualScanResults(message.target, message.results);
-                  } else if (message.command === 'scanError') {
-                      displayScanError(message.target, message.error, message.explanation);
+                  const m = event.data;
+                  if (m.command === 'dastEvent') {
+                      const ev = m.event;
+                      const d = ev.data || {};
+                      let content = ev.type.replace(/_/g, ' ');
+                      if (d.targetUrl) content += ': ' + d.targetUrl;
+                      if (d.type) content += ' - ' + d.type;
+                      if (d.severity) content += ' (' + d.severity + ')';
+                      if (d.title) content += ': ' + d.title;
+                      if (d.count !== undefined) content += ' - ' + d.count + ' endpoints';
+                      addFeedItem({ type: ev.type, content: content, data: d });
+                  } else if (m.command === 'pentestComplete') {
+                      document.getElementById('startPentestBtn').disabled = false;
+                      document.getElementById('statusBadge').textContent = 'Complete';
+                      document.getElementById('statusBadge').className = 'status-badge complete';
+                      const summary = m.summary || {};
+                      const vulnCount = m.vulnerabilities?.length || 0;
+                      const notConfirmed = Math.max(0, (m.attacksPerformed || 0) - vulnCount);
+                      addFeedItem({ type: 'scan_completed', content: 'Pentest complete. Vulnerabilities: ' + vulnCount + ' (Critical: ' + (summary.critical || 0) + ', High: ' + (summary.high || 0) + ', Medium: ' + (summary.medium || 0) + '). ' + 
+                        (notConfirmed > 0 ? notConfirmed + ' payloads did not confirm - review for tool improvements.' : '') });
+                      var btn = document.createElement('div');
+                      btn.className = 'feed-item feed-actions';
+                      var actDiv = document.createElement('div');
+                      actDiv.className = 'feed-content';
+                      var vReport = document.createElement('button');
+                      vReport.className = 'btn btn-pentest btn-terminal';
+                      vReport.textContent = 'View Full Report';
+                      vReport.style.marginRight = '8px';
+                      vReport.onclick = function() { vscode.postMessage({ command: 'viewResults' }); };
+                      var vImprove = document.createElement('button');
+                      vImprove.className = 'btn btn-pentest btn-terminal';
+                      vImprove.textContent = 'View Improvements';
+                      vImprove.title = 'Open results and scroll to payloads that did not confirm vulnerabilities';
+                      vImprove.style.marginRight = '8px';
+                      vImprove.onclick = function() { vscode.postMessage({ command: 'viewResults', focusImprovements: true }); };
+                      var wRoom = document.createElement('button');
+                      wRoom.className = 'btn btn-warroom btn-terminal';
+                      wRoom.textContent = 'War Room Live';
+                      wRoom.onclick = function() { vscode.postMessage({ command: 'openWarRoomLive' }); };
+                      actDiv.appendChild(vReport);
+                      actDiv.appendChild(vImprove);
+                      actDiv.appendChild(wRoom);
+                      btn.innerHTML = '<span class="feed-type">Actions</span>';
+                      btn.appendChild(actDiv);
+                      document.getElementById('activityFeed').appendChild(btn);
+                  } else if (m.command === 'pentestError') {
+                      document.getElementById('startPentestBtn').disabled = false;
+                      document.getElementById('statusBadge').textContent = 'Error';
+                      document.getElementById('statusBadge').className = 'status-badge';
+                      addFeedItem({ type: 'error', content: 'Pentest failed: ' + (m.error || 'Unknown error') });
+                  } else if (m.command === 'warRoomPort') {
+                      addFeedItem({ type: 'info', content: 'War Room opened at http://localhost:' + m.port });
+                  } else if (m.command === 'askResponse') {
+                      const el = document.createElement('div');
+                      el.className = 'qa-response';
+                      el.innerHTML = '<strong>AI:</strong> ' + (m.response || 'No response');
+                      document.getElementById('qaResponses').appendChild(el);
                   }
               });
               
-              function displayScanError(target, error, explanation) {
-                  addMessage('ai', \`
-                      <div class="attack-status failed">Status: Scan failed for <strong>\${target}</strong></div>
-                      <div class="code-block">
-                          <strong>Error:</strong> \${error}<br><br>
-                          <strong>AI Analysis & Solutions:</strong><br>
-                          \${explanation}
-                      </div>
-                  \`);
-              }
-              
-              function displayActualScanResults(target, results) {
-                  const vulnerabilities = results.vulnerabilities || [];
-                  const exploits = results.exploits || [];
-                  
-                  let html = \`<strong>Actual Scan Results for \${target}</strong><br><br>\`;
-                  
-                  if (vulnerabilities.length > 0) {
-                      html += \`<div class="attack-status success">Status: \${vulnerabilities.length} vulnerabilities found</div>\`;
-                      html += \`<div class="code-block">\`;
-                      html += \`<strong>Discovered Vulnerabilities:</strong><br>\`;
-                      vulnerabilities.forEach(vuln => {
-                          html += \`• \${vuln.name} (Severity: \${vuln.severity})<br>\`;
-                          html += \`  - CVSS: \${vuln.cvss}<br>\`;
-                          html += \`  - Description: \${vuln.description}<br><br>\`;
-                      });
-                      html += \`</div>\`;
-                  } else {
-                      html += \`<div class="attack-status success">Status: No vulnerabilities found</div>\`;
-                  }
-                  
-                  if (exploits.length > 0) {
-                      html += \`<div class="code-block">\`;
-                      html += \`<strong>Exploitation Results:</strong><br>\`;
-                      exploits.forEach(exploit => {
-                          html += \`• \${exploit.vulnerability}: \${exploit.success ? 'SUCCESS' : 'FAILED'}<br>\`;
-                          if (exploit.output) {
-                              html += \`  - Output: \${exploit.output.substring(0, 200)}...<br>\`;
-                          }
-                      });
-                      html += \`</div>\`;
-                  }
-                  
-                  addMessage('ai', html);
-              }
-              
-              // Initialize
-              addMessage('system', 'Red Team Operations Center initialized. All systems operational.');
+              document.getElementById('qaInput').addEventListener('keydown', function(e) {
+                  if (e.key === 'Enter') { e.preventDefault(); askAboutAttack(); }
+              });
           </script>
       </body>
       </html>
@@ -969,6 +648,24 @@ export class RedTeamOperationsCenter {
 
     this.panel.webview.onDidReceiveMessage(async (message) => {
       switch (message.command) {
+        case 'startPentest':
+          await this.runPentest(message.targetUrl);
+          break;
+        case 'openWarRoomLive':
+          await this.openWarRoomLive();
+          break;
+        case 'askAboutAttack':
+          await this.answerAttackQuestion(message.question);
+          break;
+        case 'viewResults':
+          await vscode.commands.executeCommand('ciphermate.showPentestResults');
+          break;
+        case 'exportTo0x0':
+          await vscode.commands.executeCommand('ciphermate.uploadPentestFindings');
+          break;
+        case 'viewLastPentest':
+          await vscode.commands.executeCommand('ciphermate.viewPentestImprovements');
+          break;
         case 'executeAttack':
           await this.executeAttack(message.attackType, message.target);
           break;
@@ -986,6 +683,138 @@ export class RedTeamOperationsCenter {
           break;
       }
     });
+  }
+
+  private async runPentest(targetUrl: string): Promise<void> {
+    try {
+      const config = vscode.workspace.getConfiguration('ciphermate');
+      const orchestrator = new AgentOrchestrator(this.context);
+      const result = await orchestrator.run({
+        targetUrl,
+        discoverFromWorkspace: true,
+        pentestMode: true,
+        wafEvasion: config.get<boolean>('dast.wafEvasion', true),
+        unrestrictedMode: config.get<boolean>('dast.unrestrictedMode', true),
+        enableExternalTools: config.get<boolean>('dast.enableExternalTools', true),
+        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
+        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
+        enableDeepDive: true,
+        maxDeepDiveAgents: config.get<number>('dast.pentestAgentSwarmSize', 100),
+        agentsPerFinding: config.get<number>('dast.pentestAgentsPerFinding', 4),
+        resilienceRetries: config.get<number>('dast.resilienceRetries', 12),
+        maxEndpoints: config.get<number>('dast.pentestMaxEndpoints', 1000),
+        concurrency: config.get<number>('dast.pentestConcurrency', 80),
+        brutalMode: true,
+        adaptiveThrottling: false,
+        enableGraphQL: true,
+        enableJwtOAuth: true,
+        enableIdor: true,
+        enableFileUploadTests: config.get<boolean>('dast.enableFileUploadTests', true),
+      });
+      this.lastPentestResult = {
+        targetUrl,
+        vulnerabilities: result.vulnerabilities || []
+      };
+      if (this.panel) {
+        this.panel.webview.postMessage({
+          command: 'pentestComplete',
+          targetUrl,
+          vulnerabilities: result.vulnerabilities,
+          endpointsTested: result.endpointsTested ?? 0,
+          attacksPerformed: result.attacksPerformed ?? 0,
+          duration: result.duration ?? 0,
+          summary: {
+            critical: result.vulnerabilities?.filter((v: any) => v.severity === 'critical').length ?? 0,
+            high: result.vulnerabilities?.filter((v: any) => v.severity === 'high').length ?? 0,
+            medium: result.vulnerabilities?.filter((v: any) => v.severity === 'medium').length ?? 0,
+          }
+        });
+      }
+      await this.savePentestAndShowResults(targetUrl, result);
+    } catch (error) {
+      if (this.panel) {
+        this.panel.webview.postMessage({
+          command: 'pentestError',
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+
+  private async savePentestAndShowResults(targetUrl: string, result: any): Promise<void> {
+    const vulnerabilities = result.vulnerabilities || [];
+    const mapped = vulnerabilities.map((v: any) => {
+      const meta = { ...(v.metadata || {}) };
+      if (v.payload) meta.payload = v.payload;
+      if (v.curlReplay) meta.curlReplay = v.curlReplay;
+      if (v.responseSnippet) meta.responseSnippet = v.responseSnippet;
+      if (v.responseStatus != null) meta.responseStatus = v.responseStatus;
+      if (v.paramName) meta.paramName = v.paramName;
+      if (v.paramLocation) meta.paramLocation = v.paramLocation;
+      if (v.evidence) meta.evidence = v.evidence;
+      return {
+        tool: 'PENTEST',
+        path: v.endpoint || targetUrl,
+        file: v.endpoint || targetUrl,
+        start: { line: 0 },
+        extra: { message: v.description || v.title },
+        severity: (v.severity || 'info').toUpperCase(),
+        type: v.type,
+        description: v.description,
+        recommendation: v.recommendation,
+        curlReplay: v.curlReplay,
+        payload: v.payload,
+        responseSnippet: v.responseSnippet,
+        metadata: Object.keys(meta).length ? meta : undefined,
+        ...v,
+      };
+    });
+    this.context.globalState.update('ciphermate.pendingPentestResults', {
+      vulnerabilities: mapped,
+      targetUrl,
+      endpointsTested: result.endpointsTested ?? 0,
+      attacksPerformed: result.attacksPerformed ?? 0,
+      duration: result.duration ?? 0,
+    });
+    await vscode.commands.executeCommand('ciphermate.showPentestResults');
+  }
+
+  private async openWarRoomLive(): Promise<void> {
+    try {
+      const fonts = getFontConfigRaw();
+      const port = await startWarRoomServer(undefined, { fontFamily: fonts.fontFamily, fontFamilyCode: fonts.fontFamilyCode });
+      const uri = vscode.Uri.parse(`http://localhost:${port}`);
+      await vscode.env.openExternal(uri);
+      if (this.panel) {
+        this.panel.webview.postMessage({ command: 'warRoomPort', port });
+      }
+    } catch (error) {
+      if (this.panel) {
+        this.panel.webview.postMessage({
+          command: 'pentestError',
+          error: `Failed to open War Room: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+    }
+  }
+
+  private async answerAttackQuestion(question: string): Promise<void> {
+    try {
+      const response = await vscode.commands.executeCommand<string>('ciphermate.askAIAboutPentest', {
+        question,
+        targetUrl: this.lastPentestResult?.targetUrl,
+        vulnerabilities: this.lastPentestResult?.vulnerabilities,
+      });
+      if (this.panel) {
+        this.panel.webview.postMessage({ command: 'askResponse', response: response || 'No response.' });
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const fallback = `Could not get AI answer: ${errMsg}. Make sure your AI provider (OpenRouter, OpenAI, etc.) is configured in CipherMate Settings.`;
+      if (this.panel) {
+        this.panel.webview.postMessage({ command: 'askResponse', response: fallback });
+      }
+    }
   }
 
   private async executeAttack(attackType: string, target: string): Promise<void> {

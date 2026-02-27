@@ -5,6 +5,7 @@ import { getIntentRecognizer } from './intent-recognizer';
 import { CyberAgentAdapter } from './cyber-agent-adapter';
 import { getScanDataService, setLastScanResults, postResultsToWebviewExported, getLastScanResults } from '../extension';
 import { resolveAtMentions } from '../engine';
+import { getFontConfigCss } from '../core/font-config';
 
 // Optional Mastra import - will fail gracefully if packages not installed
 let MastraAdapter: any = null;
@@ -1474,6 +1475,7 @@ export class ChatInterface {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CipherMate</title>
     <style>
+        :root { ${getFontConfigCss()} }
         * {
             margin: 0;
             padding: 0;
@@ -1511,7 +1513,7 @@ export class ChatInterface {
         }
 
         body {
-            font-family: var(--vscode-font-family);
+            font-family: var(--ciphermate-font);
             background: var(--vscode-editor-background);
             color: var(--vscode-editor-foreground);
             height: 100vh;
@@ -1582,7 +1584,7 @@ export class ChatInterface {
             letter-spacing: -0.3px;
             color: var(--vscode-foreground);
             line-height: 1.2;
-            font-family: var(--vscode-font-family);
+            font-family: var(--ciphermate-font);
         }
 
         .welcome-subtitle {
@@ -1634,7 +1636,7 @@ export class ChatInterface {
             background: transparent;
             border: none;
             color: var(--vscode-input-foreground);
-            font-family: var(--vscode-font-family);
+            font-family: var(--ciphermate-font);
             font-size: 14px;
             outline: none;
             height: 22px;
@@ -1915,7 +1917,7 @@ export class ChatInterface {
             border: 1px solid var(--vscode-panel-border) !important;
             border-radius: 6px !important;
             padding: 10px 14px !important;
-            font-family: var(--vscode-editor-font-family) !important;
+            font-family: var(--ciphermate-font-code) !important;
             font-size: var(--vscode-editor-font-size) !important;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
         }
@@ -1935,7 +1937,7 @@ export class ChatInterface {
             border-radius: 4px;
             font-size: 11px;
             color: var(--vscode-descriptionForeground);
-            font-family: var(--vscode-editor-font-family);
+            font-family: var(--ciphermate-font-code);
             opacity: 0;
             transition: opacity 0.3s ease;
             max-height: 0;
@@ -2040,7 +2042,7 @@ export class ChatInterface {
             padding: 12px;
             margin: 8px 0;
             overflow-x: auto;
-            font-family: var(--vscode-editor-font-family, 'Consolas', 'Monaco', 'Courier New', monospace);
+            font-family: var(--ciphermate-font-code);
             font-size: 12px;
             line-height: 1.5;
         }
@@ -2056,7 +2058,7 @@ export class ChatInterface {
             color: var(--vscode-editor-foreground);
             padding: 2px 6px;
             border-radius: 3px;
-            font-family: var(--vscode-editor-font-family, 'Consolas', 'Monaco', 'Courier New', monospace);
+            font-family: var(--ciphermate-font-code);
             font-size: 0.9em;
         }
 
@@ -2157,7 +2159,7 @@ export class ChatInterface {
             padding: 4px 0;
         }
         .vuln-finding .vuln-location {
-            font-family: var(--vscode-editor-font-family);
+            font-family: var(--ciphermate-font-code);
             font-size: 12px;
         }
         .vuln-finding .vuln-description {
@@ -2167,7 +2169,7 @@ export class ChatInterface {
 
         /* Clickable file paths */
         .file-path-link {
-            font-family: var(--vscode-editor-font-family);
+            font-family: var(--ciphermate-font-code);
             background: var(--vscode-editor-background);
             padding: 2px 6px;
             border-radius: 3px;
@@ -2236,7 +2238,7 @@ export class ChatInterface {
             border-left: 3px solid var(--vscode-textLink-foreground);
             margin: 8px 0;
             gap: 8px;
-            font-family: 'Courier New', 'Monaco', 'Menlo', monospace;
+            font-family: var(--ciphermate-font-code);
             font-size: 13px;
             color: var(--vscode-foreground);
             opacity: 0;
@@ -2414,7 +2416,7 @@ export class ChatInterface {
             background: var(--vscode-input-background);
             color: var(--vscode-input-foreground);
             border: 1px solid var(--vscode-input-border);
-            font-family: var(--vscode-font-family);
+            font-family: var(--ciphermate-font);
             font-size: 14px;
             height: 44px;
             border-radius: 0 !important;
@@ -2511,7 +2513,7 @@ export class ChatInterface {
         code {
             background: var(--vscode-textCodeBlock-background);
             padding: 2px 4px;
-            font-family: var(--vscode-editor-font-family);
+            font-family: var(--ciphermate-font-code);
             font-size: 13px;
             border-radius: 0 !important;
             -webkit-border-radius: 0 !important;

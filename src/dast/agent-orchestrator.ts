@@ -31,6 +31,7 @@ import {
 import { analyzeResponseRules, analyzeResponseWithAI, AnalyzeRequest } from './response-analyzer';
 import { runWithConcurrency, getAdaptiveDelay, toCurl } from './http-client';
 import { httpRequestWithRetry, resetCircuitBreaker } from './resilient-http';
+import { mergeWithEvasion } from './waf-evasion';
 import { toSarif, generateExecutiveSummary } from './report-generator';
 import { runGraphQLAttacks } from './attacks/graphql-attack';
 import { runJwtAttacks } from './attacks/jwt-attack';
@@ -48,6 +49,7 @@ import {
   isPromisingFinding,
 } from './deep-dive-agents';
 import { dastEventBus } from './dast-event-bus';
+import { hasBinary, runNuclei } from './external-tools';
 
 const REQUIRED_HEADERS: Array<{ name: string; recommended: string; severity: 'critical' | 'high' | 'medium' | 'low' | 'info' }> = [
   { name: 'Strict-Transport-Security', recommended: 'max-age=31536000; includeSubDomains', severity: 'high' },
@@ -68,9 +70,11 @@ export class AgentOrchestrator {
     let attacksPerformed = 0;
     const pentest = config.pentestMode ?? false;
     const brutal = config.brutalMode ?? pentest ?? false;
+    const wafEvasion = config.wafEvasion ?? (pentest || brutal);
+    const unrestricted = config.unrestrictedMode ?? false;
     const deepDive = config.enableDeepDive ?? true;
-    const concurrency = pentest ? (config.concurrency ?? 50) : brutal ? Math.min(config.concurrency ?? 10, 20) : Math.min(config.concurrency ?? 5, 15);
-    let delay = brutal ? 0 : (config.delayBetweenRequestsMs ?? 80);
+    const concurrency = unrestricted ? (config.concurrency ?? 80) : pentest ? (config.concurrency ?? 50) : brutal ? Math.min(config.concurrency ?? 10, 20) : Math.min(config.concurrency ?? 5, 15);
+    let delay = (unrestricted || brutal) ? 0 : (config.delayBetweenRequestsMs ?? 80);
     const useAI = config.enableAIResponseAnalysis ?? true;
     const timeout = config.requestTimeoutMs ?? 10000;
 
@@ -85,7 +89,7 @@ export class AgentOrchestrator {
       const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       const endpoints = await this.discoverEndpoints(config, workspacePath);
       ev('endpoint_discovered', { count: endpoints.length, paths: endpoints.slice(0, 20).map(e => e.path || e.url) });
-      const maxEndpoints = pentest ? (config.maxEndpoints ?? 300) : brutal ? Math.min(config.maxEndpoints ?? 50, 100) : (config.maxEndpoints ?? 30);
+      const maxEndpoints = unrestricted ? (config.maxEndpoints ?? 1000) : pentest ? (config.maxEndpoints ?? 300) : brutal ? Math.min(config.maxEndpoints ?? 50, 100) : (config.maxEndpoints ?? 30);
       let toTest = endpoints.slice(0, maxEndpoints);
 
       let profile: Awaited<ReturnType<typeof buildTargetContext>> | null = null;
@@ -202,7 +206,8 @@ export class AgentOrchestrator {
             task.endpoint.method,
             task.paramName,
             task.payload,
-            task.injectAsJson
+            task.injectAsJson,
+            wafEvasion
           );
 
           ev('payload_sent', {
@@ -218,9 +223,11 @@ export class AgentOrchestrator {
             headers: injected.headers,
             body: injected.body,
             auth: config.auth,
-            timeout,
-            maxRetries: config.resilienceRetries ?? 3,
-            circuitBreakerThreshold: config.resilienceCircuitThreshold ?? 5,
+            timeout: unrestricted ? (timeout + 15000) : timeout,
+            maxRetries: unrestricted ? (config.resilienceRetries ?? 12) : (config.resilienceRetries ?? 3),
+            circuitBreakerThreshold: unrestricted ? 999 : (config.resilienceCircuitThreshold ?? 5),
+            retryOn403: wafEvasion,
+            evasionUrl: wafEvasion ? injected.url : undefined,
           });
 
           if (config.adaptiveThrottling && (resp.status === 429 || resp.status === 503)) {
@@ -264,6 +271,8 @@ export class AgentOrchestrator {
               headers: injected.headers,
               body: injected.body,
             });
+            (vuln as any).responseSnippet = (resp.body || '').slice(0, 3000);
+            (vuln as any).responseStatus = resp.status;
             ev('vuln_confirmed', {
               type: vuln.type,
               endpoint: vuln.endpoint,
@@ -420,6 +429,19 @@ export class AgentOrchestrator {
         }
       }
 
+      if ((config.enableExternalTools ?? unrestricted) && (await hasBinary('nuclei'))) {
+        ev('external_tool_started', { tool: 'nuclei' });
+        try {
+          const nucleiFindings = await runNuclei(config.targetUrl, { severity: ['critical', 'high', 'medium', 'low'] });
+          for (const v of nucleiFindings) {
+            ev('vuln_confirmed', { type: v.type, endpoint: v.endpoint, severity: v.severity, title: v.title });
+            vulnerabilities.push(v);
+          }
+        } catch (e) {
+          console.warn('Nuclei integration failed', e);
+        }
+      }
+
       const deduped = this.deduplicateVulns(vulnerabilities);
       ev('scan_completed', {
         success: true,
@@ -492,13 +514,15 @@ export class AgentOrchestrator {
     method: string,
     paramName: string,
     payload: string,
-    asJson = false
+    asJson = false,
+    useEvasion = false
   ): { url: string; method: string; headers: Record<string, string>; body?: string } {
     try {
       const u = new URL(url);
-      const headers: Record<string, string> = { 'User-Agent': 'CipherMate-DAST/2.0', Accept: '*/*' };
+      const base: Record<string, string> = { 'User-Agent': 'CipherMate-DAST/2.0', Accept: '*/*' };
+      const headers = useEvasion ? mergeWithEvasion(base, url, true) : base;
       if (asJson) {
-        headers['Content-Type'] = 'application/json';
+        (headers as Record<string, string>)['Content-Type'] = 'application/json';
         return {
           url: u.toString(),
           method: method === 'GET' ? 'POST' : method,

@@ -23,6 +23,8 @@ import { getLiveDiagnosticsService } from './core/live-diagnostics-service';
 import { AgentOrchestrator } from './dast/agent-orchestrator';
 import { startWarRoomServer } from './dast/war-room-server';
 import { discoverApisBrutal } from './dast/api-discovery-brutal';
+import { extractMaterialsFromVulns, buildFindingsJson } from './services/upload-findings';
+import { getFontConfig, getFontConfigCss, getFontConfigRaw } from './core/font-config';
 
 // Enterprise Architecture - Core Infrastructure
 interface Logger {
@@ -1575,6 +1577,10 @@ class VulnerabilityCodeLensProvider implements vscode.CodeLensProvider {
 
 const vulnerabilityCodeLensProvider = new VulnerabilityCodeLensProvider();
 let resultsPanel: vscode.WebviewPanel | null = null;
+let pentestResultsPanel: vscode.WebviewPanel | null = null;
+let lastPentestResults: any[] = [];
+let focusImprovementsOnNextUpdate = false;
+let forceLatestScanForNextUpdate: { id: string; scanType?: string; metadata?: Record<string, unknown>; timestamp?: Date | string; totalVulnerabilities?: number; criticalCount?: number; highCount?: number; mediumCount?: number; lowCount?: number } | null = null;
 let encryptionKey: Buffer | null = null;
 let activeCodeReviewer: ActiveCodeReviewer | null = null;
 let scanDataService: ScanDataService | null = null;
@@ -1793,6 +1799,9 @@ function getVSCodeSettings() {
       apiPreference: config.get<'nvd' | 'mitre' | 'both'>('cve.apiPreference', 'both'),
       rateLimitDelay: config.get<number>('cve.rateLimitDelay', 200),
     },
+    // Font settings
+    fontFamily: config.get<string>('fontFamily', ''),
+    fontFamilyCode: config.get<string>('fontFamilyCode', ''),
     // UI settings
     ui: {
       showCodeLens: config.get<boolean>('ui.showCodeLens', true),
@@ -1917,7 +1926,7 @@ async function exportSecurityAudit(context: vscode.ExtensionContext): Promise<vo
       byFile[file] = (byFile[file] || 0) + 1;
     });
     
-    // Generate HTML report
+    const fonts = getFontConfigRaw();
     const reportHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1927,7 +1936,7 @@ async function exportSecurityAudit(context: vscode.ExtensionContext): Promise<vo
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: ${fonts.fontFamily};
             line-height: 1.6;
             color: #333;
             background: #fff;
@@ -2039,7 +2048,7 @@ async function exportSecurityAudit(context: vscode.ExtensionContext): Promise<vo
             margin: 5px 0;
         }
         .vuln-file {
-            font-family: 'Courier New', monospace;
+            font-family: ${fonts.fontFamilyCode};
             color: #007acc;
             font-weight: bold;
         }
@@ -2279,11 +2288,14 @@ async function postResultsToWebview() {
           currentResultsLength: results.length
         });
         
-        latestScanInfo = recentScans.length > 0 ? recentScans[0] : null;
-        // When no in-memory results, load latest scan from database so Refresh shows something
-        if (recentScans.length > 0 && results.length === 0 && latestScanInfo) {
+        latestScanInfo = (forceLatestScanForNextUpdate as any) || null;
+        if (forceLatestScanForNextUpdate) forceLatestScanForNextUpdate = null;
+        // When no in-memory results, load latest NON-Pentest scan from database (pentest has its own panel)
+        const latestNonPentest = recentScans.find((s: any) => s.scanType !== 'Pentest');
+        const toLoad = latestScanInfo || latestNonPentest;
+        if (recentScans.length > 0 && results.length === 0 && toLoad) {
           try {
-            const dbVulns = scanDataService.getVulnerabilities(latestScanInfo.id);
+            const dbVulns = scanDataService.getVulnerabilities(toLoad.id);
             results = dbVulns.map((v: any) => ({
               tool: v.type || 'Unknown',
               path: v.file || '',
@@ -2296,10 +2308,13 @@ async function postResultsToWebview() {
               description: v.description,
             }));
             lastScanResults = results;
-            logger?.info('postResultsToWebview: Loaded from database', { scanId: latestScanInfo.id, count: results.length });
+            latestScanInfo = toLoad;
+            logger?.info('postResultsToWebview: Loaded from database', { scanId: toLoad.id, count: results.length });
           } catch (e) {
             logger?.warn('postResultsToWebview: Failed to load from database', e as Error);
           }
+        } else if (!latestScanInfo && recentScans.length > 0) {
+          latestScanInfo = recentScans[0];
         }
       } catch (error) {
         logger?.error('Failed to load scan data from database', error as Error);
@@ -2381,17 +2396,20 @@ async function postResultsToWebview() {
       }
     }
     
-    // Send comprehensive data to webview (using current scan statistics, not aggregated)
+    // Send comprehensive data to webview (pentest has its own panel, exclude from main)
     try {
       const suppressionsList = Array.from(suppressions);
+      const mainPanelScans = recentScans.filter((s: any) => s.scanType !== 'Pentest');
       const message = { 
         command: 'updateResults', 
         results: results,
         scanStatistics: currentScanStatistics, // Use current scan stats, not aggregated
-        recentScans: recentScans,
+        recentScans: mainPanelScans,
         vulnerabilityAnalysis: vulnerabilityAnalysis, // Include analysis for charts and trends
-        suppressions: suppressionsList
+        suppressions: suppressionsList,
+        focusImprovements: focusImprovementsOnNextUpdate
       };
+      if (focusImprovementsOnNextUpdate) focusImprovementsOnNextUpdate = false;
       
       logger?.info('Posting message to webview', { 
         resultCount: results.length,
@@ -2426,6 +2444,56 @@ async function postResultsToWebview() {
       });
     }
   }
+}
+
+async function postPentestResultsToWebview(): Promise<void> {
+  if (!pentestResultsPanel?.webview) return;
+  let results = Array.isArray(lastPentestResults) ? lastPentestResults : [];
+  let recentPentestScans: any[] = [];
+  let latestScanInfo: any = null;
+  if (scanDataService) {
+    const all = scanDataService.getRecentScans(50);
+    recentPentestScans = all.filter(s => s.scanType === 'Pentest');
+    if (results.length === 0 && recentPentestScans.length > 0 && forceLatestScanForNextUpdate?.scanType !== 'Pentest') {
+      const latest = recentPentestScans[0];
+      latestScanInfo = latest;
+      const dbVulns = scanDataService.getVulnerabilities(latest.id);
+      results = dbVulns.map((v: any) => ({
+        tool: v.type || 'PENTEST', path: v.file, start: { line: v.line || 0 },
+        severity: (v.severity || 'INFO').toUpperCase(), type: v.type,
+        extra: { message: v.description || v.title }, title: v.title, description: v.description,
+        metadata: v.metadata ? JSON.parse(v.metadata) : {},
+      }));
+      lastPentestResults = results;
+    } else if (forceLatestScanForNextUpdate?.scanType === 'Pentest') {
+      latestScanInfo = forceLatestScanForNextUpdate;
+      if (results.length === 0 && latestScanInfo.id) {
+        const dbVulns = scanDataService.getVulnerabilities(latestScanInfo.id);
+        results = dbVulns.map((v: any) => ({
+          tool: v.type || 'PENTEST', path: v.file, start: { line: v.line || 0 },
+          severity: (v.severity || 'INFO').toUpperCase(), type: v.type,
+          extra: { message: v.description || v.title }, title: v.title, description: v.description,
+          metadata: v.metadata ? JSON.parse(v.metadata) : {},
+        }));
+        lastPentestResults = results;
+      }
+      forceLatestScanForNextUpdate = null;
+    }
+  }
+  const scanStatistics = {
+    totalVulnerabilities: results.length,
+    criticalCount: results.filter((r: any) => /CRITICAL|ERROR/.test((r.severity || '').toUpperCase())).length,
+    highCount: results.filter((r: any) => /HIGH|WARNING/.test((r.severity || '').toUpperCase())).length,
+    mediumCount: results.filter((r: any) => /MEDIUM|INFO/.test((r.severity || '').toUpperCase())).length,
+    lowCount: results.filter((r: any) => /LOW/.test((r.severity || '').toUpperCase())).length,
+    latestScan: latestScanInfo,
+  };
+  pentestResultsPanel.webview.postMessage({
+    command: 'updatePentestResults',
+    results,
+    recentPentestScans,
+    scanStatistics,
+  });
 }
 
 async function callLmStudio(prompt: string): Promise<string> {
@@ -5128,7 +5196,8 @@ export function activate(context: vscode.ExtensionContext) {
   let warRoomPort: number | null = null;
   let openDastWarRoomDisposable = vscode.commands.registerCommand('ciphermate.openDastWarRoom', async () => {
     try {
-      const port = warRoomPort ?? await startWarRoomServer();
+      const fonts = getFontConfigRaw();
+      const port = warRoomPort ?? await startWarRoomServer(undefined, { fontFamily: fonts.fontFamily, fontFamilyCode: fonts.fontFamilyCode });
       warRoomPort = port;
       const uri = vscode.Uri.parse(`http://localhost:${port}`);
       await vscode.env.openExternal(uri);
@@ -5344,16 +5413,19 @@ export function activate(context: vscode.ExtensionContext) {
         targetUrl: targetUrl.trim(),
         discoverFromWorkspace: true,
         pentestMode: true,
+        wafEvasion: config.get<boolean>('dast.wafEvasion', true),
+        unrestrictedMode: config.get<boolean>('dast.unrestrictedMode', true),
+        enableExternalTools: config.get<boolean>('dast.enableExternalTools', true),
         enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
         enableContextAware: config.get<boolean>('dast.enableContextAware', true),
         enableDeepDive: true,
         maxDeepDiveAgents: config.get<number>('dast.pentestAgentSwarmSize', 100),
         agentsPerFinding: config.get<number>('dast.pentestAgentsPerFinding', 4),
-        resilienceRetries: config.get<number>('dast.resilienceRetries', 3),
+        resilienceRetries: config.get<number>('dast.resilienceRetries', 12),
         resilienceCircuitThreshold: config.get<number>('dast.resilienceCircuitThreshold', 5),
-        maxEndpoints: config.get<number>('dast.pentestMaxEndpoints', 300),
-        concurrency: config.get<number>('dast.pentestConcurrency', 50),
-        adaptiveThrottling: config.get<boolean>('dast.adaptiveThrottling', true),
+        maxEndpoints: config.get<number>('dast.pentestMaxEndpoints', 1000),
+        concurrency: config.get<number>('dast.pentestConcurrency', 80),
+        adaptiveThrottling: false,
         enableGraphQL: true,
         enableJwtOAuth: true,
         enableIdor: true,
@@ -5375,10 +5447,31 @@ export function activate(context: vscode.ExtensionContext) {
         type: v.type,
         ...v,
       }));
-      lastScanResults = mapped;
-      cleanupScanResults();
-      saveEncryptedData(lastScanResults, context);
-      postResultsToWebview();
+      lastPentestResults = mapped;
+      saveEncryptedData(mapped, context);
+      if (scanDataService) {
+        try {
+          const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+          const attacksNotConfirmed = Math.max(0, (result.attacksPerformed || 0) - (result.vulnerabilities?.length || 0));
+          await scanDataService.saveScan({
+            scanType: 'Pentest',
+            workspacePath,
+            vulnerabilities: mapped,
+            timestamp: new Date(),
+            duration: result.duration || 0,
+            metadata: {
+              targetUrl: result.targetUrl,
+              scanName: `Pentest: ${result.targetUrl}`,
+              endpointsTested: result.endpointsTested || 0,
+              attacksPerformed: result.attacksPerformed || 0,
+              attacksNotConfirmed,
+            },
+          });
+        } catch (e) {
+          logger?.warn('Failed to save pentest to database', e as Error);
+        }
+      }
+      await postPentestResultsToWebview();
 
       const highPlus = result.pentestHighPlusFindings || [];
       const crit = highPlus.filter((f: any) => f.severity === 'critical').length;
@@ -5388,7 +5481,7 @@ export function activate(context: vscode.ExtensionContext) {
         `Pentest complete: ${result.endpointsTested} endpoints, ${result.attacksPerformed} attacks, ${result.vulnerabilities.length} findings (${crit} critical, ${high} high). No High+? Money back.`
       );
       if (result.vulnerabilities.length > 0) {
-        await vscode.commands.executeCommand('ciphermate.showResults');
+        await vscode.commands.executeCommand('ciphermate.showPentestResults');
       }
     } catch (error) {
       showNotification(NotificationType.ERROR, `Pentest failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -5574,6 +5667,10 @@ export function activate(context: vscode.ExtensionContext) {
             await config.update('cve.rateLimitDelay', settings.cve.rateLimitDelay, vscode.ConfigurationTarget.Global);
           }
           
+          // Font settings
+          if (settings.fontFamily !== undefined) await config.update('fontFamily', settings.fontFamily.trim(), vscode.ConfigurationTarget.Global);
+          if (settings.fontFamilyCode !== undefined) await config.update('fontFamilyCode', settings.fontFamilyCode.trim(), vscode.ConfigurationTarget.Global);
+          
           // UI settings
           if (settings.ui) {
             await config.update('ui.showCodeLens', settings.ui.showCodeLens, vscode.ConfigurationTarget.Global);
@@ -5716,8 +5813,256 @@ export function activate(context: vscode.ExtensionContext) {
     });
   });
 
+  // Command: Show Pentest Results (dedicated pentest panel, separate from main scan results)
+  let showPentestResultsDisposable = vscode.commands.registerCommand('ciphermate.showPentestResults', async (args?: { scanId?: string }) => {
+    const scanIdArg = args?.scanId;
+    const pending = context.globalState.get<{
+      vulnerabilities: any[];
+      targetUrl: string;
+      endpointsTested: number;
+      attacksPerformed: number;
+      duration: number;
+    }>('ciphermate.pendingPentestResults');
+    if (pending && Array.isArray(pending.vulnerabilities)) {
+      context.globalState.update('ciphermate.pendingPentestResults', undefined);
+      const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const scanName = `Pentest: ${pending.targetUrl || 'Unknown'}`;
+      const attacksNotConfirmed = Math.max(0, (pending.attacksPerformed || 0) - pending.vulnerabilities.length);
+      if (scanDataService) {
+        try {
+          await scanDataService.saveScan({
+            scanType: 'Pentest',
+            workspacePath,
+            vulnerabilities: pending.vulnerabilities,
+            timestamp: new Date(),
+            duration: pending.duration || 0,
+            metadata: {
+              targetUrl: pending.targetUrl,
+              scanName,
+              endpointsTested: pending.endpointsTested || 0,
+              attacksPerformed: pending.attacksPerformed || 0,
+              attacksNotConfirmed,
+            },
+          });
+          logger?.info('Pentest results saved to database', { count: pending.vulnerabilities.length });
+        } catch (e) {
+          logger?.warn('Failed to save pentest to database', e as Error);
+        }
+      }
+      lastPentestResults = pending.vulnerabilities;
+      saveEncryptedData(pending.vulnerabilities, context);
+      showNotification(
+        pending.vulnerabilities.length > 0 ? NotificationType.VULNERABILITY : NotificationType.INFO,
+        `Pentest results: ${pending.vulnerabilities.length} findings. ${attacksNotConfirmed} payloads did not confirm - review for improvements.`
+      );
+    } else if (scanDataService) {
+      const recent = scanDataService.getRecentScans(50);
+      const toLoad = scanIdArg
+        ? recent.find((s: any) => s.id === scanIdArg)
+        : recent.find(s => s.scanType === 'Pentest');
+      if (toLoad && toLoad.scanType === 'Pentest') {
+        const vulns = scanDataService.getVulnerabilities(toLoad.id);
+        lastPentestResults = vulns.map((v: any) => ({
+          tool: v.type || 'PENTEST', path: v.file, start: { line: v.line || 0 },
+          severity: (v.severity || 'INFO').toUpperCase(), type: v.type,
+          extra: { message: v.description || v.title }, title: v.title, description: v.description,
+          metadata: v.metadata ? JSON.parse(v.metadata) : {},
+        }));
+        forceLatestScanForNextUpdate = { ...toLoad, scanType: 'Pentest' };
+      }
+    }
+    if (!pentestResultsPanel) {
+      pentestResultsPanel = vscode.window.createWebviewPanel(
+        'ciphermatePentestResults',
+        'CipherMate Pentest Results',
+        vscode.ViewColumn.One,
+        { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [context.extensionUri] }
+      );
+      pentestResultsPanel.webview.html = getPentestResultsPanelHtml(context, pentestResultsPanel);
+      pentestResultsPanel.onDidDispose(() => { pentestResultsPanel = null; }, null, context.subscriptions);
+      pentestResultsPanel.webview.onDidReceiveMessage(async (msg) => {
+        if (msg.command === 'pentestWebviewReady') {
+          await postPentestResultsToWebview();
+        } else if (msg.command === 'loadPentestScan' && msg.scanId && scanDataService) {
+          try {
+            const vulns = scanDataService.getVulnerabilities(msg.scanId);
+            lastPentestResults = vulns.map((v: any) => ({
+              tool: v.type || 'PENTEST', path: v.file, start: { line: v.line || 0 },
+              severity: (v.severity || 'INFO').toUpperCase(), type: v.type,
+              extra: { message: v.description || v.title }, title: v.title, description: v.description,
+              metadata: v.metadata ? JSON.parse(v.metadata) : {},
+            }));
+            const scans = scanDataService.getRecentScans(50);
+            const rec = scans.find(s => s.id === msg.scanId);
+            forceLatestScanForNextUpdate = rec ? { ...rec, scanType: 'Pentest' } : null;
+            await postPentestResultsToWebview();
+          } catch (e) {
+            logger?.error('Failed to load pentest scan', e as Error);
+          }
+        } else if (msg.command === 'uploadPentestFindings') {
+          await vscode.commands.executeCommand('ciphermate.uploadPentestFindings', { scanId: msg.scanId });
+        }
+      });
+    }
+    pentestResultsPanel.reveal(vscode.ViewColumn.One, false);
+    await postPentestResultsToWebview();
+  });
+
+  // Command: Export pentest findings to JSON (or ZIP) - local download, no 0x0
+  let uploadPentestFindingsDisposable = vscode.commands.registerCommand('ciphermate.uploadPentestFindings', async (args?: { scanId?: string }) => {
+    const scanId = args?.scanId;
+    let vulns: any[] = [];
+    let metadata: Record<string, unknown> = {};
+    if (scanId && scanDataService) {
+      try {
+        vulns = scanDataService.getVulnerabilities(scanId);
+        const scans = scanDataService.getRecentScans(50);
+        const rec = scans.find(s => s.id === scanId);
+        if (rec?.metadata) metadata = rec.metadata as Record<string, unknown>;
+      } catch (e) {
+        logger?.error('Failed to load scan for export', e as Error);
+        showNotification(NotificationType.ERROR, 'Failed to load scan');
+        return;
+      }
+    } else {
+      vulns = Array.isArray(lastPentestResults) ? lastPentestResults : [];
+      const scans = scanDataService?.getRecentScans(10) || [];
+      const pentest = scans.find(s => s.scanType === 'Pentest');
+      if (pentest?.metadata) metadata = pentest.metadata as Record<string, unknown>;
+    }
+    if (vulns.length === 0) {
+      showNotification(NotificationType.INFO, 'No findings to export. Run a pentest first.');
+      return;
+    }
+    const extracted = extractMaterialsFromVulns(vulns, {
+      targetUrl: metadata.targetUrl as string,
+      endpointsTested: metadata.endpointsTested as number,
+      attacksPerformed: metadata.attacksPerformed as number,
+      attacksNotConfirmed: metadata.attacksNotConfirmed as number,
+    });
+    const json = buildFindingsJson(extracted, scanId);
+    const defaultName = `ciphermate-pentest-${new Date().toISOString().slice(0, 10)}.json`;
+    const saveDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || require('os').homedir();
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.joinPath(vscode.Uri.file(saveDir), defaultName),
+      filters: { 'JSON': ['json'], 'ZIP': ['zip'], 'All Files': ['*'] },
+      title: 'Export Pentest Findings',
+    });
+    if (!uri) return;
+    try {
+      const ext = path.extname(uri.fsPath).toLowerCase();
+      if (ext === '.zip') {
+        const JSZip = require('jszip');
+        const zip = new JSZip();
+        zip.file('findings.json', json);
+        extracted.findings.forEach((f: any, i: number) => {
+          const safeName = `${String(i + 1).padStart(3, '0')}_${(f.type || 'finding').replace(/[^a-z0-9]/gi, '_')}.json`;
+          zip.file(`findings/${safeName}`, JSON.stringify(f, null, 2));
+        });
+        const buf = await zip.generateAsync({ type: 'nodebuffer' });
+        fs.writeFileSync(uri.fsPath, buf);
+      } else {
+        fs.writeFileSync(uri.fsPath, json, 'utf8');
+      }
+      showNotification(NotificationType.INFO, `Exported ${vulns.length} findings to ${path.basename(uri.fsPath)}`);
+    } catch (e) {
+      logger?.error('Failed to export findings', e as Error);
+      showNotification(NotificationType.ERROR, `Export failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
+
+  // Command: Load latest pentest and show in dedicated pentest results panel
+  let viewPentestImprovementsDisposable = vscode.commands.registerCommand('ciphermate.viewPentestImprovements', async () => {
+    if (!scanDataService) {
+      showNotification(NotificationType.WARNING, 'Scan database not available');
+      return;
+    }
+    const recent = scanDataService.getRecentScans(50);
+    const latestPentest = recent.find(s => s.scanType === 'Pentest');
+    if (!latestPentest) {
+      showNotification(NotificationType.INFO, 'No pentest scans found. Run a pentest first.');
+      return;
+    }
+    try {
+      const vulns = scanDataService.getVulnerabilities(latestPentest.id);
+      lastPentestResults = vulns.map((v: any) => ({
+        tool: v.type || 'PENTEST',
+        path: v.file,
+        start: { line: v.line || 0 },
+        severity: (v.severity || 'INFO').toUpperCase(),
+        extra: { message: v.description || v.title, severity: v.severity, cwe: v.cwe, cve: v.cve },
+        title: v.title,
+        description: v.description,
+        fix: v.fix,
+        fixable: v.fixable,
+        cwe: v.cwe,
+        cve: v.cve,
+        metadata: v.metadata ? JSON.parse(v.metadata) : {}
+      }));
+      forceLatestScanForNextUpdate = { ...latestPentest, scanType: 'Pentest' };
+      await vscode.commands.executeCommand('ciphermate.showPentestResults');
+    } catch (e) {
+      logger?.error('Failed to load pentest from history', e as Error);
+      showNotification(NotificationType.ERROR, 'Failed to load pentest results');
+    }
+  });
+
+  // Command: Ask AI about pentest (used by Red Team Q&A - passes findings as context)
+  let askAIAboutPentestDisposable = vscode.commands.registerCommand('ciphermate.askAIAboutPentest', async (args?: { question: string; targetUrl?: string; vulnerabilities?: any[] }): Promise<string> => {
+    const question = args?.question?.trim() || '';
+    if (!question) return 'Please ask a question.';
+
+    let vulns = args?.vulnerabilities;
+    const targetUrl = args?.targetUrl;
+
+    if (!vulns?.length && (lastPentestResults?.length || scanDataService)) {
+      vulns = lastPentestResults?.length ? lastPentestResults : [];
+      if (!vulns.length && scanDataService) {
+        const recent = scanDataService.getRecentScans(50);
+        const latest = recent.find((s: any) => s.scanType === 'Pentest');
+        if (latest) {
+          const meta = (m: string) => { try { return m ? JSON.parse(m) : {}; } catch { return {}; } };
+          vulns = scanDataService.getVulnerabilities(latest.id).map((v: any) => {
+            const m = meta(v.metadata);
+            return {
+              severity: v.severity, type: v.type, title: v.title, description: v.description,
+              path: v.file, endpoint: v.file, payload: m.payload, curlReplay: m.curlReplay,
+            };
+          });
+        }
+      }
+    }
+
+    const vulnList = vulns || [];
+    const bySev = (v: any) => (v.severity || '').toUpperCase();
+    const crit = vulnList.filter((v: any) => /CRITICAL|ERROR/.test(bySev(v)));
+    const high = vulnList.filter((v: any) => /HIGH|WARNING/.test(bySev(v)));
+    const sample = [...crit.slice(0, 5), ...high.slice(0, 8)];
+    const summary = sample.map((v: any, i: number) => {
+      const sev = bySev(v);
+      const ep = v.path || v.endpoint || v.file || '';
+      const payload = v.payload ? ` (payload: ${String(v.payload).slice(0, 80)}...)` : '';
+      return `${i + 1}. [${sev}] ${v.type || 'unknown'}: ${(v.title || v.description || '').slice(0, 100)} | ${ep}${payload}`;
+    }).join('\n');
+
+    const contextBlock = vulnList.length > 0
+      ? `\n\nPENTEST CONTEXT:\nTarget: ${targetUrl || 'Unknown'}\nTotal findings: ${vulnList.length}\nCritical: ${crit.length}, High: ${high.length}\n\nSample findings:\n${summary}\n\nAnswer the user's question using this context. Be specific and cite endpoints/types when relevant.`
+      : `\n\nNo pentest findings in context. Target was ${targetUrl || 'unknown'}. Answer based on general pentest knowledge if applicable.`;
+
+    const prompt = `You are a security analyst helping with a penetration test. The user has run a DAST/pentest and is asking about the results.${contextBlock}\n\nUser question: ${question}`;
+
+    try {
+      const response = await callAIForExplanation(prompt, context);
+      return response?.trim() || 'No response from AI.';
+    } catch (e) {
+      throw e;
+    }
+  });
+
   // Command: Show Results Panel (modern webview)
-  let resultsDisposable = vscode.commands.registerCommand('ciphermate.showResults', async () => {
+  // Optional args: { focusImprovements?: boolean } to scroll to pentest improvements section
+  let resultsDisposable = vscode.commands.registerCommand('ciphermate.showResults', async (args?: { focusImprovements?: boolean }) => {
+    if (args?.focusImprovements) focusImprovementsOnNextUpdate = true;
     welcomeTreeView.reveal(welcomeTreeProvider.viewResultsItem);
     // If panel already exists, just reveal it and update with latest data
     if (resultsPanel) {
@@ -5773,29 +6118,37 @@ export function activate(context: vscode.ExtensionContext) {
         // Open settings
         vscode.commands.executeCommand('ciphermate.advancedSettings');
       } else if (message.command === 'loadScan') {
-        // Load a specific scan from database
+        // Load a specific scan from database (route Pentest scans to dedicated pentest panel)
         if (scanDataService && message.scanId) {
           try {
+            const scans = scanDataService.getRecentScans(50);
+            const rec = scans.find((s: any) => s.id === message.scanId);
+            if (rec?.scanType === 'Pentest') {
+              vscode.commands.executeCommand('ciphermate.showPentestResults', { scanId: message.scanId });
+              return;
+            }
             const vulns = scanDataService.getVulnerabilities(message.scanId);
-            const results = vulns.map(v => ({
-              tool: v.type || 'Unknown',
-              path: v.file,
-              start: { line: v.line || 0 },
-              severity: v.severity?.toUpperCase() || 'INFO',
-              extra: {
-                message: v.description || v.title,
-                severity: v.severity,
+            const results = vulns.map(v => {
+              const meta = v.metadata ? JSON.parse(v.metadata) : {};
+              return {
+                tool: v.type || 'Unknown',
+                path: v.file,
+                file: v.file,
+                start: { line: v.line || 0 },
+                severity: v.severity?.toUpperCase() || 'INFO',
+                extra: { message: v.description || v.title, severity: v.severity, cwe: v.cwe, cve: v.cve },
+                title: v.title,
+                description: v.description,
+                fix: v.fix,
+                fixable: v.fixable,
                 cwe: v.cwe,
-                cve: v.cve
-              },
-              title: v.title,
-              description: v.description,
-              fix: v.fix,
-              fixable: v.fixable,
-              cwe: v.cwe,
-              cve: v.cve,
-              metadata: v.metadata ? JSON.parse(v.metadata) : {}
-            }));
+                cve: v.cve,
+                payload: meta.payload,
+                curlReplay: meta.curlReplay,
+                responseSnippet: meta.responseSnippet,
+                metadata: meta,
+              };
+            });
             lastScanResults = results;
             cleanupScanResults(); // Clean up if too many results
             postResultsToWebview().catch(err => {
@@ -5807,6 +6160,8 @@ export function activate(context: vscode.ExtensionContext) {
             showNotification(NotificationType.ERROR, 'Failed to load scan from history');
           }
         }
+      } else if (message.command === 'uploadPentestFindings') {
+        await vscode.commands.executeCommand('ciphermate.uploadPentestFindings', { scanId: message.scanId });
       } else if (message.command === 'openFile') {
         // Open file at specific line and highlight it
         // Split the view: move results panel to right side, open file on left side
@@ -6315,7 +6670,7 @@ Please provide:
               <meta name="viewport" content="width=device-width, initial-scale=1.0">
               <style>
                 body {
-                  font-family: var(--vscode-font-family);
+                  font-family: var(--ciphermate-font);
                   padding: 20px;
                   color: var(--vscode-foreground);
                   background: var(--vscode-editor-background);
@@ -6935,7 +7290,7 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
           <title>CipherMate Commands</title>
           <style>
               body {
-                  font-family: var(--vscode-font-family, 'Consolas', 'Monaco', monospace);
+                  font-family: var(--ciphermate-font-code);
                   font-size: 13px;
                   color: var(--vscode-foreground);
                   background: var(--vscode-editor-background);
@@ -7421,6 +7776,10 @@ Provide a brief security analysis (2-3 sentences) of this code line, highlightin
     settingsDisposable, 
     advancedSettingsDisposable, 
     homeDisposable, 
+    showPentestResultsDisposable,
+    askAIAboutPentestDisposable,
+    uploadPentestFindingsDisposable,
+    viewPentestImprovementsDisposable,
     resultsDisposable, 
     scanMeDisposable, 
     clearDataDisposable, 
@@ -7479,6 +7838,7 @@ function getSettingsHtml(settings: any) {
         <title>CipherMate Settings</title>
         <style>
             :root {
+                ${getFontConfigCss()}
                 --border-radius: 0;
                 --border-radius-sm: 0;
                 --spacing-xs: 4px;
@@ -7504,7 +7864,7 @@ function getSettingsHtml(settings: any) {
             }
             
             body {
-                font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+                font-family: var(--ciphermate-font);
                 font-size: var(--font-size-md);
                 font-weight: var(--font-weight-normal);
                 color: var(--vscode-foreground);
@@ -7923,7 +8283,7 @@ function getAdvancedSettingsHtml(settings: any) {
             }
             
       body {
-                font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+                font-family: var(--ciphermate-font);
                 font-size: var(--font-size-md);
                 font-weight: var(--font-weight-normal);
                 color: var(--vscode-foreground);
@@ -8719,9 +9079,7 @@ function getAdvancedSettingsHtml(settings: any) {
 }
 
 function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
-  // Ensure scanResults is an array and handle undefined/null cases
   const results = Array.isArray(scanResults) ? scanResults : [];
-  
   const totalVulnerabilities = results.length;
   const criticalCount = results.filter(r => r.severity === 'critical' || r.severity === 'error').length;
   const highCount = results.filter(r => r.severity === 'high' || r.severity === 'warning').length;
@@ -8740,6 +9098,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
         <title>CipherMate Home</title>
         <style>
             :root {
+                ${getFontConfigCss()}
                 --border-radius: 10px;
                 --border-radius-sm: 6px;
                 --accent-warm: #b86f4a;
@@ -8772,7 +9131,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
             }
             
             body {
-                font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+                font-family: var(--ciphermate-font);
                 font-size: var(--font-size-md);
                 font-weight: var(--font-weight-normal);
                 color: var(--vscode-foreground);
@@ -9283,7 +9642,7 @@ function getHomeDashboardHtml(settings: any, scanResults: any[], panel: vscode.W
                 border: 1px solid var(--vscode-panel-border);
                 border-radius: var(--border-radius-sm);
                 padding: var(--spacing-sm);
-                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                font-family: var(--ciphermate-font-code);
                 font-size: var(--font-size-sm);
                 line-height: 1.4;
                 margin: var(--spacing-sm) 0;
@@ -9810,6 +10169,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
     <title>CipherMate Results</title>
     <style>
         :root {
+            ${getFontConfigCss()}
             --border-radius: 10px;
             --border-radius-sm: 6px;
             --border-radius-lg: 14px;
@@ -9840,7 +10200,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'SF Pro Text', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
             font-size: var(--font-size-md);
             font-weight: var(--font-weight-normal);
             color: var(--vscode-foreground);
@@ -9893,7 +10253,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             color: var(--vscode-foreground);
             margin: 0 0 var(--spacing-xs) 0;
             letter-spacing: -0.01em;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'SF Pro Text', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
             position: relative;
             padding-left: var(--spacing-lg);
             display: flex;
@@ -9923,7 +10283,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             font-size: var(--font-size-md);
             color: var(--vscode-descriptionForeground);
             margin: 0 0 var(--spacing-lg) 0;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
         }
         
         .scan-info {
@@ -9941,14 +10301,14 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             border: 2px solid var(--vscode-panel-border);
             border-left: 4px solid var(--accent-warm);
             border-radius: var(--border-radius-sm);
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
             font-weight: 500;
         }
         
         .scan-time {
             font-size: var(--font-size-sm);
             color: var(--vscode-descriptionForeground);
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
             background: var(--vscode-panel-background);
             padding: var(--spacing-xs) var(--spacing-md);
             border: 1px solid var(--vscode-panel-border);
@@ -9985,7 +10345,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             color: var(--vscode-foreground);
             display: block;
             margin-bottom: var(--spacing-xs);
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
             letter-spacing: -0.03em;
             line-height: 1.1;
         }
@@ -9996,7 +10356,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             text-transform: none;
             letter-spacing: 0;
             font-weight: var(--font-weight-medium);
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
         }
         
         .stat-critical {
@@ -10056,6 +10416,35 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             font-weight: 700;
         }
         
+        .pentest-stats-panel {
+            background: var(--vscode-panel-background);
+            border: 2px solid var(--vscode-panel-border);
+            border-left: 4px solid var(--accent-warm);
+            padding: var(--spacing-lg);
+            margin-bottom: var(--spacing-xl);
+            border-radius: var(--border-radius-sm);
+        }
+        .pentest-stats-title {
+            font-size: var(--font-size-md);
+            font-weight: var(--font-weight-semibold);
+            color: var(--vscode-foreground);
+            margin: 0 0 var(--spacing-md) 0;
+        }
+        .pentest-stats-content {
+            font-size: var(--font-size-sm);
+            color: var(--vscode-descriptionForeground);
+            line-height: 1.6;
+        }
+        .pentest-stats-content .pentest-fails {
+            margin-top: var(--spacing-sm);
+            padding: var(--spacing-sm);
+            background: rgba(255, 176, 32, 0.1);
+            border: 1px solid var(--vscode-charts-orange);
+            border-radius: var(--border-radius-sm);
+        }
+        .pentest-extract-row { margin-top: var(--spacing-md); }
+        .pentest-extract-btn { font-size: var(--font-size-sm); }
+        
         .controls {
         display: flex;
             gap: var(--spacing-sm);
@@ -10079,7 +10468,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             min-height: 36px;
             position: relative;
             overflow: hidden;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
         }
         
         .btn:active {
@@ -10375,7 +10764,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .result-file {
-            font-family: var(--vscode-editor-font-family, 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace);
+            font-family: var(--ciphermate-font-code);
             font-size: var(--font-size-sm);
             color: var(--vscode-textLink-foreground);
             cursor: pointer;
@@ -10529,7 +10918,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
         
         .suppression-item-file {
-            font-family: var(--vscode-editor-font-family, monospace);
+            font-family: var(--ciphermate-font-code);
             font-size: var(--font-size-sm);
             color: var(--vscode-textLink-foreground);
             overflow: hidden;
@@ -10748,6 +11137,14 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             background-color: var(--vscode-list-hoverBackground);
         }
         
+        .history-row { display: flex; align-items: center; gap: var(--spacing-sm); cursor: pointer; }
+        .history-chevron { font-size: 10px; color: var(--vscode-descriptionForeground); transition: transform 0.2s; }
+        .history-expanded { display: none; padding: var(--spacing-md); margin-top: var(--spacing-xs); border-top: 1px solid var(--vscode-panel-border); font-size: var(--font-size-sm); }
+        .history-item.expanded .history-expanded { display: block; }
+        .history-expanded-meta { color: var(--vscode-descriptionForeground); }
+        .pentest-fails-inline { margin: var(--spacing-sm) 0; padding: var(--spacing-xs); background: rgba(255,176,32,0.1); border-radius: var(--border-radius-sm); }
+        .history-extract-btn { margin-top: var(--spacing-sm); font-size: var(--font-size-xs); }
+        
         .history-item:last-child {
             border-bottom: none;
         }
@@ -10766,7 +11163,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         .history-time {
             font-size: var(--font-size-xs);
             color: var(--vscode-descriptionForeground);
-            font-family: var(--vscode-editor-font-family, monospace);
+            font-family: var(--ciphermate-font-code);
         }
         
         .history-stats {
@@ -10867,7 +11264,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             border-bottom: 2px solid var(--vscode-panel-border);
             text-transform: none;
             letter-spacing: -0.01em;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
         }
         
         .charts-grid {
@@ -10890,7 +11287,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             color: var(--vscode-foreground);
             margin: 0 0 var(--spacing-md) 0;
             text-align: center;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: var(--ciphermate-font);
             letter-spacing: 0.02em;
             text-transform: none;
         }
@@ -10971,6 +11368,11 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             <span class="stat-number" id="total-count">0</span>
             <span class="stat-label">Total</span>
         </div>
+    </div>
+    
+    <div id="pentest-stats-panel" class="pentest-stats-panel" style="display: none;">
+        <h3 class="pentest-stats-title">Pentest Summary</h3>
+        <div id="pentest-stats-content" class="pentest-stats-content"></div>
     </div>
     
     <!-- Graphical Analysis Section -->
@@ -11774,6 +12176,7 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         }
       }
       
+      var expandedScanIds = {};
       function renderScanHistory(scans) {
         const historyList = document.getElementById('history-list');
         if (!historyList) return;
@@ -11781,22 +12184,65 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
         historyList.innerHTML = '';
         scans.forEach(scan => {
           const item = document.createElement('li');
-          item.className = 'history-item';
+          const wasExpanded = expandedScanIds[scan.id];
+          item.className = 'history-item history-item-collapsible' + (wasExpanded ? ' expanded' : '');
           const scanTime = new Date(scan.timestamp).toLocaleString();
+          const displayName = (scan.scanType === 'Pentest' && scan.metadata?.targetUrl)
+            ? 'Pentest: ' + scan.metadata.targetUrl
+            : (scan.metadata?.scanName || scan.scanType || 'Security Scan');
+          const meta = scan.metadata || {};
+          const notConfirmed = meta.attacksNotConfirmed ?? 0;
+          const pentestStats = scan.scanType === 'Pentest' && notConfirmed > 0
+            ? \`<span class="history-stat" title="Payloads that did not confirm vulnerabilities">\${notConfirmed} to improve</span>\`
+            : '';
+          const isPentest = scan.scanType === 'Pentest';
+          const expandHtml = isPentest ? \`<span class="history-chevron">\${wasExpanded ? '&#9650;' : '&#9660;'}</span>\` : '';
+          const expandContent = isPentest ? \`
+            <div class="history-expanded" data-scan-id="\${scan.id}">
+              <div class="history-expanded-meta">
+                \${meta.targetUrl ? '<strong>Target:</strong> ' + meta.targetUrl + '<br>' : ''}
+                \${notConfirmed > 0 ? '<div class="pentest-fails-inline"><strong>For improvements:</strong> ' + notConfirmed + ' payloads did not confirm. Review War Room or activity feed.</div>' : ''}
+                <button class="btn btn-primary history-extract-btn" data-scan-id="\${scan.id}">Export</button>
+              </div>
+            </div>
+          \` : '';
           item.innerHTML = \`
-            <div class="history-info">
-              <div class="history-scan-type">\${scan.scanType || 'Security Scan'}</div>
-              <div class="history-time">\${scanTime}</div>
+            <div class="history-row" data-scan-id="\${scan.id}">
+              \${expandHtml}
+              <div class="history-info">
+                <div class="history-scan-type">\${displayName}</div>
+                <div class="history-time">\${scanTime}</div>
+              </div>
+              <div class="history-stats">
+                <span class="history-stat" style="color: var(--vscode-inputValidation-errorForeground);">\${scan.criticalCount || 0} Critical</span>
+                <span class="history-stat" style="color: var(--vscode-inputValidation-warningForeground);">\${scan.highCount || 0} High</span>
+                <span class="history-stat">\${scan.totalVulnerabilities || 0} Total</span>
+                \${pentestStats}
+              </div>
             </div>
-            <div class="history-stats">
-              <span class="history-stat" style="color: var(--vscode-inputValidation-errorForeground);">\${scan.criticalCount || 0} Critical</span>
-              <span class="history-stat" style="color: var(--vscode-inputValidation-warningForeground);">\${scan.highCount || 0} High</span>
-              <span class="history-stat">\${scan.totalVulnerabilities || 0} Total</span>
-            </div>
+            \${expandContent}
           \`;
-          item.onclick = () => {
-            vscode.postMessage({ command: 'loadScan', scanId: scan.id });
-          };
+          var row = item.querySelector('.history-row');
+          var expanded = item.querySelector('.history-expanded');
+          var chevron = item.querySelector('.history-chevron');
+          var extractBtn = item.querySelector('.history-extract-btn');
+          if (row) {
+            row.onclick = function(e) {
+              if (e.target.closest('.history-extract-btn')) return;
+              if (isPentest && chevron && expanded) {
+                var isExp = item.classList.toggle('expanded');
+                expandedScanIds[scan.id] = !!isExp;
+                chevron.textContent = isExp ? '&#9650;' : '&#9660;';
+              }
+              vscode.postMessage({ command: 'loadScan', scanId: scan.id });
+            };
+          }
+          if (extractBtn) {
+            extractBtn.onclick = function(e) {
+              e.stopPropagation();
+              vscode.postMessage({ command: 'uploadPentestFindings', scanId: scan.id });
+            };
+          }
           historyList.appendChild(item);
         });
       }
@@ -11998,6 +12444,34 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
             document.getElementById('high-count').textContent = stats.highCount || 0;
             document.getElementById('medium-count').textContent = stats.mediumCount || 0;
             document.getElementById('low-count').textContent = stats.lowCount || 0;
+            // Show pentest stats/improvements panel when available
+            const pentestPanel = document.getElementById('pentest-stats-panel');
+            const pentestContent = document.getElementById('pentest-stats-content');
+            if (stats.latestScan?.metadata?.targetUrl && pentestPanel && pentestContent) {
+              const m = stats.latestScan.metadata;
+              const target = m.targetUrl || 'Unknown';
+              const endpoints = m.endpointsTested ?? 0;
+              const attacks = m.attacksPerformed ?? 0;
+              const notConfirmed = m.attacksNotConfirmed ?? Math.max(0, attacks - (stats.totalVulnerabilities || 0));
+              pentestContent.innerHTML = 
+                '<strong>Target:</strong> ' + target + '<br>' +
+                '<strong>Endpoints tested:</strong> ' + endpoints + ' &bull; ' +
+                '<strong>Attacks performed:</strong> ' + attacks + ' &bull; ' +
+                '<strong>Confirmed vulnerabilities:</strong> ' + (stats.totalVulnerabilities || 0) + '<br>' +
+                (notConfirmed > 0 ? '<div class="pentest-fails"><strong>For improvements:</strong> ' + notConfirmed + 
+                  ' payloads did not confirm vulnerabilities. Review War Room or activity feed to improve detection (timing, payload variations, or response analysis).</div>' : '') +
+                '<div class="pentest-extract-row"><button class="btn btn-primary pentest-extract-btn" id="pentestExtractBtn">Export</button></div>';
+              (function(scanId) {
+                var btn = document.getElementById('pentestExtractBtn');
+                if (btn) btn.onclick = function() { vscode.postMessage({ command: 'uploadPentestFindings', scanId: scanId || undefined }); };
+              })(stats.latestScan?.id);
+              pentestPanel.style.display = 'block';
+              if (message.focusImprovements) {
+                setTimeout(function() { pentestPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 200);
+              }
+            } else if (pentestPanel) {
+              pentestPanel.style.display = 'none';
+            }
           } else {
             // Fallback: calculate from current results
             const stats = {
@@ -12076,6 +12550,150 @@ function getResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.W
 </html>`;
 }
 
+function getPentestResultsPanelHtml(context?: vscode.ExtensionContext, panel?: vscode.WebviewPanel): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CipherMate Pentest Results</title>
+  <style>
+    :root { ${getFontConfigCss()} }
+    * { box-sizing: border-box; }
+    body {
+      font-family: var(--ciphermate-font-code);
+      font-size: 12px;
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      margin: 0; padding: 16px; line-height: 1.5;
+    }
+    .header { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--vscode-panel-border); }
+    .header h1 { font-size: 14px; font-weight: 600; margin: 0; font-family: var(--ciphermate-font-code); }
+    .header .sub { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 4px; }
+    .stats { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+    .stat { padding: 8px 12px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; font-family: var(--ciphermate-font-code); font-size: 11px; }
+    .stat .n { font-weight: 600; font-size: 14px; }
+    .stat.crit .n { color: var(--vscode-inputValidation-errorForeground); }
+    .stat.high .n { color: var(--vscode-inputValidation-warningForeground); }
+    .meta-panel { padding: 12px; background: var(--vscode-panel-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin-bottom: 16px; font-family: var(--ciphermate-font-code); font-size: 11px; }
+    .meta-panel code { background: rgba(0,0,0,0.2); padding: 2px 6px; border-radius: 2px; }
+    .findings-list { list-style: none; padding: 0; margin: 0; }
+    .finding { padding: 12px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin-bottom: 8px; font-family: var(--ciphermate-font-code); font-size: 11px; }
+    .finding .sev { font-weight: 600; text-transform: uppercase; }
+    .finding .sev.CRITICAL, .finding .sev.ERROR { color: var(--vscode-inputValidation-errorForeground); }
+    .finding .sev.HIGH, .finding .sev.WARNING { color: var(--vscode-inputValidation-warningForeground); }
+    .finding .url { color: var(--vscode-textLink-foreground); word-break: break-all; }
+    .finding .data { margin-top: 8px; padding: 8px; background: rgba(0,0,0,0.2); border-radius: 4px; white-space: pre-wrap; font-size: 10px; overflow-x: auto; }
+    .history { margin-top: 16px; }
+    .history h3 { font-size: 12px; margin: 0 0 8px 0; font-family: var(--ciphermate-font-code); }
+    .history-item { padding: 8px 12px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; margin-bottom: 6px; cursor: pointer; font-family: var(--ciphermate-font-code); font-size: 11px; }
+    .history-item:hover { background: var(--vscode-list-hoverBackground); }
+    .btn { padding: 6px 12px; border-radius: 4px; font-family: var(--ciphermate-font-code); font-size: 11px; cursor: pointer; }
+    .btn-primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; }
+    .btn-primary:hover { background: var(--vscode-button-hoverBackground); }
+    .header-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+    .export-btn { padding: 8px 16px; font-weight: 600; }
+    .empty { color: var(--vscode-descriptionForeground); font-size: 11px; padding: 24px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Pentest Results</h1>
+    <div class="sub">DAST findings - separate from repository scan results</div>
+    <div class="header-actions">
+      <button class="btn btn-primary export-btn" id="exportBtn">Export</button>
+    </div>
+  </div>
+  <div class="stats">
+    <div class="stat crit"><span class="n" id="critical-count">0</span> Critical</div>
+    <div class="stat high"><span class="n" id="high-count">0</span> High</div>
+    <div class="stat"><span class="n" id="medium-count">0</span> Medium</div>
+    <div class="stat"><span class="n" id="low-count">0</span> Low</div>
+    <div class="stat"><span class="n" id="total-count">0</span> Total</div>
+  </div>
+  <div id="meta-panel" class="meta-panel" style="display:none;"></div>
+  <div id="findings-section">
+    <ul class="findings-list" id="findings-list"></ul>
+    <div class="empty" id="empty-msg">No pentest findings. Run a pentest from the Red Team Operations Center.</div>
+  </div>
+  <div class="history">
+    <h3>Recent Pentests</h3>
+    <div id="history-list"></div>
+  </div>
+  <script>
+    const vscode = acquireVsCodeApi();
+    function renderFindings(results) {
+      const list = document.getElementById('findings-list');
+      const empty = document.getElementById('empty-msg');
+      if (!list) return;
+      list.innerHTML = '';
+      if (!results || results.length === 0) {
+        if (empty) empty.style.display = 'block';
+        return;
+      }
+      if (empty) empty.style.display = 'none';
+      results.forEach((r, i) => {
+        const li = document.createElement('li');
+        li.className = 'finding';
+        const sev = (r.severity || 'INFO').toUpperCase();
+        const url = r.path || r.endpoint || r.file || '';
+        let dataBlock = '';
+        const obj = { type: r.type, category: r.category, param: r.paramName || r.param, severity: sev, title: r.title || r.extra?.message };
+        if (r.payload) obj.payload = r.payload;
+        if (r.curlReplay) obj.curlReplay = r.curlReplay;
+        dataBlock = JSON.stringify(obj, null, 2);
+        li.innerHTML = '<span class="sev ' + sev + '">' + sev + '</span> ' + (r.title || r.extra?.message || '') + '<br><span class="url">' + escapeHtml(url) + '</span><div class="data">' + escapeHtml(dataBlock) + '</div>';
+        list.appendChild(li);
+      });
+    }
+    function escapeHtml(s) { if (!s) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function renderHistory(scans) {
+      const el = document.getElementById('history-list');
+      if (!el) return;
+      el.innerHTML = '';
+      (scans || []).filter(s => s.scanType === 'Pentest').forEach(scan => {
+        const div = document.createElement('div');
+        div.className = 'history-item';
+        const name = (scan.metadata?.targetUrl) ? 'Pentest: ' + scan.metadata.targetUrl : (scan.metadata?.scanName || scan.id);
+        const time = new Date(scan.timestamp).toLocaleString();
+        div.textContent = name + ' - ' + time + ' (' + (scan.totalVulnerabilities || 0) + ' findings)';
+        div.onclick = () => vscode.postMessage({ command: 'loadPentestScan', scanId: scan.id });
+        el.appendChild(div);
+      });
+    }
+    let currentScanId = null;
+    document.getElementById('exportBtn')?.addEventListener('click', () => {
+      vscode.postMessage({ command: 'uploadPentestFindings', scanId: currentScanId });
+    });
+    window.addEventListener('message', e => {
+      const m = e.data;
+      if (m.command === 'updatePentestResults') {
+        const r = m.results || [];
+        currentScanId = m.scanStatistics?.latestScan?.id || null;
+        const eb = document.getElementById('exportBtn');
+        if (eb) eb.disabled = r.length === 0;
+        document.getElementById('critical-count').textContent = m.scanStatistics?.criticalCount ?? r.filter(x => /CRITICAL|ERROR/.test((x.severity||'').toUpperCase())).length;
+        document.getElementById('high-count').textContent = m.scanStatistics?.highCount ?? r.filter(x => /HIGH|WARNING/.test((x.severity||'').toUpperCase())).length;
+        document.getElementById('medium-count').textContent = m.scanStatistics?.mediumCount ?? r.filter(x => /MEDIUM|INFO/.test((x.severity||'').toUpperCase())).length;
+        document.getElementById('low-count').textContent = m.scanStatistics?.lowCount ?? r.filter(x => /LOW/.test((x.severity||'').toUpperCase())).length;
+        document.getElementById('total-count').textContent = m.scanStatistics?.totalVulnerabilities ?? r.length;
+        renderFindings(r);
+        renderHistory(m.recentPentestScans || []);
+        const meta = document.getElementById('meta-panel');
+        if (meta && m.scanStatistics?.latestScan?.metadata) {
+          const md = m.scanStatistics.latestScan.metadata;
+          meta.innerHTML = 'Target: <code>' + escapeHtml(md.targetUrl||'') + '</code> | Endpoints: ' + (md.endpointsTested??0) + ' | Attacks: ' + (md.attacksPerformed??0) + ' | Not confirmed: ' + (md.attacksNotConfirmed??0) + '<br><button class="btn btn-primary" id="extractBtn">Export</button>';
+          meta.style.display = 'block';
+          document.getElementById('extractBtn')?.addEventListener('click', () => vscode.postMessage({ command: 'uploadPentestFindings', scanId: m.scanStatistics.latestScan?.id }));
+        }
+      }
+    });
+    vscode.postMessage({ command: 'pentestWebviewReady' });
+  </script>
+</body>
+</html>`;
+}
+
 function getTeamDashboardHtml(teamLead: TeamLead, reports: TeamVulnerabilityReport[]): string {
   return `
   <!DOCTYPE html>
@@ -12083,7 +12701,8 @@ function getTeamDashboardHtml(teamLead: TeamLead, reports: TeamVulnerabilityRepo
   <head>
     <title>CipherMate Team Dashboard</title>
     <style>
-      body { font-family: var(--vscode-font-family); background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); }
+      :root { ${getFontConfigCss()} }
+      body { font-family: var(--ciphermate-font); background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); }
       .header { background: var(--vscode-sideBar-background); padding: 1rem; border-bottom: 1px solid var(--vscode-editorWidget-border); }
       .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; padding: 1rem; }
       .stat-card { background: var(--vscode-editorWidget-background); padding: 1rem; border-radius: 0; }
@@ -12213,7 +12832,7 @@ function getUserProfileHtml(user: UserProfile | null, history: VulnerabilityHist
             * { box-sizing: border-box; }
             
             body {
-                font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+                font-family: var(--ciphermate-font);
                 font-size: var(--font-size-md);
                 color: var(--vscode-foreground);
                 background: var(--vscode-editor-background);
@@ -12542,7 +13161,7 @@ function getUserProfileHtml(user: UserProfile | null, history: VulnerabilityHist
             * { box-sizing: border-box; }
             
             body {
-                font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+                font-family: var(--ciphermate-font);
                 font-size: var(--font-size-md);
                 color: var(--vscode-foreground);
                 background: var(--vscode-editor-background);
@@ -12779,7 +13398,7 @@ function getTeamSetupHtml(): string {
   <head>
     <title>CipherMate Team Setup</title>
     <style>
-      body { font-family: var(--vscode-font-family); background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); padding: 2rem; }
+      body { font-family: var(--ciphermate-font); background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); padding: 2rem; }
       .form-group { margin: 1rem 0; }
       label { display: block; margin-bottom: 0.5rem; }
       input, select { width: 100%; padding: 0.5rem; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; }
@@ -12871,9 +13490,10 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CipherMate Settings</title>
     <style>
+        :root { ${getFontConfigCss()} }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: var(--vscode-font-family);
+            font-family: var(--ciphermate-font);
             background: var(--vscode-editor-background);
             color: var(--vscode-editor-foreground);
             height: 100vh;
@@ -13281,6 +13901,25 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
             </div>
             <div class="section" id="ui">
                 <div class="setting-group">
+                    <div class="setting-group-title">Fonts</div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">UI Font</div>
+                            <div class="setting-label-desc">Font for panels, chat, results. Leave empty for VS Code default. e.g. Inter, "Open Sans", -apple-system, sans-serif</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="text" id="fontFamily" value="${(settings.fontFamily || '').replace(/"/g, '&quot;')}" placeholder="Leave empty for default" />
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <div class="setting-label">
+                            <div class="setting-label-title">Code Font</div>
+                            <div class="setting-label-desc">Font for code blocks and monospace. Leave empty for editor font. e.g. "Fira Code", "JetBrains Mono", monospace</div>
+                        </div>
+                        <div class="setting-control">
+                            <input type="text" id="fontFamilyCode" value="${(settings.fontFamilyCode || '').replace(/"/g, '&quot;')}" placeholder="Leave empty for default" />
+                        </div>
+                    </div>
                     <div class="setting-group-title">UI & Display Settings</div>
                     <div class="setting-item">
                         <div class="setting-label">
@@ -13765,6 +14404,8 @@ function getSidebarSettingsHtml(settings: any, panel: vscode.WebviewPanel, conte
                 },
                 scanOnSave: document.getElementById('scanOnSave') ? document.getElementById('scanOnSave').checked : true,
                 scanInterval: parseInt(document.getElementById('scanInterval').value) || 1,
+                fontFamily: document.getElementById('fontFamily') ? document.getElementById('fontFamily').value.trim() : '',
+                fontFamilyCode: document.getElementById('fontFamilyCode') ? document.getElementById('fontFamilyCode').value.trim() : '',
                 cve: {
                     enabled: document.getElementById('cve.enabled').checked,
                     cacheEnabled: document.getElementById('cve.cacheEnabled').checked,

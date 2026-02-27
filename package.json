@@ -30,6 +30,7 @@
     "onCommand:ciphermate.scan",
     "onCommand:ciphermate.intelligentScan",
     "onCommand:ciphermate.showResults",
+    "onCommand:ciphermate.viewPentestImprovements",
     "onCommand:ciphermate.settings",
     "onCommand:ciphermate.advancedSettings",
     "onCommand:ciphermate.home",
@@ -104,6 +105,10 @@
         },
         {
           "command": "ciphermate.showResults",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "ciphermate.viewPentestImprovements",
           "when": "workspaceFolderCount > 0"
         },
         {
@@ -287,6 +292,14 @@
       {
         "command": "ciphermate.showResults",
         "title": "CipherMate: Show Results Panel"
+      },
+      {
+        "command": "ciphermate.viewPentestImprovements",
+        "title": "CipherMate: View Pentest Improvements"
+      },
+      {
+        "command": "ciphermate.uploadPentestFindings",
+        "title": "CipherMate: Extract & Upload Pentest Findings"
       },
       {
         "command": "ciphermate.clearData",
@@ -583,6 +596,18 @@
           "default": [],
           "description": "Only show vulnerabilities of these severities (empty = show all)",
           "markdownDescription": "Filter results by severity level. Leave empty to show all vulnerabilities."
+        },
+        "ciphermate.fontFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Font family for UI (body, headings, panels). Leave empty to use VS Code default.",
+          "markdownDescription": "e.g. `-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif` or `Inter`, `Open Sans`. Empty = inherit from VS Code."
+        },
+        "ciphermate.fontFamilyCode": {
+          "type": "string",
+          "default": "",
+          "description": "Font family for code blocks and monospace text. Leave empty to use VS Code editor font.",
+          "markdownDescription": "e.g. `'Fira Code'`, `'JetBrains Mono'`, `monospace`. Empty = use VS Code editor font."
         },
         "ciphermate.useCloudAI": {
           "type": "boolean",
@@ -901,6 +926,24 @@
           "maximum": 2000,
           "description": "Delay between CVE lookups (milliseconds)",
           "markdownDescription": "Rate limiting delay to avoid API throttling. Higher values = slower but safer."
+        },
+        "ciphermate.dast.wafEvasion": {
+          "type": "boolean",
+          "default": true,
+          "description": "WAF/Cloudflare evasion: rotate User-Agents, use browser headers, retry 403 with new headers",
+          "markdownDescription": "Enables rotating browser User-Agents, Accept/Sec-* headers, and retries 403 (Cloudflare/WAF blocks) with different headers. Used in pentest mode."
+        },
+        "ciphermate.dast.unrestrictedMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Unrestricted pentest: high concurrency (80), 1000 endpoints, 12 retries, no circuit breaker, no time limit",
+          "markdownDescription": "Aggressive pentest: no delays, high parallelism, more endpoints, longer retries. No artificial time limits. Use only on authorized targets."
+        },
+        "ciphermate.dast.enableExternalTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run nuclei (and ffuf) when installed in PATH; merge findings into pentest results",
+          "markdownDescription": "If nuclei is in PATH, run it against the target and merge CVE/exposure findings. No time limit. Install: https://github.com/projectdiscovery/nuclei"
         },
         "ciphermate.ui.showCodeLens": {
           "type": "boolean",

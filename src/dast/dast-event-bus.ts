@@ -19,6 +19,7 @@ export type DastEventType =
   | 'deep_dive_result'
   | 'vuln_confirmed'
   | 'circuit_breaker'
+  | 'external_tool_started'
   | 'error';
 
 export interface DastEvent {

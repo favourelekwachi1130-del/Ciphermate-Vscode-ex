@@ -141,7 +141,15 @@ export class ScanDataService {
       fixable: vuln.fixable !== undefined ? vuln.fixable : (vuln.fix ? true : false),
       fixComplexity: vuln.fixComplexity || undefined,
       references: Array.isArray(vuln.references) ? vuln.references.join(',') : vuln.references,
-      metadata: vuln.metadata ? JSON.stringify(vuln.metadata) : undefined
+      metadata: (() => {
+        const m: Record<string, unknown> = { ...(typeof vuln.metadata === 'object' && vuln.metadata ? vuln.metadata : {}) };
+        if (vuln.payload) m.payload = vuln.payload;
+        if (vuln.curlReplay) m.curlReplay = vuln.curlReplay;
+        if (vuln.responseSnippet) m.responseSnippet = vuln.responseSnippet;
+        if (vuln.paramName) m.paramName = vuln.paramName;
+        if (vuln.evidence) m.evidence = vuln.evidence;
+        return Object.keys(m).length ? JSON.stringify(m) : undefined;
+      })()
       };
     });
 
