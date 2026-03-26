@@ -5,3 +5,7 @@ node_modules
 *.vsix
 .DS_Store
 **/.DS_Store
+__pycache__/
+*.pyc
+*.bak
+.kode/settings.local.json

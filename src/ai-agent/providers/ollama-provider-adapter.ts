@@ -14,7 +14,7 @@ export class OllamaProvider extends BaseAIProvider {
     
     // Extract baseUrl and model from config
     const baseUrl = config.apiUrl || 'http://localhost:11434';
-    const model = config.model || 'deepseek-r1:14b';
+    const model = config.model || 'llama3:8b';
     
     // Create CLI provider with exact signature: (baseUrl, model)
     this.cliProvider = new CLIOllamaProvider(baseUrl, model);
@@ -26,21 +26,19 @@ export class OllamaProvider extends BaseAIProvider {
 
   getSupportedModels(): string[] {
     return [
-      'deepseek-r1:14b',
-      'deepseek-r1:8b',
+      'llama3:8b',
+      'llama3:70b',
+      'llama3.1:8b',
+      'llama3.2:3b',
       'gemma3:4b',
-      'deepseek-coder:6.7b',
-      'deepseek-coder:1.3b',
-      'deepseek-coder:33b',
-      'deepseek-coder:latest',
+      'gemma3:12b',
       'codellama:7b',
       'codellama:13b',
       'codellama:34b',
       'mistral:7b',
-      'llama2:7b',
-      'llama2:13b',
       'qwen2.5-coder:7b',
       'qwen2.5-coder:32b',
+      'phi4:14b',
     ];
   }
 

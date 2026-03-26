@@ -61,12 +61,10 @@ export class MastraAdapter {
 
   /**
    * Process user request with Mastra's memory management
-   * @param attachments - Optional image attachments (base64 data URLs) for vision processing
    */
   async processRequest(
     userRequest: string,
-    workspacePath?: string,
-    attachments?: Array<{ type: string; data: string; mimeType?: string; name?: string }>
+    workspacePath?: string
   ): Promise<string> {
     try {
       const agent = await this.getAgent();
@@ -86,22 +84,17 @@ export class MastraAdapter {
       };
       let response: any;
 
-      // Build input: string or multimodal content when attachments exist
-      const input = attachments?.length
-        ? [{ type: 'text' as const, text: userRequest || 'Analyze the attached image(s).' }, ...attachments.map(a => ({ type: 'image' as const, image: a.data, mimeType: a.mimeType || 'image/png' }))]
-        : userRequest;
-
       // Try generate() first (V2/AI SDK v5). On V4/model mismatch errors, fall back to generateLegacy().
       // If generateLegacy() then fails with "V2 models not supported", we have a ping-pong conflict
       // and re-throw the original error so the user sees the real model compatibility issue.
       try {
-        response = await agent.generate(input, memoryOpts);
+        response = await agent.generate(userRequest, memoryOpts);
       } catch (err: any) {
         const msg = err?.message || String(err);
         const needsLegacy = msg.includes('streamLegacy') || msg.includes('AI SDK v4') || msg.includes('not compatible with stream');
         if (needsLegacy && typeof agent.generateLegacy === 'function') {
           try {
-            response = await agent.generateLegacy(input, memoryOpts);
+            response = await agent.generateLegacy(userRequest, memoryOpts);
           } catch (legacyErr: any) {
             const legacyMsg = legacyErr?.message || String(legacyErr);
             const isV2ForLegacy = legacyMsg.includes('V2 models are not supported for generateLegacy') || legacyMsg.includes('Please use generate instead');

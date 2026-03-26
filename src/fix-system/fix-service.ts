@@ -376,7 +376,7 @@ export class FixService {
       }
 
       // Multi-AI Pipeline Agent 4: Final Validator - comprehensive AI review when user requested apply
-      if (confirmed && this.config.enableMultiAIPipeline && config.get('fixes.multiAI.finalValidator', true)) {
+      if (confirmed && this.config.enableMultiAIPipeline && config.get('fixes.multiAI.finalValidator', false)) {
         const pipeline = getMultiAIFixPipeline(this.context);
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
         const projectContext = await this.getProjectContextForValidation(workspaceRoot);
@@ -428,42 +428,8 @@ export class FixService {
     const result = await this.fixApplicator.applyFix(proposal);
 
     if (result.success) {
-      // Agent 3: File/Data Handler - AI plans file creation (.env, .gitignore, etc.) when enabled
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-      const useFileDataHandler = this.config.enableMultiAIPipeline &&
-        vscode.workspace.getConfiguration('ciphermate').get('fixes.multiAI.fileDataHandler', true);
-
-      if (useFileDataHandler && workspaceRoot) {
-        const pipeline = getMultiAIFixPipeline(this.context);
-        const plan = await pipeline.planFileData(proposal, workspaceRoot);
-        if (plan) {
-          // Use AI plan: envVars take precedence, fallback to proposal.envVarsToCreate
-          const envVars = plan.envVars?.length ? plan.envVars : (proposal.envVarsToCreate || []);
-          if (plan.createEnv && envVars.length > 0) {
-            this.createOrAppendEnvFile(proposal.vulnerability.file, envVars);
-          }
-          if (plan.updateGitignore) {
-            this.ensureGitignoreHasEnv(workspaceRoot);
-          }
-          if (plan.otherFiles?.length) {
-            for (const relPath of plan.otherFiles) {
-              const fullPath = path.join(workspaceRoot, relPath);
-              if (!fs.existsSync(fullPath) && relPath === '.env.example') {
-                const vars = plan.envVars?.length ? plan.envVars : (proposal.envVarsToCreate || []);
-                fs.writeFileSync(
-                  fullPath,
-                  '# Copy to .env and fill in values\n' + vars.map(({ name }) => `${name}=`).join('\n') + '\n',
-                  'utf8'
-                );
-              }
-            }
-          }
-        } else if (proposal.envVarsToCreate && proposal.envVarsToCreate.length > 0) {
-          // Fallback: no AI plan, use proposal directly
-          this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
-        }
-      } else if (proposal.envVarsToCreate && proposal.envVarsToCreate.length > 0) {
-        // File/Data Handler disabled - use proposal.envVarsToCreate directly
+      // Create/append .env when fixing secrets (PHP, Node, etc.)
+      if (proposal.envVarsToCreate && proposal.envVarsToCreate.length > 0) {
         this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
       }
       // Get backup for undo manager
@@ -641,28 +607,12 @@ export class FixService {
     // Apply all fixes
     const results = await this.fixApplicator.applyBatchFixes(validProposals);
 
-    // Track successful fixes in undo manager; Agent 3: File/Data Handler for .env when fixing secrets
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    const useFileDataHandler = this.config.enableMultiAIPipeline &&
-      vscode.workspace.getConfiguration('ciphermate').get('fixes.multiAI.fileDataHandler', true);
-
+    // Track successful fixes in undo manager; create .env when fixing secrets
     for (const result of results) {
       if (result.success) {
         const proposal = validProposals.find(p => p.id === result.fixId);
-        if (proposal && (proposal.envVarsToCreate?.length || useFileDataHandler)) {
-          if (useFileDataHandler && workspaceRoot) {
-            const pipeline = getMultiAIFixPipeline(this.context);
-            const plan = await pipeline.planFileData(proposal, workspaceRoot);
-            if (plan?.createEnv && (plan.envVars?.length || proposal.envVarsToCreate?.length)) {
-              const envVars = plan.envVars?.length ? plan.envVars : (proposal.envVarsToCreate || []);
-              this.createOrAppendEnvFile(proposal.vulnerability.file, envVars);
-            } else if (proposal.envVarsToCreate?.length) {
-              this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
-            }
-            if (plan?.updateGitignore) this.ensureGitignoreHasEnv(workspaceRoot);
-          } else if (proposal.envVarsToCreate?.length) {
-            this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
-          }
+        if (proposal?.envVarsToCreate?.length) {
+          this.createOrAppendEnvFile(proposal.vulnerability.file, proposal.envVarsToCreate);
         }
         const backup = await this.backupManager.getBackup(result.backupId);
         if (backup) {
@@ -1147,10 +1097,7 @@ export class FixService {
       return vulnerability.code || '';
     }
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const filePath = workspaceRoot && !path.isAbsolute(vulnerability.file)
-      ? path.join(workspaceRoot, vulnerability.file)
-      : vulnerability.file;
+    const filePath = vulnerability.file;
     const line = vulnerability.line || 1;
 
     try {

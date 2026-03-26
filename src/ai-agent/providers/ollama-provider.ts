@@ -1,4 +1,4 @@
-import { AIProvider, ConversationMessage } from './cli-base';
+import { AIProvider, AIChatOptions, ConversationMessage } from './cli-base';
 
 /**
  * Ollama Provider - EXACT port from Cyber-Claude CLI
@@ -16,24 +16,49 @@ export class OllamaProvider implements AIProvider {
     this.model = model;
   }
 
-  async chat(messages: ConversationMessage[], systemPrompt: string): Promise<string> {
+  async chat(messages: ConversationMessage[], systemPrompt: string, options?: AIChatOptions): Promise<string> {
     try {
+      const userImages = options?.userImages?.length ? options.userImages : undefined;
       console.log(`Ollama: Sending message to Ollama (${this.model})`);
       
-      // Build messages array with system prompt first (EXACT match to CLI)
-      const ollamaMessages = [
-        { role: 'system', content: systemPrompt },
-        ...messages.map(msg => ({
+      // Build messages array with system prompt first (EXACT match to CLI).
+      // Vision models (llava, bakllava, llama3.2-vision, etc.): pass base64 in `images` on the last user message.
+      const mapped = messages.map((msg, idx) => {
+        const isLastUser =
+          msg.role === 'user' && idx === messages.length - 1 && userImages && userImages.length > 0;
+        const text =
+          isLastUser && (!msg.content || !String(msg.content).trim())
+            ? '(see attached image(s))'
+            : msg.content;
+        const row: { role: string; content: string; images?: string[] } = {
           role: msg.role,
-          content: msg.content
-        }))
-      ];
+          content: text,
+        };
+        if (isLastUser) {
+          row.images = userImages.map((img) => img.base64);
+        }
+        return row;
+      });
+
+      const ollamaMessages = [{ role: 'system', content: systemPrompt }, ...mapped];
 
       // Set a long timeout for DeepSeek-R1 and other reasoning models
-      // DeepSeek-R1 can take 10+ minutes for complex reasoning
-      const controller = new AbortController();
+      const timeoutController = new AbortController();
       const timeoutMs = 900000; // 15 minutes (EXACT match to CLI)
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
+
+      const external = options?.signal;
+      let fetchSignal: AbortSignal = timeoutController.signal;
+      if (external && typeof AbortSignal !== 'undefined' && typeof (AbortSignal as any).any === 'function') {
+        fetchSignal = (AbortSignal as any).any([timeoutController.signal, external]);
+      } else if (external) {
+        const merged = new AbortController();
+        const abortMerged = () => merged.abort();
+        timeoutController.signal.addEventListener('abort', abortMerged);
+        external.addEventListener('abort', abortMerged);
+        if (external.aborted) merged.abort();
+        fetchSignal = merged.signal;
+      }
 
       try {
         const response = await fetch(`${this.baseUrl}/api/chat`, {
@@ -49,7 +74,7 @@ export class OllamaProvider implements AIProvider {
               num_predict: 8192
             }
           }),
-          signal: controller.signal,
+          signal: fetchSignal,
         });
 
         clearTimeout(timeoutId);
@@ -83,6 +108,9 @@ export class OllamaProvider implements AIProvider {
       // Provide helpful error messages (EXACT match to CLI)
       if (error instanceof Error) {
         if (error.name === 'AbortError') {
+          if (options?.signal?.aborted) {
+            throw error;
+          }
           throw new Error(
             `Request to Ollama timed out after 15 minutes. ` +
             `This can happen with DeepSeek-R1 on complex questions. Try:\n` +
@@ -106,5 +134,5 @@ export class OllamaProvider implements AIProvider {
 
   getProviderName(): string {
     return `Ollama (${this.model})`;
-    }
   }
+}

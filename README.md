@@ -98,6 +98,17 @@ CipherMate combines static analysis tools with AI-powered vulnerability detectio
 4. See all vulnerabilities with severity levels
 5. Click **"Fix"** or **"Explain"** for each issue
 
+### @-mention a file in chat (exact path + full file context)
+CipherMate reads the file from your **opened workspace** and injects its contents into the prompt so answers target that file.
+
+1. **Shorthand (recommended):** type `@` + path from the workspace root, after a space or at the start of the message:
+   - `@src/server.js` — review or fix this file
+   - `@packages/api/src/index.ts` — monorepo subfolder
+   - `@/Users/you/project/src/server.js` — absolute path (must be inside the workspace)
+2. **Explicit:** `@file src/server.js` or `@file "/path with spaces/file.js"`
+3. You can also **paste a full path** without `@`; if it’s under the workspace, the same file context is added.
+4. **Tip:** Open the folder that contains the project as the workspace root so `@src/...` matches your tree.
+
 ---
 
 ## SETUP OPTIONS

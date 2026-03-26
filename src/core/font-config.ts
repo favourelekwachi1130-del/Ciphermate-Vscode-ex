@@ -47,3 +47,12 @@ export function getFontConfigCss(): string {
   const { fontFamily, fontFamilyCode } = getFontConfig();
   return `--ciphermate-font: ${fontFamily}; --ciphermate-font-code: ${fontFamilyCode};`;
 }
+
+/**
+ * Get CSS rules that apply font settings to body and code elements.
+ * Use after :root { getFontConfigCss() } so the variables are defined.
+ */
+export function getFontApplyCss(): string {
+  return `body, .cm-root, .vscode-body { font-family: var(--ciphermate-font) !important; }
+    code, pre, .cm-code, [data-code] { font-family: var(--ciphermate-font-code) !important; }`;
+}

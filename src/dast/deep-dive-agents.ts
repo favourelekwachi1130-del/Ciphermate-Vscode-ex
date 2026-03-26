@@ -88,6 +88,7 @@ export async function runDeepDiveAgent(
       targetProfile: profile,
       failedPayloads: [finding.payload],
       lastResponseSnippet: finding.responseSnippet,
+      responseStatus: finding.responseStatus,
       useSwarm: true,
     });
 
@@ -246,5 +247,6 @@ export function isPromisingFinding(
   if (baselineBody && Math.abs(body.length - baselineBody.length) > 500) return true;
   if (baselineStatus && statusCode !== baselineStatus) return true;
   if (statusCode >= 500) return true;
+  if (statusCode === 403) return true; // WAF/blocked - AI generates bypass payloads
   return false;
 }

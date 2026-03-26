@@ -95,12 +95,13 @@ export class AgentOrchestrator {
       let profile: Awaited<ReturnType<typeof buildTargetContext>> | null = null;
       let strategy: Awaited<ReturnType<typeof getAttackStrategy>> | null = null;
 
+      const useAIPayloads = config.enableAIPayloadGeneration ?? (pentest || brutal);
       if (config.enableContextAware !== false && endpoints.length > 0) {
         try {
           ev('strategist_started');
           profile = await buildTargetContext(config.targetUrl, workspacePath, config.auth, timeout);
           ev('target_context_built', { stackSummary: profile.stackSummary, database: profile.database, hasGraphql: profile.hasGraphql });
-          strategy = await getAttackStrategy(this.context, profile, endpoints);
+          strategy = await getAttackStrategy(this.context, profile, endpoints, undefined, useAIPayloads);
           ev('strategist_completed', { categories: strategy.prioritizedCategories, rationale: strategy.rationale });
           if (strategy.highValuePatterns.length > 0) {
             toTest = [...toTest].sort((a, b) => {
@@ -158,6 +159,7 @@ export class AgentOrchestrator {
       const promisingFindings: PromisingFinding[] = [];
       const baselineCache = new Map<string, { status: number; body: string }>();
 
+      // AI-first: when AI payloads exist, they are PRIMARY. Predefined only as fallback/supplement.
       const tasks: AttackTask[] = [];
       for (const ep of toTest) {
         const targetUrl = ep.url.startsWith('http') ? ep.url : config.targetUrl.replace(/\/$/, '') + ep.path;
@@ -177,8 +179,15 @@ export class AgentOrchestrator {
             else paramNames = paramNames.slice(0, 3);
 
             const basePayloadList = brutal ? getBrutalPayloads(cat, attack) : attack.payloads;
-            const payloadList = [...customForCat.slice(0, 4), ...basePayloadList];
-            for (const payload of payloadList.slice(0, payloadLimit + (customForCat.length ? 4 : 0))) {
+            // AI-first: customPayloads (AI-generated) are PRIMARY. Predefined as supplement when AI has few or none.
+            const aiPayloadCount = customForCat.length;
+            const payloadList = aiPayloadCount > 0
+              ? [...customForCat, ...basePayloadList.slice(0, aiPayloadCount > 10 ? 2 : 4)]
+              : basePayloadList;
+            const effectiveLimit = useAIPayloads && aiPayloadCount > 0
+              ? Math.max(payloadLimit + 10, aiPayloadCount + 4)
+              : payloadLimit + (aiPayloadCount ? 4 : 0);
+            for (const payload of payloadList.slice(0, effectiveLimit)) {
               for (const param of paramNames.slice(0, 4)) {
                 tasks.push({
                   endpoint: ep,

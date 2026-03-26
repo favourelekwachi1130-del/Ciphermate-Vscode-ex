@@ -20,6 +20,8 @@ export interface PayloadGenerationRequest {
   failedPayloads?: string[];
   /** Response snippet - did we get filtered? Error? */
   lastResponseSnippet?: string;
+  /** Response status - 403 = WAF blocked, trigger bypass payloads */
+  responseStatus?: number;
   /** Encoding that might bypass (url, double-url, unicode, etc.) */
   encodingHint?: string;
   /** Use swarm provider (Ollama) for volume - default false (uses primary) */
@@ -31,18 +33,9 @@ export async function generateContextualPayloads(
   req: PayloadGenerationRequest
 ): Promise<string[]> {
   try {
-    const callAI = req.useSwarm
-      ? async (r: import('../ai-agent/providers/base-provider').AIRequest) => {
-          const { callDastAI } = await import('./dast-ai');
-          return callDastAI(context, 'swarm', r);
-        }
-      : async (r: import('../ai-agent/providers/base-provider').AIRequest) => {
-          const module = await import('../ai-agent/multi-provider-service');
-          const ai = new module.MultiProviderAIService(context);
-          return ai.callAI(r);
-        };
-
-    const prompt = `You are a penetration tester. Generate 5-8 attack payloads for ${req.category} that are OPTIMIZED for this specific target.
+    const wasBlocked = req.responseStatus === 403 || (req.lastResponseSnippet && (req.lastResponseSnippet.includes('403') || req.lastResponseSnippet.includes('Forbidden') || req.lastResponseSnippet.includes('blocked')));
+    const prompt = `You are a penetration tester. Generate ${wasBlocked ? '10-12' : '5-8'} attack payloads for ${req.category} that are OPTIMIZED for this specific target.
+${wasBlocked ? 'PREVIOUS PAYLOAD WAS BLOCKED (403/WAF). Generate WAF bypass variants: encoding, fragmentation, case variation, comments, null bytes, unicode.' : ''}
 
 TARGET: ${req.targetProfile.stackSummary}
 ${req.targetProfile.database ? `Database: ${req.targetProfile.database}` : ''}
@@ -65,6 +58,35 @@ Example for nosql-injection + MongoDB: ["{\\"$gt\\":\\"\\"}","{\\"$ne\\":null}"]
 
 ["payload1","payload2","payload3",...]`;
 
+    const maxPayloads = wasBlocked ? 12 : 8;
+
+    // Kode engine: richer payload generation with workspace context (non-swarm only)
+    if (!req.useSwarm) {
+      const cfg = vscode.workspace.getConfiguration('ciphermate');
+      if (cfg.get('fixes.useKodeEngine', false)) {
+        try {
+          const { getKodeEngineAdapter } = await import('../fix-system/kode-engine-adapter');
+          const kode = getKodeEngineAdapter({ context, kodePath: cfg.get('fixes.kodePath', 'kode') });
+          const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          const result = await kode.generatePayloads(prompt, workspaceRoot);
+          if (result && result.length > 0) return result.slice(0, maxPayloads);
+        } catch {
+          // fall through to standard AI
+        }
+      }
+    }
+
+    const callAI = req.useSwarm
+      ? async (r: import('../ai-agent/providers/base-provider').AIRequest) => {
+          const { callDastAI } = await import('./dast-ai');
+          return callDastAI(context, 'swarm', r);
+        }
+      : async (r: import('../ai-agent/providers/base-provider').AIRequest) => {
+          const module = await import('../ai-agent/multi-provider-service');
+          const ai = new module.MultiProviderAIService(context);
+          return ai.callAI(r);
+        };
+
     const res = await callAI({
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.4,
@@ -77,7 +99,7 @@ Example for nosql-injection + MongoDB: ["{\\"$gt\\":\\"\\"}","{\\"$ne\\":null}"]
 
     const parsed = JSON.parse(match[0]);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0 && p.length < 500).slice(0, 8);
+    return parsed.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0 && p.length < 500).slice(0, maxPayloads);
   } catch (e) {
     console.warn('AI payload generator failed', e);
     return [];
@@ -94,9 +116,6 @@ export async function getAdaptiveSuggestions(
   profile: TargetProfile
 ): Promise<{ nextPayloads?: string[]; tryEncoding?: string; tryParam?: string }> {
   try {
-    const module = await import('../ai-agent/multi-provider-service');
-    const ai = new module.MultiProviderAIService(context);
-
     const prompt = `Pen test in progress. We sent payload "${payload}" for ${category}. Response: status ${responseStatus}, body snippet: "${responseSnippet.slice(0, 500)}"
 
 Target: ${profile.stackSummary}
@@ -109,6 +128,22 @@ The payload didn't clearly confirm vulnerability. What should we try next?
 Return JSON only:
 {"nextPayloads": ["p1","p2"], "tryEncoding": "double-url" or null, "tryParam": "other_param_name" or null}`;
 
+    // Kode engine first (adaptive suggestions benefit from workspace context)
+    const cfg = vscode.workspace.getConfiguration('ciphermate');
+    if (cfg.get('fixes.useKodeEngine', false)) {
+      try {
+        const { getKodeEngineAdapter } = await import('../fix-system/kode-engine-adapter');
+        const kode = getKodeEngineAdapter({ context, kodePath: cfg.get('fixes.kodePath', 'kode') });
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const result = await kode.getAdaptiveSuggestions(prompt, workspaceRoot);
+        if (result) return result;
+      } catch {
+        // fall through
+      }
+    }
+
+    const module = await import('../ai-agent/multi-provider-service');
+    const ai = new module.MultiProviderAIService(context);
     const res = await ai.callAI({
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.2,

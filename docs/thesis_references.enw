@@ -1,0 +1,491 @@
+%0 Generic
+%A OWASP Foundation
+%D 2021
+%T OWASP Top Ten Web Application Security Risks
+%U https://owasp.org/Top10/
+
+%0 Generic
+%A MITRE
+%D 2023
+%T Common Weakness Enumeration (CWE)
+%U https://cwe.mitre.org/
+
+%0 Generic
+%A NVD
+%D 2024
+%T National Vulnerability Database
+%U https://nvd.nist.gov/
+
+%0 Generic
+%A Semgrep
+%D 2024
+%T Semgrep: Static analysis at the speed of development
+%U https://semgrep.dev/
+
+%0 Generic
+%A Bandit
+%D 2024
+%T Bandit – a Python security linter
+%U https://bandit.readthedocs.io/
+
+%0 Journal Article
+%A Li, Z.
+%A Zou, D.
+%A Xu, S.
+%A Ou, X.
+%A Jin, H.
+%A Wang, S.
+%A Deng, Z.
+%A Zhong, Y.
+%D 2018
+%T VulDeePecker: A deep learning-based system for vulnerability detection
+%J NDSS
+%C San Diego, CA
+
+%0 Journal Article
+%A Zhou, Y.
+%A Liu, S.
+%A Siow, J.
+%A Du, X.
+%A Liu, Y.
+%D 2019
+%T Devign: Effective vulnerability identification by learning comprehensive program semantics
+%J NeurIPS
+%C Vancouver, Canada
+
+%0 Journal Article
+%A Pearce, H.
+%A Ahmad, B.
+%A Tan, B.
+%A Dolan-Gavitt, B.
+%A Karri, R.
+%D 2022
+%T Asleep at the keyboard? Assessing the security of GitHub Copilot's code contributions
+%J IEEE Symposium on Security and Privacy
+%C Oakland, CA
+
+%0 Journal Article
+%A Nijkamp, E.
+%A Pang, B.
+%A Hayashi, H.
+%A Tu, L.
+%A Wang, H.
+%A Zhou, Y.
+%A Savarese, S.
+%A Xiong, C.
+%D 2023
+%T CodeGen: An open large language model for code with multi-turn program synthesis
+%J ICML
+%C Honolulu, HI
+
+%0 Journal Article
+%A Allamanis, M.
+%A Brockschmidt, M.
+%A Khademi, M.
+%D 2018
+%T Learning to represent programs with graphs
+%J ICLR
+%C Vancouver, Canada
+
+%0 Journal Article
+%A Johnson, B.
+%A Song, Y.
+%A Murphy-Hill, E.
+%A Bowdidge, R.
+%D 2013
+%T Why don't software developers use static analysis tools to find bugs?
+%J ICSE
+%C San Francisco, CA
+
+%0 Journal Article
+%A Christakis, M.
+%A Bird, C.
+%D 2016
+%T What developers want and need from program analysis: an empirical study
+%J Automated Software Engineering (ASE)
+%C Singapore
+
+%0 Generic
+%A Microsoft
+%D 2024
+%T Visual Studio Code Extension API
+%U https://code.visualstudio.com/api
+
+%0 Generic
+%A CipherMate
+%D 2024
+%T CipherMate – AI-powered security assistant for VS Code
+
+%0 Generic
+%A CVE Program
+%D 2024
+%T Common Vulnerabilities and Exposures
+%U https://cve.mitre.org/
+
+%0 Journal Article
+%A Bessey, A.
+%A Block, K.
+%A Chelf, B.
+%A Chou, A.
+%A Fulton, B.
+%A Halpern, S.
+%A Kam, J.
+%A McPeak, C.
+%A Engler, D.
+%D 2010
+%T A few billion lines of code later: How static analysis has matured
+%J Communications of the ACM
+%V 53
+%N 2
+%P 66-75
+
+%0 Journal Article
+%A Beller, M.
+%A Bholanath, R.
+%A McIntosh, S.
+%A Zaidman, A.
+%D 2016
+%T Analyzing the state of static analysis: A large-scale evaluation in open source software
+%J SANER
+%C Osaka, Japan
+
+%0 Journal Article
+%A Muske, T. B.
+%A Serebrenik, A.
+%D 2017
+%T Survey of approaches for handling static analysis alarms
+%J SANER
+%C Klagenfurt, Austria
+
+%0 Journal Article
+%A Chakraborty, S.
+%A Krishna, R.
+%A Ding, Y.
+%A Ray, B.
+%D 2021
+%T Deep learning based vulnerability detection: Are we there yet?
+%J IEEE Transactions on Software Engineering
+%V 48
+%N 9
+%P 3280-3296
+
+%0 Journal Article
+%A Allamanis, M.
+%A Barr, E. T.
+%A Devanbu, P.
+%A Sutton, C.
+%D 2018
+%T A survey of machine learning for big code and naturalness
+%J ACM Computing Surveys
+%V 50
+%N 5
+%P 1-37
+
+%0 Journal Article
+%A Russell, R.
+%A Kim, L.
+%A Hamilton, L.
+%A Lazovich, T.
+%A Harer, J.
+%A Ozdemir, O.
+%A McConley, M.
+%D 2018
+%T Automated vulnerability detection in source code using deep representation learning
+%J ICMLA
+
+%0 Journal Article
+%A Ding, S. H.
+%A Fung, B. C.
+%A Charland, P.
+%D 2019
+%T Asm2Vec: Boosting static representation fusion for binary clone search across optimization levels
+%J ESEC/FSE
+
+%0 Journal Article
+%A Hin, D.
+%A Kan, A.
+%A Chen, H.
+%A Babar, M. A.
+%D 2022
+%T LineVD: Statement-level vulnerability detection using graph neural networks
+%J IEEE Transactions on Software Engineering
+
+%0 Journal Article
+%A Ayewah, N.
+%A Hovemeyer, D.
+%A Morgenthaler, J. D.
+%A Penix, J.
+%A Pugh, W.
+%D 2008
+%T Using static analysis to find bugs
+%J IEEE Software
+
+%0 Journal Article
+%A Heckman, S. S.
+%A Williams, L.
+%A Poshyvanyk, D.
+%D 2011
+%T A systematic literature review of actionable alert identification techniques for automated static code analysis
+%J Information and Software Technology
+
+%0 Journal Article
+%A Kim, S.
+%A Zimmermann, T.
+%A Pan, K.
+%A Whitehead, E.
+%D 2006
+%T Automatic identification of bug-introducing changes
+%J ASE
+
+%0 Journal Article
+%A Lavazza, L.
+%A Morasca, S.
+%D 2016
+%T An empirical evaluation of static analysis tools for security
+%J ESEM
+
+%0 Journal Article
+%A Lin, G.
+%A Zhang, J.
+%A Luo, W.
+%D 2020
+%T Cross-project vulnerability detection with deep domain adaptation
+%J ASE
+
+%0 Journal Article
+%A Fan, M.
+%A Li, Y.
+%A Wang, X.
+%D 2020
+%T VulnLoc: A deep learning-based vulnerability localization system
+%J ICSME
+
+%0 Journal Article
+%A Sandoval, G.
+%A Pearce, H.
+%D 2023
+%T Lost at C: A user study on LLM security understanding
+%J USENIX Security
+
+%0 Journal Article
+%A Siddiq, M. L.
+%A Santos, J. M.
+%D 2022
+%T Copilot is all you need? Exploring the security of code generation models
+%J arXiv preprint
+
+%0 Journal Article
+%A Khoury, R.
+%D 2023
+%T How secure is code generated by ChatGPT?
+%J IEEE Security and Privacy
+
+%0 Journal Article
+%A Green, T. R. G.
+%A Petre, M.
+%D 1996
+%T Usability analysis of visual programming environments
+%J Journal of Visual Languages
+
+%0 Journal Article
+%A Murphy-Hill, E.
+%A Parnin, C.
+%A Black, A.
+%D 2009
+%T How we refactor, and how we know it
+%J ICSE
+
+%0 Journal Article
+%A Storey, M. A.
+%D 2008
+%T How do programmers understand code?
+%J ICSE
+
+%0 Journal Article
+%A LaToza, T. D.
+%A Myers, B. A.
+%D 2010
+%T Developers ask reachability questions
+%J ICSE
+
+%0 Journal Article
+%A Mell, P.
+%A Scarfone, K.
+%A Romanosky, S.
+%D 2006
+%T A complete guide to the CVSS
+%J FIRST
+
+%0 Journal Article
+%A Bozorgi, M.
+%D 2010
+%T Beyond heuristics: Learning to classify vulnerabilities and predict exploits
+%J KDD
+
+%0 Journal Article
+%A Sabottke, C.
+%D 2015
+%T Vulnerability disclosure in the age of social media
+%J USENIX Security
+
+%0 Journal Article
+%A Holm, H.
+%D 2014
+%T Measuring the effectiveness of vulnerability scanning
+%J ICISSP
+
+%0 Journal Article
+%A Le Goues, C.
+%A Nguyen, T.
+%A Forrest, S.
+%A Weimer, W.
+%D 2012
+%T GenProg: Automatic program repair
+%J ICSE
+
+%0 Journal Article
+%A Monperrus, M.
+%D 2018
+%T Automatic software repair: A bibliography
+%J ACM Computing Surveys
+
+%0 Journal Article
+%A Long, F.
+%A Rinard, M.
+%D 2016
+%T Automatic patch generation
+%J PLDI
+
+%0 Journal Article
+%A Mesbah, A.
+%D 2019
+%T Deep learning for software engineering
+%J IEEE Software
+
+%0 Journal Article
+%A Rahman, F.
+%A Devanbu, P.
+%D 2013
+%T How, and why, process metrics are better
+%J ICSE
+
+%0 Journal Article
+%A Thomas, S. W.
+%A Adams, B.
+%A Hassan, A. E.
+%A Blostein, D.
+%D 2014
+%T Studying the impact of software evolution on software quality
+%J Journal of Systems and Software
+
+%0 Journal Article
+%A Chen, M.
+%A Tworek, J.
+%A Jun, H.
+%A Yuan, Q.
+%A Kaplan, J.
+%A Zettlemoyer, L.
+%D 2021
+%T Evaluating large language models trained on code
+%J arXiv preprint arXiv:2107.03374
+
+%0 Journal Article
+%A Roziere, B.
+%A Gehring, J.
+%A Gloeckle, F.
+%A Sootla, S.
+%A Gat, I.
+%A Tan, X. E.
+%A Synnaeve, G.
+%D 2023
+%T Code Llama: Open foundation models for code
+%J arXiv preprint arXiv:2308.12950
+
+%0 Journal Article
+%A He, J.
+%A Vechev, M.
+%D 2023
+%T Large language models for code: Security hardening and adversarial testing
+%J CCS
+
+%0 Journal Article
+%A Perry, N.
+%A Srivastava, M.
+%A Kumar, D.
+%A Levy, O.
+%D 2022
+%T Do users write more insecure code with AI assistants?
+%J arXiv preprint arXiv:2211.03622
+
+%0 Book
+%A McGraw, G.
+%D 2006
+%T Software security: Building security in
+%I Addison-Wesley
+
+%0 Generic
+%A SANS Institute
+%D 2018
+%T The state of application security
+%9 Report
+
+%0 Book
+%A Williams, L.
+%A McGraw, G.
+%D 2009
+%T Building security in
+%I Addison-Wesley
+
+%0 Generic
+%A OWASP
+%D 2022
+%T OWASP Software Assurance Maturity Model (SAMM)
+%U https://owasp.org/www-project-samm/
+
+%0 Journal Article
+%A Spring, J. M.
+%A Hatleberg, B.
+%A Borman, C.
+%A Dash, S.
+%A Kadakia, A.
+%D 2017
+%T CVE details: The value of vulnerability information
+%J IEEE S&P Workshops
+
+%0 Journal Article
+%A Ruohonen, J.
+%A Hyrynsalmi, S.
+%A Leppänen, V.
+%D 2020
+%T An empirical analysis of the evolution of CVE
+%J Computers and Security
+
+%0 Journal Article
+%A Alhazmi, O. H.
+%A Malaiya, Y. K.
+%A Ray, I.
+%D 2007
+%T Security vulnerabilities in software systems: A quantitative perspective
+%J Journal of Systems and Software
+
+%0 Journal Article
+%A Chen, Z.
+%A Kommrusch, S. J.
+%A Tufano, M.
+%A Pouchet, L. N.
+%A Poshyvanyk, D.
+%A Monperrus, M.
+%D 2021
+%T Sequencer: Sequence-to-sequence learning for end-to-end program repair
+%J IEEE Transactions on Software Engineering
+
+%0 Journal Article
+%A Tufano, M.
+%A Watson, C.
+%A Bavota, G.
+%A Di Penta, M.
+%A White, M.
+%A Poshyvanyk, D.
+%D 2019
+%T Deep learning similarities from different representations of source code
+%J ICSE

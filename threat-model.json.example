@@ -1,0 +1,10 @@
+{
+  "sliceFocus": "Authorization boundary and input validation",
+  "entryPoints": ["HTTP routes", "RPC handlers", "CLI"],
+  "trustBoundaries": ["browser to server", "service to service"],
+  "highRiskOps": ["deserialization", "authz checks", "parsing untrusted input"],
+  "attackerModel": "remote-unauthenticated",
+  "crownJewels": ["payment API", "user PII"],
+  "invariants": ["Only admins can call DELETE /users"],
+  "source": "user"
+}

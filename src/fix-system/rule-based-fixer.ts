@@ -90,23 +90,9 @@ export class RuleBasedFixer {
       return this.fixInsecureRandom(vulnerability);
     }
 
-    // Eval detection - improved matching without requiring 'deserialization' keyword
     if (vulnType.includes('eval') ||
-        vulnType === 'eval' ||
-        title.includes('eval') ||
-        title.includes('function constructor') ||
-        code.includes('eval(') ||
-        code.includes('new Function(')) {
+        (combinedText.includes('eval') && combinedText.includes('deserialization'))) {
       return this.fixEval(vulnerability);
-    }
-
-    // YAML injection handler
-    if (vulnType.includes('yaml') ||
-        vulnType === 'yaml-injection' ||
-        combinedText.includes('yaml') ||
-        code.includes('yaml.load') ||
-        code.includes('yaml.unsafe_load')) {
-      return this.fixYamlUnsafeLoad(vulnerability);
     }
 
     if (vulnType.includes('innerHTML') || vulnType.includes('innerhtml') ||
@@ -120,17 +106,10 @@ export class RuleBasedFixer {
       return this.fixWeakHash(vulnerability);
     }
 
-    // Add insecure-deserialization handler (includes pickle)
+    // Add insecure-deserialization handler
     if (vulnType.includes('deserialization') || vulnType.includes('deserialize') ||
-        combinedText.includes('deserialization') || combinedText.includes('unserialize') ||
-        combinedText.includes('pickle') ||
-        code.includes('pickle.load') || code.includes('pickle.loads')) {
+        combinedText.includes('deserialization') || combinedText.includes('pickle') || combinedText.includes('unserialize')) {
       return this.fixInsecureDeserialization(vulnerability);
-    }
-
-    // Python subprocess shell=True handler (treated as command injection)
-    if (code.includes('shell=True') || code.includes('shell = True')) {
-      return this.fixSubprocessShell(vulnerability);
     }
 
     // Add SSRF handler
@@ -157,206 +136,7 @@ export class RuleBasedFixer {
       return this.fixWeakPassword(vulnerability);
     }
 
-    // IaC (Infrastructure as Code) - Terraform, Kubernetes, CloudFormation
-    if (vulnType.startsWith('IAC-')) {
-      return this.fixIac(vulnerability);
-    }
-
-    // Container / Dockerfile (CONT-001, CONT-003, CONT-005, CONT-011)
-    if (vulnType.startsWith('CONT-') || vulnType.includes('container')) {
-      return this.fixContainer(vulnerability);
-    }
-
     // No matching rule
-    return null;
-  }
-
-  /**
-   * Fix IaC misconfigurations (Terraform, Kubernetes, CloudFormation)
-   */
-  private fixIac(vulnerability: Vulnerability): RuleBasedFix | null {
-    const code = vulnerability.code || '';
-    const ruleId = vulnerability.type || '';
-
-    // IAC-K8S-001: privileged: true -> false
-    if (ruleId === 'IAC-K8S-001' && /privileged\s*:\s*true/i.test(code)) {
-      return {
-        originalCode: code,
-        fixedCode: code.replace(/privileged\s*:\s*true/i, 'privileged: false'),
-        explanation: 'Set privileged to false to disable host-level container access',
-        confidence: 0.95,
-        securityImprovements: ['Restricts container to user namespace', 'Reduces attack surface'],
-        testingNotes: 'Verify the container still runs correctly; some workloads require privileged mode'
-      };
-    }
-
-    // IAC-K8S-002: runAsUser: 0 -> runAsUser: 1000
-    if (ruleId === 'IAC-K8S-002') {
-      if (/runAsUser\s*:\s*0\b/i.test(code)) {
-        return {
-          originalCode: code,
-          fixedCode: code.replace(/runAsUser\s*:\s*0\b/i, 'runAsUser: 1000'),
-          explanation: 'Set runAsUser to non-root (1000). Add runAsNonRoot: true for defense in depth.',
-          confidence: 0.9,
-          securityImprovements: ['Container runs as non-root user'],
-          testingNotes: 'Ensure your image supports running as non-root; some images require root'
-        };
-      }
-      if (/runAsRoot\s*:\s*true/i.test(code)) {
-        return {
-          originalCode: code,
-          fixedCode: code.replace(/runAsRoot\s*:\s*true/i, 'runAsNonRoot: true'),
-          explanation: 'Set runAsNonRoot to true to prevent running as root',
-          confidence: 0.95,
-          securityImprovements: ['Forbids root execution'],
-          testingNotes: 'Verify container works with runAsNonRoot: true'
-        };
-      }
-    }
-
-    // IAC-K8S-003: hostNetwork/hostPID/hostIPC: true -> false
-    if (ruleId === 'IAC-K8S-003') {
-      let fixed = code;
-      if (/hostNetwork\s*:\s*true/i.test(fixed)) fixed = fixed.replace(/hostNetwork\s*:\s*true/i, 'hostNetwork: false');
-      if (/hostPID\s*:\s*true/i.test(fixed)) fixed = fixed.replace(/hostPID\s*:\s*true/i, 'hostPID: false');
-      if (/hostIPC\s*:\s*true/i.test(fixed)) fixed = fixed.replace(/hostIPC\s*:\s*true/i, 'hostIPC: false');
-      if (fixed !== code) {
-        return {
-          originalCode: code,
-          fixedCode: fixed,
-          explanation: 'Disable host namespace sharing (hostNetwork, hostPID, hostIPC)',
-          confidence: 0.9,
-          securityImprovements: ['Pod uses isolated network/PID/IPC namespaces'],
-          testingNotes: 'Some DaemonSets (e.g. node exporter) require hostNetwork; add ciphermate:ignore if intentional'
-        };
-      }
-    }
-
-    // IAC-K8S-006: readOnlyRootFilesystem: false -> true
-    if (ruleId === 'IAC-K8S-006' && /readOnlyRootFilesystem\s*:\s*false/i.test(code)) {
-      return {
-        originalCode: code,
-        fixedCode: code.replace(/readOnlyRootFilesystem\s*:\s*false/i, 'readOnlyRootFilesystem: true'),
-        explanation: 'Enable read-only root filesystem for immutability',
-        confidence: 0.9,
-        securityImprovements: ['Prevents writes to container filesystem', 'Immutable container'],
-        testingNotes: 'Ensure app uses tmpfs or volumes for any required writes'
-      };
-    }
-
-    // IAC-K8S-007: allowPrivilegeEscalation: true -> false
-    if (ruleId === 'IAC-K8S-007' && /allowPrivilegeEscalation\s*:\s*true/i.test(code)) {
-      return {
-        originalCode: code,
-        fixedCode: code.replace(/allowPrivilegeEscalation\s*:\s*true/i, 'allowPrivilegeEscalation: false'),
-        explanation: 'Disable privilege escalation in the container',
-        confidence: 0.95,
-        securityImprovements: ['Prevents privilege escalation via setuid binaries'],
-        testingNotes: 'Verify no legitimate use of privilege escalation'
-      };
-    }
-
-    // IAC-TF-003: cidr_blocks = ["0.0.0.0/0"] -> restrict (placeholder - user must specify)
-    if (ruleId === 'IAC-TF-003' && /cidr_blocks\s*=\s*\[?\s*["']0\.0\.0\.0\/0["']\s*\]?/i.test(code)) {
-      return {
-        originalCode: code,
-        fixedCode: code.replace(/["']0\.0\.0\.0\/0["']/gi, '"10.0.0.0/8"  # TODO: Restrict to your VPC or specific IPs'),
-        explanation: 'Replace 0.0.0.0/0 with your VPC CIDR or specific IP ranges',
-        confidence: 0.7,
-        securityImprovements: ['Restricts ingress to internal/specific IPs'],
-        testingNotes: 'Update the CIDR to match your environment (VPC CIDR, office IPs, etc.)'
-      };
-    }
-
-    return null;
-  }
-
-  /**
-   * Fix container / Dockerfile misconfigurations (CONT-001, CONT-003, CONT-005, CONT-011)
-   */
-  private fixContainer(vulnerability: Vulnerability): RuleBasedFix | null {
-    const code = vulnerability.code || '';
-    const ruleId = vulnerability.type || '';
-
-    // CONT-001: FROM xxx:latest -> suggest pinned tag (alpine:3.19, node:20, etc.)
-    if (ruleId === 'CONT-001') {
-      const fromMatch = code.match(/FROM\s+(?:--platform=\S+\s+)?([\w./-]+):(?:latest|stable|LTS)\s*(.*)$/im);
-      if (fromMatch) {
-        const [, base, rest] = fromMatch;
-        let suggested = base;
-        if (/alpine/i.test(base)) suggested = `${base}:3.19`;
-        else if (/node/i.test(base)) suggested = `${base}:20`;
-        else if (/python/i.test(base)) suggested = `${base}:3.11`;
-        else if (/ubuntu|debian/i.test(base)) suggested = `${base}:22.04`;
-        else suggested = `${base}:<pin-version>`;
-        const fixed = code.replace(
-          /(FROM\s+(?:--platform=\S+\s+)?)([\w./-]+):(?:latest|stable|LTS)(\s.*)?$/im,
-          `$1${suggested}$3`
-        );
-        if (fixed !== code) {
-          return {
-            originalCode: code,
-            fixedCode: fixed,
-            explanation: `Pinned base image to a specific version instead of :latest`,
-            confidence: 0.85,
-            securityImprovements: ['Reproducible builds', 'Reduced supply chain risk'],
-            testingNotes: 'Verify the pinned version is maintained and compatible'
-          };
-        }
-      }
-    }
-
-    // CONT-003: Add USER directive before CMD/ENTRYPOINT
-    if (ruleId === 'CONT-003') {
-      // Insert USER nobody (or 1000) before the first CMD or ENTRYPOINT if not already present
-      if (!/^\s*USER\s+/mi.test(code)) {
-        const beforeCmd = code.replace(
-          /^(\s*)((?:RUN\s+[^\n]+\n)+)(\s*(?:CMD|ENTRYPOINT)\s)/m,
-          '$1$2$1USER nobody\n$3'
-        );
-        if (beforeCmd !== code) {
-          return {
-            originalCode: code,
-            fixedCode: beforeCmd,
-            explanation: 'Added USER directive so container runs as non-root',
-            confidence: 0.8,
-            securityImprovements: ['Container runs as non-root user'],
-            testingNotes: 'Use USER 1000 or a named user if your image has one; ensure directories are writable'
-          };
-        }
-      }
-    }
-
-    // CONT-005: apt-get install -> add --no-install-recommends
-    if (ruleId === 'CONT-005' && /apt-get\s+install\s+-y\s+[^;]+(?!--no-install-recommends)/i.test(code)) {
-      const fixed = code.replace(
-        /apt-get\s+install\s+(-y)\s+/gi,
-        'apt-get install -y --no-install-recommends '
-      );
-      if (fixed !== code) {
-        return {
-          originalCode: code,
-          fixedCode: fixed,
-          explanation: 'Added --no-install-recommends to reduce image size and attack surface',
-          confidence: 0.95,
-          securityImprovements: ['Smaller image', 'Fewer packages to maintain'],
-          testingNotes: 'Verify app still works; some packages need recommended deps'
-        };
-      }
-    }
-
-    // CONT-011: privileged: true -> false (docker-compose)
-    if (ruleId === 'CONT-011' && /privileged\s*:\s*true/i.test(code)) {
-      return {
-        originalCode: code,
-        fixedCode: code.replace(/privileged\s*:\s*true/i, 'privileged: false'),
-        explanation: 'Set privileged to false; use cap_add for specific capabilities if needed',
-        confidence: 0.9,
-        securityImprovements: ['Disables host-level container access'],
-        testingNotes: 'Verify container works without privileged; some drivers need it'
-      };
-    }
-
     return null;
   }
 
@@ -657,47 +437,6 @@ ${code}`,
         'Avoid shell interpretation of user input'
       ],
       testingNotes: 'Test with: ; ls -la, | cat /etc/passwd, $(whoami)'
-    };
-  }
-
-  /**
-   * Fix Python subprocess shell=True vulnerability
-   */
-  private fixSubprocessShell(vulnerability: Vulnerability): RuleBasedFix {
-    const code = vulnerability.code || '';
-
-    // Replace shell=True with shell=False
-    let fixedCode = code.replace(/shell\s*=\s*True/gi, 'shell=False');
-
-    // If it looks like a string command is being passed, suggest using a list
-    if (code.match(/subprocess\.\w+\s*\(\s*["']/)) {
-      return {
-        originalCode: code,
-        fixedCode: `# Command Injection Prevention: Use list of arguments instead of shell string
-# Before: subprocess.run("command arg1 arg2", shell=True)
-# After:  subprocess.run(["command", "arg1", "arg2"], shell=False)
-# Fixed code with shell=False (requires converting string to list):
-${fixedCode}`,
-        explanation: 'Disabled shell execution and suggest using argument list to prevent command injection',
-        confidence: 0.85,
-        securityImprovements: [
-          'shell=False prevents shell interpretation of special characters',
-          'Using list of arguments prevents command injection'
-        ],
-        testingNotes: 'Convert command string to list format: ["cmd", "arg1", "arg2"]'
-      };
-    }
-
-    return {
-      originalCode: code,
-      fixedCode,
-      explanation: 'Changed shell=True to shell=False to prevent command injection',
-      confidence: 0.9,
-      securityImprovements: [
-        'Disables shell interpretation',
-        'Special characters not processed as shell commands'
-      ],
-      testingNotes: 'Verify command works without shell features. Pass arguments as list.'
     };
   }
 
@@ -1186,52 +925,6 @@ ${code}`,
       confidence: 0.6,
       securityImprovements: ['Validate input before deserialization'],
       testingNotes: 'Implement proper input validation and type checking'
-    };
-  }
-
-  /**
-   * Fix YAML unsafe load vulnerabilities
-   */
-  private fixYamlUnsafeLoad(vulnerability: Vulnerability): RuleBasedFix {
-    const code = vulnerability.code || '';
-
-    // Pattern: yaml.load(x) → yaml.safe_load(x)
-    if (code.includes('yaml.load') || code.includes('yaml.unsafe_load')) {
-      const fixedCode = code
-        .replace(/yaml\.unsafe_load\s*\(/g, 'yaml.safe_load(')
-        .replace(/yaml\.load\s*\(\s*([^,)]+)\s*\)/g, 'yaml.safe_load($1)');
-
-      return {
-        originalCode: code,
-        fixedCode,
-        explanation: 'Replaced unsafe YAML load with safe_load to prevent code execution',
-        confidence: 0.95,
-        securityImprovements: [
-          'safe_load only parses safe YAML subsets',
-          'Prevents arbitrary code execution from YAML files'
-        ],
-        testingNotes: 'Verify YAML parsing still works correctly. safe_load does not support custom Python objects.'
-      };
-    }
-
-    // Generic fallback
-    return {
-      originalCode: code,
-      fixedCode: `# YAML Injection Prevention:
-# Always use yaml.safe_load() instead of yaml.load()
-# yaml.safe_load() only parses standard YAML types
-# Example:
-#   import yaml
-#   data = yaml.safe_load(file_content)
-# Original code:
-${code}`,
-      explanation: 'yaml.load can execute arbitrary Python code from YAML files',
-      confidence: 0.7,
-      securityImprovements: [
-        'Use yaml.safe_load() for untrusted input',
-        'Prevents arbitrary code execution'
-      ],
-      testingNotes: 'Ensure YAML content does not require custom Python objects'
     };
   }
 

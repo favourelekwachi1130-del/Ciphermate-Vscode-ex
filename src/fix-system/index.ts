@@ -22,6 +22,12 @@ export { RuleBasedFixer, getRuleBasedFixer } from './rule-based-fixer';
 export { TaskGuard, getTaskGuard, TaskGuardResult } from './task-guard';
 export { ReviewSubagent, getReviewSubagent, ReviewResult } from './review-subagent';
 export { MultiAIFixPipeline, getMultiAIFixPipeline } from './multi-ai-fix-pipeline';
+export { KodeEngineAdapter, getKodeEngineAdapter } from './kode-engine-adapter';
+export { findSamePatternInWorkspace } from './pattern-fix-service';
+export { reviewDiffHunks, parseUnifiedDiffToHunks } from './diff-review';
+export { getPlaybookForVulnType, getAllPlaybooks } from './remediation-playbooks';
+export { loadEccRules } from './ecc-rules-loader';
+export { runWorkspaceTests, detectTestCommand } from './workspace-test-runner';
 
 // Main service
 export { FixService } from './fix-service';

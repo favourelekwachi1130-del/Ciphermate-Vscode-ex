@@ -229,6 +229,15 @@ export interface FixServiceConfig {
 
   /** Use multi-AI pipeline (Generator, Pre-Validator, File Handler, Final Validator) */
   enableMultiAIPipeline?: boolean;
+
+  /** Use optional classic fix engine (external binary). Default: false — CipherMate native pipeline is recommended. */
+  useKodeEngine?: boolean;
+
+  /** Path to classic fix engine binary when useKodeEngine is true (advanced) */
+  kodePath?: string;
+
+  /** When classic engine is enabled, fall back to CipherMate pipeline if unavailable or fails */
+  kodeFallbackToMultiAI?: boolean;
 }
 
 /**

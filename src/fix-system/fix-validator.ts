@@ -6,6 +6,21 @@
  */
 
 import * as vscode from 'vscode';
+
+/** Lightweight brace/paren/bracket check — export for use in fix pipeline retry logic. */
+export function checkBalancedDelimiters(code: string): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  const openBraces = (code.match(/\{/g) || []).length;
+  const closeBraces = (code.match(/\}/g) || []).length;
+  if (openBraces !== closeBraces) errors.push(`Mismatched braces: ${openBraces} '{' vs ${closeBraces} '}'`);
+  const openParens = (code.match(/\(/g) || []).length;
+  const closeParens = (code.match(/\)/g) || []).length;
+  if (openParens !== closeParens) errors.push(`Mismatched parentheses`);
+  const openBrackets = (code.match(/\[/g) || []).length;
+  const closeBrackets = (code.match(/\]/g) || []).length;
+  if (openBrackets !== closeBrackets) errors.push(`Mismatched brackets`);
+  return { valid: errors.length === 0, errors };
+}
 import * as path from 'path';
 import { FixProposal, ValidationResult } from './types';
 import { Vulnerability, ScanResult } from '../scanners/types';
@@ -146,17 +161,7 @@ export class FixValidator {
   }
 
   private checkBalancedDelimiters(code: string): { valid: boolean; errors: string[] } {
-    const errors: string[] = [];
-    const openBraces = (code.match(/\{/g) || []).length;
-    const closeBraces = (code.match(/\}/g) || []).length;
-    if (openBraces !== closeBraces) errors.push(`Mismatched braces: ${openBraces} '{' vs ${closeBraces} '}'`);
-    const openParens = (code.match(/\(/g) || []).length;
-    const closeParens = (code.match(/\)/g) || []).length;
-    if (openParens !== closeParens) errors.push(`Mismatched parentheses`);
-    const openBrackets = (code.match(/\[/g) || []).length;
-    const closeBrackets = (code.match(/\]/g) || []).length;
-    if (openBrackets !== closeBrackets) errors.push(`Mismatched brackets`);
-    return { valid: errors.length === 0, errors };
+    return checkBalancedDelimiters(code);
   }
 
   private checkUnterminatedStrings(code: string): boolean {

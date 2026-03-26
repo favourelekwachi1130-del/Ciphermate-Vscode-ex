@@ -1,0 +1,164 @@
+# CipherMate — Project Impact Statement, Project Plan & Simulated Ethics Application  
+### (Theme submission package — coursework / portfolio)
+
+**Forum upload reminder:** When posting to the module forums, attach **this document** together with the **Theme 1 abstract and literature survey** (`docs/LITERATURE_SURVEY_EXPANDED.md` in the repository), as required by the brief.
+
+**Project:** CipherMate — AI-augmented application security in Visual Studio Code, **first-party agent tools via OpenRouter**, and a **roadmap toward a dedicated security-coding model** trained or fine-tuned with **institutional GPU resources**.
+
+**Disclaimer:** Section 3 is a **fictional, illustrative** ethics-style protocol for academic practice only. It has **not** been submitted to any institutional review board (IRB).
+
+---
+
+## 1. Project Impact Statement
+
+Software vulnerabilities remain the main cause of data breaches and ransomware attacks and supply chain security breaches. Organizations spent considerable money on secure development life cycle and testing procedures and dependency tracking yet their systems still suffered from security vulnerabilities that reached operational use. The existing issue arises because detection technology exists yet developers fail to develop fixes from detection alerts because of the detection-remediation gap. The field of empirical software-engineering research provides an explanation for this situation. The research conducted by Johnson et al. demonstrated that developers tend to disregard or completely stop using static analysis tools when they face false positive results and complex warnings which need special skills to interpret and prioritize [1]. Christakis and Bird demonstrated that practitioners prefer **smaller sets of high-confidence, actionable findings** instead of long undifferentiated alert lists [2]. Sadowski et al. reported on industrial deployment at Google that engineers followed alerts when their workflow integration and performance and actionable next steps existed throughout the process [3]. The research results show that shift left implementation only succeeds when developers receive timely and trustworthy feedback that exists in their integrated development environment.
+
+The direct evidence which backs CipherMate shows its actual motivation. The system considers static and policy-driven analysis as its main source which identifies all discovered elements. The system operates through conversational AI and agent tools which assist developers in comprehending and organizing and fixing problems. The system functions through multiple detectors which replace a single hidden system that functions as a complete replacement for detection systems. The architectural design addresses contemporary threats which arise from large language models. Pearce *et al.* demonstrated that Copilot-style assistants can produce **insecure code** under mundane prompts [4], and follow-on work has questioned how far general coding assistants improve or harm security outcomes [5]. Chakraborty *et al.* showed that multiple deep learning methods used for vulnerability detection generate false positive results because their evaluation methods do not meet standards. The system uses multiple detection systems instead of depending on a single neural system to define its foundational truth. The system uses ML and LLM technology to create assistive systems which help with ranking and explanation and human-reviewed fixing suggestions. The approach follows the research field's established methodological standards.
+
+The national and community frameworks which exist in the present time both support the same objective. NIST’s **Secure Software Development Framework (SSDF)** highlights secure design requirements together with safe engineering environments and ongoing artifact development processes [7]. The OWASP **Top 10** list and the **Application Security Verification Standard (ASVS)** document establish common terms which define security vulnerabilities and testing procedures for security evaluation [8], [9]. The essential texts about **software security** and **threat modelling** demonstrate that organizations must conduct their own assessments of assets and threats, including mitigation strategies, because tools cannot provide complete solutions [10], [11]. The developers of CipherMate created the tool to implement the concepts in VS Code through its scanning system which delivers organized results that follow CWE/CVE standards when relevant while its assistant provides contextual interpretation of findings which determines their impact on production systems or testing environments based on company guidelines and employee decisions.
+
+The system currently operates through **CipherMate-defined agent tools** which OpenRouter directs to function as a single application programming interface that connects multiple base models. The system design enables three benefits which include reduced vendor dependency, model testing through A/B experiments under identical security conditions, and cost-effective routing which uses advanced models for complex explanations and smaller models for initial assessment. The system does not allow free control because it restricts tool usage to specified functions which it records through monitoring systems and provides users with three interface options (preview, diff, rollback) to maintain their authority over the process which helps to prevent the failure mode that Pearce et al. identified in their work about automated solution implementation [4].
+
+The project aims to establish its unique path through its **CipherMate security-coding model** which combines dedicated security weightings for **cybersecurity implementation, review, and remediation** purposes. General models optimise for speed and broad correctness; the security vertical benefits from models that default to **safe APIs**, **explicit threat trade-offs**, and **CWE-aware** reasoning. The project needs GPU resources for training and fine-tuning purposes to achieve its thesis and product development goals. **This work will rely on the school’s GPU computing facilities** (institutional cluster or faculty GPU laboratory) for repeatable training runs, hyperparameter search, and benchmark replication; laptop CPUs are insufficient for credible iteration on modern parameter counts, and ad hoc local GPUs complicate reproducibility and fair comparison across experiments. The system maintains ability to develop extensions through CPU methods while the institution allocates GPU resources specifically to support the machine-learning track.
+
+CipherMate enables **developers** to complete their work from **alert to understood risk to merged fix** within reduced time frames while their brains experience less mental burden from unnecessary information. The platform provides **AppSec and platform teams** with a pathway to establish standardized protocols which determine **which models and tools** can function at different risk levels and eventually enable them to manage **organisation-controlled** weights within their local environment. The project provides a complete research study for **research and teaching** which demonstrates the capabilities of **hybrid human–AI security tooling** together with honest evaluation design [6] and the ethical considerations for training data used in domain-specific models. The system enables **open-source maintainers** to achieve their baseline scanning requirements before merge through a process that requires minimal effort while allowing contributors with no cloud expenses to access smaller open models that work with the system.
+
+
+CipherMate does **not** claim to guarantee absence of vulnerabilities; it seeks to **improve** the rate and quality of remediation given finite attention. The future CipherMate-tuned model and other AI-generated suggestions need **tests, review, and threat modelling** before they can be accepted. The combination of legal obligations, asset criticality, and adversary model establishes the standard for security in organizational settings. The success of the project requires evaluation through metrics that follow academic standards which include **trust**, **actionability**, **time-to-fix**, and **evaluation hygiene** rather than relying on detection counts [1]–[3], [6].
+
+The first part of this text presents the main reason and design position which this section introduces additional information for both coursework and thesis readers without changing the existing content. Supply-chain security expands the detection-remediation gap because most failures between first-party code and transitive dependencies and build pipelines and compromised packages. The software industry now requires technical documentation to include software bills of materials SBOMs together with patch management procedures and origin verification methods because outdated or insecure dependencies need to be addressed during the same process that analyzes code through static analysis methods. Developers handle all signals as undifferentiated noise because they experience alert fatigue. The CipherMate system establishes processing frameworks through structured results which follow standards whereas its conversational results demonstrate that remediation functions as a socio-technical system. The organization needs to take additional steps because the current framework blocks employees from making decisions about the most important work they need to complete before their due dates.
+
+The original team members must directly execute the work because **Threat modelling** cannot be delegated to other people. The security scanners become more effective through the combination of STRIDE-style thinking and data-flow analysis and adversary assumptions because security failures which include authorization errors and business-logic flaws and misuse of designed features do not produce clear-cut security patterns. The assistant from CipherMate enables users to model their tasks because it provides code structure summaries together with question recommendations and links to CWE family findings but it cannot replace the need for individuals to take responsibility for their assets and trust boundaries and compensating controls. The tool provides its users with a dual functionality because it detects issues which require human supervision at their detected base while providing users with detection information.
+
+The evaluation process for the assistant's security needs to be treated as a fundamental requirement which must be included in all research documentation. IDE-embedded agents that invoke tools can, in principle, be influenced by **prompt injection** in untrusted content, malicious instructions embedded in repositories, or social engineering in chat. The organization implements defensive measures which use **strict tool allow-lists** together with **path and secret redaction policies** and **user-visible previews** which exist before any changes, and **logging** enables security incident investigations. The three-interface pattern (preview, diff, rollback) functions as a usability feature because it creates a **safety boundary** which restricts model error effects according to the principle that automated systems without human control will either maintain or increase security vulnerabilities.
+
+**Note:** Some large language models are documented with a knowledge cutoff around October 2023. The document does not provide legal guidance yet it demonstrates that academic research frameworks including the **EU Cyber Resilience Act** and sector-specific regulations like critical-infrastructure directives require vendors to establish documented development protocols and vulnerability management systems and operational transparency. CipherMate achieves compliance with **SSDF-style** requirements [7] and **OWASP ASVS-style** standards [8], [9] which enables teams to use tool results for their existing security objectives while backing their **AppSec governance** through standard operating procedures and authorized toolsets and cloud-based systems that match different security categories together with on-premise prediction methods.
+
+**Open-source ecosystems** experience an unjust burden distribution which negatively impacts their project maintainers. Developers at the project site need to perform basic merge tests which do not require expensive software-as-a-service solutions. The testing process needs to maintain its testing accuracy standards while executing tests within defined time limits. The optional system directs users to **smaller open-weight models** which they use for initial assessment or detailed explanation. The system then directs users to more advanced models. The system follows production machine learning systems which consider expenses when processing data. The system preserves project **inclusivity** through its actual representation of system capabilities.
+
+The machine-learning track needs to pre-register its evaluation protocols and should document them before presenting core results according to research integrity standards. The evaluation protocols need to be assessed through train and validation and test splits which companies must maintain according to their repository boundaries and operational time limits.
+Researchers require GPU access to institutional hardware resources because they need to achieve identical research results through their use of container images and dependency specifications and batch processing.
+
+The **training data ethics** of security-specialized model training conflict with license obligations because the process requires both **PII** and **secret** data removal and the danger of model memory that protects sensitive code through improper use. The project requires dataset cards and **licence review** and **use policies** to function as essential components that align with their benchmark scores. The hybrid system of CipherMate uses **deterministic scanners as source of truth** and **models as assistants** to establish scientific integrity because it prevents researchers from treating a single neural score as the only valid assessment method. The project establishes its place in current software security standards through its two extensions which show that organizations can reduce security vulnerabilities by using existing attention and standards with their collected evidence.
+
+The process of adopting new technology by organizations will succeed or fail based on which tools they use to manage their operational procedures and how their security and development teams share responsibilities and how quickly they can validate their solutions before implementing them. CipherMate’s narrative therefore aligns with **DevSecOps** integration themes: security feedback should resemble the ergonomics of compiler diagnostics and unit tests—**local**, **fast enough**, and **action-linked**—rather than resembling a separate ticketing universe that developers visit only under duress. The IDE layer helps enterprises with **separate AppSec queues** by decreasing the amount of poorly understood tickets and their accompanying security review documentation.
+
+The process of comparative positioning demonstrates the aspects that CipherMate will not attempt to substitute. The essential functions of enterprise SOAR platforms together with central vulnerability management databases operate as the vital tools which organizations require to conduct fleet-scale threat assessment and incident response coordination. The function of CipherMate provides two main benefits which include developer-local acceleration and interpretive glue that connects different types of signals between static rules and dependency metadata and optional dynamic or agentic probes to the patch lifecycle which runs inside the editor. The additional point provides complementary support because improved local remediation processes reduce system noise which security operations must assess while their central systems receive enhanced signal-to-noise ratios.
+
+The rising danger from coding agents which operate with full autonomy because they can perform complex coding tasks across multiple files will lead to increased necessity for organizations to implement **change review** and **scope limits** about their tool operations. Research trajectories might explore **policy languages** that teams can attach to repositories (“no network calls from this agent profile,” “secrets scanner must pass before LLM-assisted merge suggestions activate”) and **benchmarks** that assess both patch accuracy and **regression risk** and **test-suite stability**. The project maintains its scientific research program through work which follows the same principle of **improvement under constraints** that the main text describes as a foundational concept.
+
+The complete impact assessment requires both accessibility and equity aspects to be included. The developers who work in resource-limited environments need to receive basic scanning services because they handle various tasks which include studying their research results and operating their local systems. The OpenRouter-based story of CipherMate functions as one deployment mode within a design space that enables air-gapped systems and bring-your-own-key systems to operate according to policy requirements. The documentation of those operational modes enables our research to make strong inclusive claims while showing that "AI-assisted security" does not depend solely on commercial API usage.
+
+The thesis requires examiners to assess how interdisciplinary approaches create new knowledge. CipherMate functions at the boundary between **software engineering** (workflows, tooling adoption) and **computer security** (threats, controls) and **human–computer interaction** (trust, cognitive load) and **machine learning** (ranking, generation, evaluation pitfalls). The supplementary material establishes the intersection point between project claims and assessment methods through its demonstration of assessment methods. The existing framework does not create fresh product commitments while it explains the technical and social aspects of research-based development for IDE environments.
+
+The **sustainability and maintainability** of the codebase itself will determine its long-term impact because the security tools which develop problems through unpinned dependencies and unreliable scans and hidden agent behavior will become a new reason for dismissal. The project therefore benefits from treating **documentation**, **automated tests**, and **transparent changelogs** for scanner and agent behaviour as first-class deliverables alongside user-visible features. The stance supports **open-science** norms and enables supervisors and external reviewers and future contributors to **verify** system functions through findings and suggested fixes.
+
+---
+
+## 2. Project Plan
+
+### Vision in three horizons
+
+In the **near term**, CipherMate is a VS Code extension that unifies **multi-scanner detection** with a **chat interface** and **tool-using agents** routed via **OpenRouter**, so that explanation, prioritisation dialogue, and draft remediations remain **grounded in real tool output**. In the **medium term**, the project adds **structured remediation workflows**—previewable diffs, validation hooks, and playbooks mapped to OWASP/CWE families where feasible—so that the gap between “found” and “fixed” shrinks in measurable ways. In the **longer term**, the **CipherMate security-coding model** becomes an optional **default brain** for security tasks inside the same pipeline, trained or fine-tuned on curated corpora with **benchmarks** that stress secure completion rather than generic coding speed, and deployed either through OpenRouter-compatible endpoints or **local inference** for sensitive codebases.
+
+### Objectives
+
+| ID | Focus | Commitment | Grounding / notes |
+|:---|:------|:-----------|:------------------|
+| **O1** | **Shift-left visibility** | Actionable security signals at **file** and **repository** scope within agreed **performance** budgets so the IDE stays responsive. | Aligns with workflow-integration lessons from industrial static analysis [3]. |
+| **O2** | **Stable agent semantics** | Documented **tool schemas**, **guardrails**, and **telemetry** (model id, latency, token use) so behaviour is inspectable, not opaque. | Supports auditability and operations in regulated settings [7]. |
+| **O3** | **Trust and usability** | **Severity**, plain **rationale**, and pointers to **standards** for serious findings—no black-box-only UX on high-risk actions. | Matches developer needs for clarity and prioritisation [1], [2]. |
+| **O4** | **Safe automation** | Every automated or semi-automated **fix** path supports **preview**, **diff review**, and **rollback**. | Mitigates risks of blind application of generated patches [4]. |
+| **O5** | **Responsible AI** | Clear disclosure of data sent to **third-party APIs**; **enterprise key** custody; **optional local** models where required. | Privacy and governance consistent with SSDF-style engineering practice [7]. |
+| **O6** | **Evaluation** | Mix **qualitative** methods (interviews, heuristic evaluation) with **quantitative** proxies (e.g. time-to-remediate, false-positive burden). | Constructs informed by trust and actionability in developer studies [1], [2]. |
+| **O7** | **Model track** | First **fine-tuned or adapter-trained** checkpoint on **institutional GPUs**, evaluated on a **security-specific** suite **vs.** strong general baselines. | Honest comparison; avoids inflated ML claims [6]. |
+
+### Phases, milestones, and resources
+
+Work is organised into phases **P0–P5** (foundations, core scanners, AI and agent layer with OpenRouter, remediation, optional DAST or advanced testing, hardening and release) plus a parallel or follow-on **P6** for the **CipherMate security model**—data curation, supervised fine-tuning, optional preference optimisation, benchmarking, model card, and integration behind a “CipherMate Secure” profile. **Milestones** progress from scan-to-explanation without LLMs, to chat plus tools on OpenRouter, to guided fix with human approval, to beta with privacy documentation, to a gated **model α** that meets pre-registered benchmark thresholds before default enablement.
+
+**Risks** include false-positive fatigue (mitigated by tunable rules and confidence labels), insecure LLM suggestions (mitigated by review workflows and security-tuned models on fix paths), third-party API dependency (mitigated by abstraction and local failover), and **training-data licence or leakage issues** (mitigated by legal review and dataset cards). **Success criteria** for a release candidate include a written **threat model** covering host, webview, OpenRouter, and training infrastructure; reproducible build and test instructions; a user-facing privacy and security section; and, where P6 is in scope, a **benchmark protocol** that avoids the methodological pitfalls Chakraborty *et al.* identified [6].
+
+---
+
+## 3. Simulated Ethics Application *(Fictional — coursework only)*
+
+**Title:** Developer Trust, Workflow Fit, and AI-Assisted Remediation with an IDE-Embedded Security Assistant (CipherMate)  
+**Principal Investigator (fictional):** [Your Name], [Department], [Institution]  
+**Status:** **NOT SUBMITTED** to any IRB or ethics committee. This document simulates how one might argue for ethical clearance if the study were real.
+
+### Summary and purpose
+
+This **fictional** protocol imagines a mixed-methods study whose purpose is to learn whether CipherMate changes how developers **prioritise**, **understand**, and **repair** security findings compared with conventional static-analysis UIs alone. The study would not attempt to “prove” security of codebases in the cryptographic sense; it would measure **human factors** and **process outcomes**—for example, whether participants merge fewer vulnerable changes after review, whether they report higher confidence in their fixes, and whether they understand when model-generated suggestions should be rejected. Such questions mirror the themes raised in developer-centred security research [1], [2], [3] and are timely given widespread adoption of LLM assistants whose security properties are still contested [4], [5].
+
+### Research questions
+
+The fictional study would ask: (RQ1) How do participants **order** CipherMate findings relative to compiler errors, failing tests, and product deadlines? (RQ2) Under what **task and time pressure** conditions do participants accept AI-suggested patches **without** independent review? (RQ3) What **privacy expectations** do participants hold about code and logs sent to cloud LLM providers versus **local** models? (RQ4) Does brief **security training** prior to tasks change acceptance behaviour or self-reported understanding? These questions are designed to produce actionable UX insights rather than to rank participants.
+
+### Methods (illustrative)
+
+Participants would be **volunteers** (e.g. N ≈ 12–20 professional or senior student developers) recruited with **written informed consent**, debriefing materials, and the right to withdraw without penalty. Sessions would last roughly **60–90 minutes** and use **synthetic repositories** containing injected vulnerabilities with known ground truth—**no** proprietary employer code and **no** real customer data. Tasks would mirror realistic fixes (e.g. dependency upgrade, injection hardening, secret removal) with think-aloud protocol optional. **Quantitative** instruments would include Likert items on trust, clarity, and workload; **qualitative** prompts would probe surprise, confusion, or deliberate override of AI advice. Optional **screen recording** would be covered explicitly in consent and stored encrypted with a fixed retention period (e.g. twenty-four months). Where cloud LLMs are used, the protocol would **document exact data flows**—what snippets, paths, or logs may leave the machine—and offer a **local-model arm** where technically feasible, so participants can choose a lower-exposure configuration. If the study ever fed data into **model fine-tuning**, additional safeguards would apply: **opt-in only**, **licence-checked** corpora, **PII and secret scrubbing**, and likely **full IRB review**—none of which are claimed here because this section remains fictional.
+
+### Ethical principles and data minimisation
+
+The fictional application would argue **respect for persons** through transparent consent and withdrawal; **beneficence** through minimal risk design (no deception about cloud transmission, no punitive scoring shared with employers); **justice** through inclusive recruitment and modest compensation if budgets allow; and **confidentiality** through pseudonymous identifiers, encrypted storage, and restricted access. **Data minimisation** would prohibit importing real production secrets into lab machines, mandate redaction pipelines for logs, and separate **research datasets** from any product telemetry CipherMate might collect under a different lawful basis. **Conflicts of interest**—for example, vendor funding tied to evaluated models—would be disclosed, and a simple **analysis plan** could be time-stamped before data collection to discourage p-hacking.
+
+### Link to Theme 1 literature survey
+
+The **Theme 1 literature survey** (submitted alongside this package) supplies the **evidence base** motivating these ethical and design choices: it synthesises static-analysis adoption barriers [1]–[3], evaluation risks for learned detectors [6], and LLM security findings [4], [5]. The fictional ethics protocol is therefore **consistent** with that survey: it prioritises **trust and actionability** as outcome constructs, avoids treating participants’ code as free training fodder, and foregrounds **honest disclosure** when third-party AI services process task artefacts.
+
+---
+
+## Acknowledgments
+
+I thank my module tutors and peers for feedback on structure and clarity. **Generative AI (large language models)** was used as a drafting and editing aid for parts of this submission and of the related Theme 1 literature survey; I remain responsible for all factual claims, citations, and interpretation. I have **checked the assessment brief** and **[complete: confirmed with tutor on DATE / module allows Gen AI with disclosure]** that use of Gen AI is permitted for this assessment type when declared as below. I have **reviewed** my institution’s Academic Integrity / Gen AI guidance and **critically reviewed** model outputs against primary sources (especially peer-reviewed papers cited in the reference list). **Prompts** used are summarised in the Theme 1 document (`LITERATURE_SURVEY_EXPANDED.md`, Section 6) and can be supplied in full if requested. **[Optional: name the tool, e.g. Cursor, ChatGPT, Copilot.]**
+
+---
+
+## Statement on use of generative AI
+
+| Question (self-audit) | My response |
+|------------------------|-------------|
+| Confirmed brief / tutor allows Gen AI for this task? | **[Yes / No / Pending — I will confirm before relying on AI-assisted text.]** |
+| Used Gen AI as directed in the brief (e.g. disclosure, limits on whole-assignment generation)? | **[Yes — describe, e.g. drafting, restructuring, word-count expansion only; human verified citations.]** |
+| Reviewed institutional Gen AI guidance? | **[Yes — link or document name: …]** |
+| Documented AI use as required by module lead? | **[Yes — this section + Theme 1 §6; adjust if your school wants a separate form.]** |
+| Acknowledgments included? | **Yes — see above.** |
+| Prepared to discuss how and why AI was used? | **Yes — outline: drafting structure, merging “implication” paragraphs, expanding sections; all references checked against originals.** |
+| Retained drafts / prompts? | **[Yes — e.g. version history in Git, screenshots, or export of chat; describe what you keep.]** |
+| Critically reviewed outputs (accuracy / quality)? | **Yes — claims about papers verified; limitations of LLMs (hallucination, outdated training) considered.** |
+| Acknowledgment format matches instructor or library guidelines? | **[Align with UL / module template if different from this table — replace this section if required.]** |
+
+*Note:* The checklist asks about **veracity** (truth/correctness) of information; “voracity” in some handouts is usually a typo for **veracity**.
+
+---
+
+## References (IEEE style — order of first appearance in this document)
+
+[1] B. Johnson, Y. Song, E. Murphy-Hill, and R. Bowdidge, “Why don't software developers use static analysis tools to find bugs?,” in *Proc. 35th Int. Conf. Software Engineering (ICSE)*, San Francisco, CA, USA, 2013, pp. 672–681.
+
+[2] M. Christakis and C. Bird, “What developers want and need from program analysis: An empirical study,” in *Proc. 31st IEEE/ACM Int. Conf. Automated Software Engineering (ASE)*, Singapore, 2016, pp. 332–343.
+
+[3] C. Sadowski *et al.*, “Lessons from building static analysis tools at Google,” *Commun. ACM*, vol. 61, no. 4, pp. 58–66, Apr. 2018.
+
+[4] H. Pearce *et al.*, “Asleep at the keyboard? Assessing the security of GitHub Copilot's code contributions,” in *Proc. IEEE Symp. Security Privacy (S&P)*, San Francisco, CA, USA, 2022, pp. 754–768.
+
+[5] A. M. Dakhel *et al.*, “GitHub Copilot AI pair programmer: Asset or Liability?” *J. Syst. Softw.*, vol. 203, p. 111734, Nov. 2023.
+
+[6] S. Chakraborty, R. Krishna, Y. Ding, and B. Ray, “Deep learning based vulnerability detection: Are we there yet?,” *IEEE Trans. Software Eng.*, vol. 48, no. 9, pp. 3280–3296, Sep. 2021.
+
+[7] NIST, “Secure Software Development Framework (SSDF) for Mitigating the Risk of Software Vulnerabilities,” National Institute of Standards and Technology, Gaithersburg, MD, USA, NIST Special Publication 800-218, Feb. 2022. [Online]. Available: https://csrc.nist.gov/publications/detail/sp/800-218/final
+
+[8] OWASP Foundation, “OWASP Top 10:2021 – The Ten Most Critical Web Application Security Risks,” OWASP, 2021. [Online]. Available: https://owasp.org/www-project-top-ten/
+
+[9] OWASP Foundation, “OWASP Application Security Verification Standard (ASVS),” OWASP. [Online]. Available: https://owasp.org/www-project-application-security-verification-standard/
+
+[10] G. McGraw, “Software security,” *IEEE Security Privacy*, vol. 2, no. 2, pp. 80–83, Mar./Apr. 2004.
+
+[11] A. Shostack, *Threat Modeling: Designing for Security*. Hoboken, NJ, USA: Wiley, 2014.
+
+---
+
+*Word-count note:* Sections 1–3 (narrative body above, excluding references) exceed **2000 words** when exported to Word or counted with a word processor; adjust names and institutional GPU facility labels in square brackets before submission.
+
+*End of document.*

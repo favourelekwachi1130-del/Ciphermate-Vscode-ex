@@ -4,12 +4,12 @@
 		"out": false, // set this to true to hide the "out" folder with the compiled JS files
 		"dist": false // set this to true to hide the "dist" folder with the compiled JS files
 	},
-	"ciphermate.ai.provider": "ollama",
-	"ciphermate.ai.ollama.apiUrl": "http://64.225.56.89:11434",
-	"ciphermate.ai.ollama.model": "deepseek-coder:1.3b",
-	"ciphermate.ai.ollama.timeout": 300000,
+	"ciphermate.ai.provider": "openrouter",
 	"ciphermate.ai.fallbackProviders": [],
 	"ciphermate.ai.useMultiProvider": true,
+	"ciphermate.fixes.useKodeEngine": true,
+	"ciphermate.fixes.kodePath": "kode",
+	"ciphermate.fixes.kodeFallbackToMultiAI": true,
 	"search.exclude": {
 		"out": true, // set this to false to include "out" folder in search results
 		"dist": true // set this to false to include "dist" folder in search results

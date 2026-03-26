@@ -4,7 +4,7 @@
  */
 
 import OpenAI from 'openai';
-import { AIProvider, ConversationMessage } from './cli-base';
+import { AIProvider, AIChatOptions, ConversationMessage } from './cli-base';
 
 export class OpenAIProvider implements AIProvider {
   private client: OpenAI;
@@ -19,31 +19,56 @@ export class OpenAIProvider implements AIProvider {
     this.baseURL = baseURL;
   }
 
-  async chat(messages: ConversationMessage[], systemPrompt: string): Promise<string> {
+  async chat(messages: ConversationMessage[], systemPrompt: string, options?: AIChatOptions): Promise<string> {
     try {
-      // Convert to OpenAI message format with system prompt first
+      const userImages = options?.userImages?.length ? options.userImages : undefined;
+      const mapped = messages.map((msg, idx) => {
+        const isLastUser =
+          msg.role === 'user' && idx === messages.length - 1 && userImages && userImages.length > 0;
+        if (isLastUser) {
+          const parts: OpenAI.ChatCompletionContentPart[] = [
+            { type: 'text', text: msg.content || '(see attached image)' }
+          ];
+          for (const img of userImages) {
+            const mime = img.mimeType || 'image/png';
+            parts.push({
+              type: 'image_url',
+              image_url: { url: `data:${mime};base64,${img.base64}` }
+            });
+          }
+          return { role: 'user' as const, content: parts };
+        }
+        return {
+          role: msg.role as 'user' | 'assistant',
+          content: msg.content
+        };
+      });
+
       const openaiMessages: OpenAI.ChatCompletionMessageParam[] = [
         { role: 'system', content: systemPrompt },
-        ...messages.map(msg => ({
-          role: msg.role as 'user' | 'assistant',
-          content: msg.content,
-        }))
+        ...mapped
       ];
 
       console.log(`OpenAI: Sending message to OpenAI (${this.model})`);
 
-      const response = await this.client.chat.completions.create({
-        model: this.model,
-        max_tokens: this.maxTokens,
-        messages: openaiMessages,
-      });
+      const response = await this.client.chat.completions.create(
+        {
+          model: this.model,
+          max_tokens: this.maxTokens,
+          messages: openaiMessages
+        },
+        { signal: options?.signal }
+      );
 
       const content = response.choices[0]?.message?.content || '';
 
       console.log('OpenAI: Received response from OpenAI');
       return content;
-    } catch (error) {
+    } catch (error: any) {
       console.error('OpenAI: Error communicating with OpenAI:', error);
+      if (error?.name === 'AbortError' || options?.signal?.aborted) {
+        throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+      }
       throw new Error(`OpenAI API error: ${error}`);
     }
   }

@@ -12,8 +12,6 @@ import { CodePatternScanner } from './code-pattern-scanner';
 import { SnykScanner } from './snyk-scanner';
 import { CodeQLScanner } from './codeql-scanner';
 import { CipherMateSASTScanner } from './ciphermate-sast-scanner';
-import { IacScanner } from './iac-scanner';
-import { ContainerScanner } from './container-scanner';
 import { RepositoryScanResult, ScanResult, Vulnerability } from './types';
 
 export class RepositoryScanner {
@@ -59,14 +57,7 @@ export class RepositoryScanner {
     if (config.get<boolean>('scanners.enableCipherMateSAST', true)) {
       this.scanners.push(new CipherMateSASTScanner(this.workspacePath));
     }
-
-    if (config.get<boolean>('scanners.enableIac', true)) {
-      this.scanners.push(new IacScanner(this.workspacePath));
-    }
-
-    if (config.get<boolean>('scanners.enableContainer', true)) {
-      this.scanners.push(new ContainerScanner(this.workspacePath));
-    }
+    // this.scanners.push(new LogAnalyzer(this.workspacePath));
   }
 
   /**
@@ -81,8 +72,6 @@ export class RepositoryScanner {
       'snyk-scanner': { step: 'Running Snyk analysis', detail: 'Checking dependencies against Snyk vulnerability database' },
       'codeql-scanner': { step: 'Running CodeQL', detail: 'Semantic code analysis for security issues' },
       'ciphermate-sast-scanner': { step: 'Running SAST analysis', detail: 'AI-powered static analysis for security flaws' },
-      'iac-scanner': { step: 'Scanning Infrastructure as Code', detail: 'Terraform, CloudFormation & Kubernetes misconfigurations' },
-      'container-scanner': { step: 'Scanning container images', detail: 'Dockerfile analysis & OS package vulnerabilities (Trivy)' },
     };
     return steps[scannerName] || { step: `Running ${scannerName}`, detail: 'Analyzing codebase' };
   }

@@ -10,4 +10,4 @@ export {
   CompletionCacheKey,
   CompletionCacheEntry
 } from './completion-cache';
-export { resolveAtMentions, ResolvedMention } from './at-mentions';
+export { resolveAtMentions, resolveImplicitFilePaths, ResolvedMention } from './at-mentions';

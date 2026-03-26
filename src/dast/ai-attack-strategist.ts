@@ -13,6 +13,7 @@
 import * as vscode from 'vscode';
 import { TargetProfile } from './target-context';
 import { DastEndpoint, DastAttackCategory } from './types';
+import { DAST_STRATEGIST_SYSTEM } from '../ai-agent/security-adversarial-prompts';
 
 export interface AttackStrategy {
   /** Categories to prioritize (in order) */
@@ -33,7 +34,9 @@ export async function getAttackStrategy(
   context: vscode.ExtensionContext,
   profile: TargetProfile,
   endpoints: DastEndpoint[],
-  userHint?: string
+  userHint?: string,
+  /** When true, AI generates 20-30 payloads per category (primary for main wave). */
+  highPayloadVolume?: boolean
 ): Promise<AttackStrategy> {
   try {
     const { callDastAI } = await import('./dast-ai');
@@ -45,7 +48,8 @@ export async function getAttackStrategy(
       summary: e.summary,
     }));
 
-    const prompt = `You are an elite penetration tester. Plan the most effective DAST attack strategy for this SPECIFIC target.
+    const useAdversarial = vscode.workspace.getConfiguration('ciphermate').get('ai.useAdversarialSecurityPrompts', true);
+    const prompt = `Plan the most effective DAST attack strategy for this SPECIFIC target. Find real, exploitable vulnerabilities—not theoretical concerns.
 
 TARGET PROFILE:
 ${profile.stackSummary}
@@ -65,14 +69,15 @@ ENDPOINTS:
 ${JSON.stringify(endpointSummary, null, 2)}
 
 ${userHint ? `USER FOCUS: ${userHint}` : ''}
+${highPayloadVolume ? '\nMODE: HIGH VOLUME - Generate 20-30 unique, potent payloads per category. These will be the PRIMARY attack payloads. Include error-based, timing-based, blind, WAF bypass, and encoding variants.' : ''}
 
 Return JSON only:
 {
   "prioritizedCategories": ["category1", "category2", ...],
   "paramFocus": ["id", "user", "filter", ...],
   "customPayloads": {
-    "sql-injection": ["payload1", "payload2"],
-    "nosql-injection": ["payload1"]
+    "sql-injection": ["payload1", "payload2", ...],
+    "nosql-injection": ["payload1", ...]
   },
   "rationale": "Brief reason for this strategy",
   "highValuePatterns": ["/user", "/admin", "/api/"],
@@ -81,33 +86,56 @@ Return JSON only:
 
 Rules:
 - prioritizedCategories: max 8, ordered by effectiveness for THIS stack
-- customPayloads: only categories you add payloads for; payloads must be executable (escape quotes in JSON)
-- If MongoDB/NoSQL detected, include nosql-injection with $gt, $ne etc
-- If MySQL/Postgres, prioritize sql-injection with DB-specific syntax
+- customPayloads: CRITICAL - these are the PRIMARY attack payloads. Generate 20-30 payloads per category you include. Payloads must be executable, unique, and optimized for THIS target stack. Escape quotes in JSON.
+- If MongoDB/NoSQL detected, include nosql-injection with $gt, $ne, $regex, $where etc. Include encoding variants.
+- If MySQL/Postgres, prioritize sql-injection with DB-specific syntax (SLEEP, WAITFOR, UNION, error-based). Include WAF bypass variants.
 - If Node/Express, include prototype-pollution, ssti
 - If Python/Django, include ssti with {{}} and server-side patterns
-- highValuePatterns: path substrings that suggest sensitive endpoints`;
+- highValuePatterns: path substrings that suggest sensitive endpoints
+- For each category: include payloads for error-based, timing-based, blind, and WAF bypass. Be diverse and potent.`;
 
-    const res = await callDastAI(context, 'strategist', {
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
-      max_tokens: 1500,
-    });
+    // Optional classic engine: attack strategy generation with workspace context
+    const cfg = vscode.workspace.getConfiguration('ciphermate');
+    let parsed: Record<string, unknown> | null = null;
+    if (cfg.get('fixes.useKodeEngine', false)) {
+      try {
+        const { getKodeEngineAdapter } = await import('../fix-system/kode-engine-adapter');
+        const kode = getKodeEngineAdapter({ context, kodePath: cfg.get('fixes.kodePath', 'kode') });
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const kodePrompt = useAdversarial ? `${DAST_STRATEGIST_SYSTEM}\n\n${prompt}` : prompt;
+        parsed = await kode.getAttackStrategy(kodePrompt, workspaceRoot) as Record<string, unknown> | null;
+      } catch {
+        // fall through to standard AI
+      }
+    }
 
-    const text = (res?.content || '').trim();
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return getDefaultStrategy(profile);
-
-    const parsed = JSON.parse(match[0]);
+    if (!parsed) {
+      const messages = useAdversarial
+        ? [
+            { role: 'system' as const, content: DAST_STRATEGIST_SYSTEM },
+            { role: 'user' as const, content: prompt },
+          ]
+        : [{ role: 'user' as const, content: prompt }];
+      const res = await callDastAI(context, 'strategist', {
+        messages,
+        temperature: 0.3,
+        max_tokens: highPayloadVolume ? 4000 : 2000,
+      });
+      const text = (res?.content || '').trim();
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) return getDefaultStrategy(profile);
+      parsed = JSON.parse(match[0]);
+    }
+    const p = parsed!;
     return {
-      prioritizedCategories: Array.isArray(parsed.prioritizedCategories)
-        ? parsed.prioritizedCategories.filter((c: string) => isValidCategory(c))
+      prioritizedCategories: Array.isArray(p.prioritizedCategories)
+        ? (p.prioritizedCategories as string[]).filter((c: string) => isValidCategory(c))
         : getDefaultStrategy(profile).prioritizedCategories,
-      paramFocus: Array.isArray(parsed.paramFocus) ? parsed.paramFocus : profile.paramHints,
-      customPayloads: typeof parsed.customPayloads === 'object' ? parsed.customPayloads : {},
-      rationale: String(parsed.rationale || ''),
-      highValuePatterns: Array.isArray(parsed.highValuePatterns) ? parsed.highValuePatterns : [],
-      skipCategories: Array.isArray(parsed.skipCategories) ? parsed.skipCategories.filter((c: string) => isValidCategory(c)) : [],
+      paramFocus: Array.isArray(p.paramFocus) ? p.paramFocus as string[] : profile.paramHints,
+      customPayloads: typeof p.customPayloads === 'object' && p.customPayloads !== null ? p.customPayloads as Record<string, string[]> : {},
+      rationale: String(p.rationale || ''),
+      highValuePatterns: Array.isArray(p.highValuePatterns) ? p.highValuePatterns as string[] : [],
+      skipCategories: Array.isArray(p.skipCategories) ? (p.skipCategories as string[]).filter((c: string) => isValidCategory(c)) : [],
     };
   } catch (e) {
     console.warn('AI strategist failed, using context-aware defaults', e);

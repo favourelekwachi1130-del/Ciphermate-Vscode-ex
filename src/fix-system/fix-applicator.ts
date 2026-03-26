@@ -378,36 +378,51 @@ export class FixApplicator {
 
     // Fall back to searching for the original code
     const fullText = document.getText();
-    const originalCode = proposal.originalCode.trim();
-    const startIndex = fullText.indexOf(originalCode);
+    const originalTrimmed = proposal.originalCode.trim();
+    let startIndex = fullText.indexOf(originalTrimmed);
 
     if (startIndex === -1) {
+      // Normalize whitespace: collapse multiple spaces/newlines for fuzzy match
+      const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
+      const normalizedOriginal = normalize(originalTrimmed);
+      const lines = fullText.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        const lineNorm = normalize(lines[i]);
+        if (lineNorm && (normalizedOriginal.includes(lineNorm) || lineNorm.includes(normalizedOriginal))) {
+          startIndex = fullText.indexOf(lines[i]);
+          if (startIndex !== -1) {
+            const endIndex = startIndex + lines[i].length;
+            return new vscode.Range(
+              document.positionAt(startIndex),
+              document.positionAt(endIndex)
+            );
+          }
+        }
+      }
       // Try to find it near the expected line
-      const expectedLine = proposal.vulnerability.line || 1;
+      const expectedLine = proposal.vulnerability.line || proposal.startLine || 1;
       const lineStart = Math.max(0, expectedLine - 5);
       const lineEnd = Math.min(document.lineCount, expectedLine + 5);
 
-      // Search within the line range
       for (let i = lineStart; i < lineEnd; i++) {
         const lineText = document.lineAt(i).text;
-        if (lineText.includes(originalCode) || originalCode.includes(lineText.trim())) {
+        if (lineText.includes(originalTrimmed) || originalTrimmed.includes(lineText.trim())) {
           return document.lineAt(i).range;
         }
       }
 
-      // Last resort: use the vulnerability line
-      const vulnLine = Math.max(0, (proposal.vulnerability.line || 1) - 1);
+      // Last resort: use the vulnerability/start line
+      const vulnLine = Math.max(0, (proposal.vulnerability.line || proposal.startLine || 1) - 1);
       if (vulnLine < document.lineCount) {
         return document.lineAt(vulnLine).range;
       }
 
-      // Absolute last resort: first line
       return document.lineAt(0).range;
     }
 
     // Found the code, calculate range
     const startPos = document.positionAt(startIndex);
-    const endPos = document.positionAt(startIndex + originalCode.length);
+    const endPos = document.positionAt(startIndex + originalTrimmed.length);
 
     return new vscode.Range(startPos, endPos);
   }

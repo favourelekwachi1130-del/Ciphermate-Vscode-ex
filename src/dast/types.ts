@@ -120,6 +120,8 @@ export interface DastScanConfig {
   maxDeepDiveAgents?: number;
   /** 10x: Agents per promising finding - spawn N agents with different strategies (default 1, pentest 4) */
   agentsPerFinding?: number;
+  /** AI at every step: AI-generated payloads primary for main wave, endpoint-group tailoring, iterative refinement. Default true for pentest. */
+  enableAIPayloadGeneration?: boolean;
 }
 
 export type DastAttackCategory =

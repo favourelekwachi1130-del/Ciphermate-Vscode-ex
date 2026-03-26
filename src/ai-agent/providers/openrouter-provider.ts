@@ -103,13 +103,18 @@ export class OpenRouterProvider extends BaseAIProvider {
       req.on('error', reject);
       req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
 
-      const requestBody = {
+      // StepFun (often used by openrouter/free) can return 400 "Expecting ',' delimiter" on large
+      // tool-call histories or fragile prefill JSON — prefer other providers when possible.
+      const requestBody: Record<string, unknown> = {
         model: this.config.model || 'openai/gpt-4',
         messages: request.messages,
         ...(request.tools && { tools: request.tools }),
         temperature: request.temperature || 0.7,
         max_tokens: request.max_tokens || 8192,
-        ...(request.stream !== undefined && { stream: request.stream })
+        ...(request.stream !== undefined && { stream: request.stream }),
+        provider: {
+          ignore: ['StepFun'],
+        },
       };
 
       req.write(JSON.stringify(requestBody));

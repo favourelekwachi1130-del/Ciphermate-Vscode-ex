@@ -4,7 +4,7 @@
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { AIProvider, ConversationMessage } from './cli-base';
+import { AIProvider, AIChatOptions, ConversationMessage } from './cli-base';
 
 export class GeminiProvider implements AIProvider {
   private client: GoogleGenerativeAI;
@@ -15,8 +15,9 @@ export class GeminiProvider implements AIProvider {
     this.model = model;
   }
 
-  async chat(messages: ConversationMessage[], systemPrompt: string): Promise<string> {
+  async chat(messages: ConversationMessage[], systemPrompt: string, options?: AIChatOptions): Promise<string> {
     try {
+      const userImages = options?.userImages?.length ? options.userImages : undefined;
       console.log(`Gemini: Sending message to Gemini (${this.model})`);
 
       const genModel = this.client.getGenerativeModel({
@@ -41,10 +42,48 @@ export class GeminiProvider implements AIProvider {
         history: history,
       });
 
-      // Send the last message
-      const result = await chat.sendMessage(lastMessage.content);
-      const response = result.response;
-      const text = response.text();
+      const mimeOrDefault = (m: string) => {
+        const x = (m || '').toLowerCase();
+        if (x.includes('png')) return 'image/png';
+        if (x.includes('gif')) return 'image/gif';
+        if (x.includes('webp')) return 'image/webp';
+        return 'image/jpeg';
+      };
+
+      const lastParts: Array<
+        | { text: string }
+        | { inlineData: { mimeType: string; data: string } }
+      > = [{ text: lastMessage.content || '(see attached image(s))' }];
+      if (userImages?.length) {
+        for (const img of userImages) {
+          lastParts.push({
+            inlineData: {
+              mimeType: mimeOrDefault(img.mimeType || 'image/jpeg'),
+              data: img.base64,
+            },
+          });
+        }
+      }
+
+      const sendPromise = chat.sendMessage(lastParts).then((result) => result.response.text());
+
+      const text = options?.signal
+        ? await Promise.race([
+            sendPromise,
+            new Promise<string>((_, reject) => {
+              const sig = options.signal!;
+              if (sig.aborted) {
+                reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+                return;
+              }
+              sig.addEventListener(
+                'abort',
+                () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })),
+                { once: true }
+              );
+            })
+          ])
+        : await sendPromise;
 
       console.log('Gemini: Received response from Gemini');
       return text;

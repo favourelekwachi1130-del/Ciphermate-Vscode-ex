@@ -7,6 +7,7 @@
 
 import * as vscode from 'vscode';
 import { CyberAgent, createCyberAgentFromSettings } from './cli-cyber-agent';
+import type { AIChatOptions } from './providers/cli-base';
 
 export type AgentMode = 'base' | 'redteam' | 'blueteam' | 'desktopsecurity' | 'webpentest' | 'osint' | 'smartcontract';
 
@@ -45,14 +46,14 @@ export class CyberAgentAdapter {
    * EXACT match to CLI's CyberAgent.chat()
    * Refreshes agent before each call so settings changes (model, API key) take effect immediately.
    */
-  async chat(userMessage: string): Promise<string> {
+  async chat(userMessage: string, chatOptions?: AIChatOptions): Promise<string> {
     await this.ensureInitialized();
     const prevHistory = this.cyberAgent.getHistory();
     await this.refreshAgent();
     if (prevHistory.length > 0) {
       this.cyberAgent.setHistory(prevHistory);
     }
-    return this.cyberAgent.chat(userMessage);
+    return this.cyberAgent.chat(userMessage, chatOptions);
   }
 
   /**

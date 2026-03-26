@@ -1,0 +1,53 @@
+# Open SWE–style engine for CipherMate
+
+This package ports the **core agentic code generation and fixing logic** from [LangChain Open SWE](https://github.com/langchain-ai/open-swe) so CipherMate’s agent behaves the same way, but inside your local workspace (no cloud sandbox).
+
+## What was taken from Open SWE
+
+- **System prompt structure**: Working environment, file management, task execution order (understand → implement → verify), tool usage, coding standards, core behavior.
+- **AGENTS.md injection**: Repo-level instructions (or CipherMate’s `AGENTS.md` / skills) are injected into the system prompt.
+- **Curated tools**: `read_file`, `write_file`, `edit_file`, `run_cmd`, `list_dir`, `grep` — all scoped to the workspace root.
+- **Tool error handling**: Tool failures are returned as structured error messages (like Open SWE’s `ToolErrorMiddleware`) so the agent can self-correct instead of crashing.
+- **Loop**: Each turn the model can call tools; results are appended and the loop continues until the model responds without tool calls or max steps is reached.
+
+## Setup
+
+```bash
+cd open_swe_engine
+pip install -e .
+# Or: pip install openai
+```
+
+## Run from CLI
+
+```bash
+export OPENROUTER_API_KEY=your_key
+python -m open_swe_engine.run --workspace /path/to/your/repo --task "fix the SQL injection in src/db.js"
+```
+
+Options:
+
+- `--agents-md`: AGENTS.md content or path to a file (default: read `AGENTS.md` from workspace if present).
+- `--base-url`: API base URL (default: `https://openrouter.ai/api/v1`).
+- `--model`: Model name (default: `openai/gpt-4o`).
+- `--max-steps`: Max agent steps (default: 50).
+
+## Use from CipherMate (VS Code extension)
+
+The extension can run this engine in two ways:
+
+1. **Subprocess**: Spawn `python -m open_swe_engine.run --workspace <workspacePath> --task "<user message>"` and read stdout. Set `OPENROUTER_API_KEY` (or `OPENAI_API_KEY`) in the environment or via settings.
+2. **Import in Node**: Not applicable (this is Python). Use subprocess or a small HTTP wrapper.
+
+To enable the Open SWE engine in CipherMate, set a config such as `ciphermate.codeAgent.useOpenSWEEngine: true` and ensure the Python interpreter and `open_swe_engine` package are available on `PATH` (or configure the path to `python`).
+
+## Layout
+
+- `open_swe_engine/prompt.py` — System prompt (ported from Open SWE `agent/prompt.py`).
+- `open_swe_engine/tools.py` — Tool implementations and OpenAI-compatible tool definitions.
+- `open_swe_engine/agent_loop.py` — Run loop: LLM → tool calls → execute (with error handling) → repeat.
+- `open_swe_engine/run.py` — CLI entry point.
+
+## License
+
+Same as CipherMate. Open SWE is MIT (https://github.com/langchain-ai/open-swe).

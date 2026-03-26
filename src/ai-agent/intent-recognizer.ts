@@ -10,10 +10,6 @@ export type SecurityIntent =
   | 'SCAN_SECRETS'
   | 'SCAN_DEPENDENCIES'
   | 'SCAN_SMART_CONTRACTS'
-  | 'SCAN_IAC'
-  | 'SCAN_CONTAINERS'
-  | 'SCAN_DAST'
-  | 'SCAN_PENTEST'
   | 'FIX_VULNERABILITIES'
   | 'SHOW_RESULTS'
   | 'EXPLAIN'
@@ -23,7 +19,7 @@ export type SecurityIntent =
 export interface RecognizedIntent {
   intent: SecurityIntent;
   confidence: number;
-  subIntent?: 'secrets' | 'dependencies' | 'smart_contracts' | 'iac' | 'containers' | 'full';
+  subIntent?: 'secrets' | 'dependencies' | 'smart_contracts' | 'full';
 }
 
 /** Common typo corrections and expansions */
@@ -69,7 +65,7 @@ const NEGATORS = /\b(dont|don't|do not|won't|will not|cant|can't|cannot|shouldn'
 
 interface IntentDefinition {
   intent: SecurityIntent;
-  subIntent?: 'secrets' | 'dependencies' | 'smart_contracts' | 'iac' | 'containers' | 'full';
+  subIntent?: 'secrets' | 'dependencies' | 'smart_contracts' | 'full';
   primary: string[];   // Strong signal - high weight
   secondary: string[]; // Supporting - lower weight
   context?: string[];  // Domain words that boost confidence when present
@@ -97,34 +93,6 @@ const INTENT_DEFINITIONS: IntentDefinition[] = [
     primary: ['smart contract', 'solidity', 'web3', 'blockchain', 'ethereum', '.sol', 'solana', 'defi', 'evm', 'contract audit'],
     secondary: ['scan', 'audit', 'analyze', 'check', 'review', 'inspect'],
     context: ['repository', 'repo', 'project'],
-  },
-  {
-    intent: 'SCAN_IAC',
-    subIntent: 'iac',
-    primary: ['infrastructure as code', 'iac', 'terraform', 'cloudformation', 'cloud formation', 'kubernetes', 'k8s', 'helm', 'pulumi', 'bridgecrew', 'wiz', 'checkov', 'tfsec', 'misconfig'],
-    secondary: ['scan', 'audit', 'check', 'review', 'analyze', 'find', 'detect'],
-    context: ['repository', 'repo', 'project'],
-  },
-  {
-    intent: 'SCAN_CONTAINERS',
-    subIntent: 'containers',
-    primary: ['container', 'containers', 'dockerfile', 'docker', 'containerfile', 'trivy', 'image scan', 'base image', 'os packages'],
-    secondary: ['scan', 'audit', 'check', 'review', 'analyze', 'find', 'detect', 'cve'],
-    context: ['repository', 'repo', 'project', 'docker-compose'],
-  },
-  {
-    intent: 'SCAN_PENTEST',
-    subIntent: undefined,
-    primary: ['pentest', 'pen test', 'penetration test', 'run pentest', 'cobalt', 'xbow', '200 agents', 'money back'],
-    secondary: ['run', 'execute', 'scan', 'test', 'attack'],
-    context: ['web app', 'api', 'url', 'localhost'],
-  },
-  {
-    intent: 'SCAN_DAST',
-    subIntent: undefined,
-    primary: ['dast', 'surface monitoring', 'dynamic scan', 'runtime scan', 'web app test', 'api test', 'api scan', 'attack simulation', 'stackhawk', 'intruder'],
-    secondary: ['scan', 'test', 'check', 'audit', 'run', 'execute', 'web app', 'api', 'endpoint', 'url', 'running app'],
-    context: ['http', 'https', 'localhost', 'url', 'api', 'endpoint', 'web'],
   },
   {
     intent: 'FIX_VULNERABILITIES',
@@ -324,13 +292,11 @@ export class IntentRecognizer {
   /**
    * Get sub-intent for scan type (secrets, dependencies, smart contracts, or full)
    */
-  getScanSubIntent(message: string): 'secrets' | 'dependencies' | 'smart_contracts' | 'iac' | 'containers' | 'full' | undefined {
+  getScanSubIntent(message: string): 'secrets' | 'dependencies' | 'smart_contracts' | 'full' | undefined {
     const result = this.recognize(message);
     if (result.intent === 'SCAN_SECRETS') return 'secrets';
     if (result.intent === 'SCAN_DEPENDENCIES') return 'dependencies';
     if (result.intent === 'SCAN_SMART_CONTRACTS') return 'smart_contracts';
-    if (result.intent === 'SCAN_IAC') return 'iac';
-    if (result.intent === 'SCAN_CONTAINERS') return 'containers';
     if (result.intent === 'SCAN_REPOSITORY' || result.intent === 'ANALYZE') return result.subIntent || 'full';
     return undefined;
   }

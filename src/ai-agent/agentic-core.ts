@@ -10,9 +10,9 @@ import { getIntentRecognizer } from './intent-recognizer';
 import { FixService, FixProposal } from '../fix-system';
 import { getProjectGenerationService } from '../core/project-generation-service';
 import { getCitationService } from '../core/citation-service';
+import { buildFileEditDiffHtml } from '../core/line-diff-html';
 import { getFileOperationsService } from '../core/file-operations-service';
-import { DastScanner } from '../dast';
-import { AgentOrchestrator } from '../dast/agent-orchestrator';
+import { normalizeAgentFilePath } from '../security/path-guard';
 
 const execAsync = promisify(exec);
 
@@ -42,8 +42,7 @@ export interface AgentTool {
 
 export interface AgentMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  /** Text or multimodal content (OpenAI format: string | Array<{type:'text'|'image_url', text?, image_url?}> */
-  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+  content: string;
   tool_calls?: Array<{
     id: string;
     type: 'function';
@@ -87,6 +86,163 @@ export class AgenticCore {
   private projectGenService = getProjectGenerationService();
   private fileService = getFileOperationsService();
   private currentMessageId: string = '';
+  /** Last successful full write from edit_file (for chat diff panel). */
+  private lastFileEditDiff: { path: string; before: string; after: string } | null = null;
+  /** Tool executions in the current processRequest() agent loop (for accurate UI error copy). */
+  private lastSessionToolExecutions = 0;
+
+  private getWorkspaceRootForTools(): string | undefined {
+    return (
+      this.state.context.workspacePath ||
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    );
+  }
+
+  /**
+   * Resolve paths from the model (e.g. `/src/server.js` = workspace-relative, not OS root).
+   */
+  private resolveToolFilePath(rawPath: string): string {
+    const ws = this.getWorkspaceRootForTools();
+    if (!ws) {
+      return path.resolve(rawPath);
+    }
+    return normalizeAgentFilePath(ws, rawPath);
+  }
+
+  /** How many tools ran in the last processRequest agent loop (updated live during the loop). */
+  public getLastSessionToolExecutions(): number {
+    return this.lastSessionToolExecutions;
+  }
+
+  /** Deduped source lines for the webview (aligned with `currentMessageId`). */
+  public getCitationsForWebview(): string[] {
+    return this.citationService.citationsToDisplayStrings(
+      this.citationService.getCitations(this.currentMessageId)
+    );
+  }
+
+  /**
+   * Inline diff payload for the assistant message (red/green). Null if no edit_file in this turn.
+   */
+  public getLastFileEditDiffForChat(): { path: string; html: string; copyText: string } | null {
+    const d = this.lastFileEditDiff;
+    if (!d || d.before === d.after) {
+      return null;
+    }
+    const MAX_COPY = 480 * 1024;
+    const copyText =
+      d.after.length > MAX_COPY
+        ? `${d.after.slice(0, MAX_COPY)}\n\n/* …clipboard truncated (${d.after.length} chars total) … */`
+        : d.after;
+    return {
+      path: d.path,
+      html: buildFileEditDiffHtml(d.before, d.after),
+      copyText,
+    };
+  }
+
+  /**
+   * Shrink tool results embedded in chat messages so OpenRouter / free-tier backends
+   * do not choke on multi‑100k JSON strings.
+   */
+  private compactToolResultForLlm(toolName: string, result: any): any {
+    if (!result || typeof result !== 'object') {
+      return result;
+    }
+    const maxFileChars = 28000;
+    if (toolName === 'read_file' && typeof result.content === 'string' && result.content.length > maxFileChars) {
+      const omitted = result.content.length - maxFileChars;
+      return {
+        ...result,
+        content:
+          result.content.slice(0, maxFileChars) +
+          `\n\n[... truncated ${omitted} characters for API limits; the file on disk is complete. Recode using this prefix + your secure version, or call read_file again if you need the tail.]`,
+        truncated: true,
+        originalLength: result.content.length,
+      };
+    }
+    try {
+      const s = JSON.stringify(result);
+      if (s.length > 90000) {
+        return {
+          success: result.success,
+          error: result.error,
+          truncated: true,
+          note: 'Tool output was very large; only a preview is included below.',
+          preview: s.slice(0, 45000) + '\n...[truncated]...',
+        };
+      }
+    } catch {
+      /* ignore */
+    }
+    return result;
+  }
+
+  /**
+   * Huge `edit_file` / `create_file` arguments in assistant history break some OpenRouter
+   * providers (JSON prefill errors). Store a truncated copy after we still execute using the full response.
+   */
+  private assistantMessageForHistory(msg: AgentMessage): AgentMessage {
+    if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      return msg;
+    }
+    const maxArgChars = 14000;
+    const tool_calls = msg.tool_calls.map(tc => {
+      const raw = tc.function?.arguments;
+      if (typeof raw !== 'string' || raw.length <= maxArgChars) {
+        return tc;
+      }
+      try {
+        const p = JSON.parse(raw) as Record<string, unknown>;
+        const content = p.content;
+        if (typeof content === 'string' && content.length > 6000) {
+          p.content =
+            content.slice(0, 4000) +
+            `\n...[${content.length - 4000} chars omitted from history after tool execution; disk write used full payload]`;
+        }
+        const compact = JSON.stringify(p);
+        if (compact.length <= maxArgChars) {
+          return {
+            ...tc,
+            function: { ...tc.function, arguments: compact },
+          };
+        }
+        return {
+          ...tc,
+          function: {
+            ...tc.function,
+            arguments: JSON.stringify({
+              note: 'Original tool arguments were very large and were shortened in conversation history.',
+              filePath: p.filePath ?? p.path,
+            }),
+          },
+        };
+      } catch {
+        return {
+          ...tc,
+          function: {
+            ...tc.function,
+            arguments: JSON.stringify({
+              note: `Unparseable or oversized arguments (${raw.length} chars) — refer to tool result messages.`,
+            }),
+          },
+        };
+      }
+    });
+    return { ...msg, tool_calls };
+  }
+
+  private resolveToolDirectory(rawDir: string): string {
+    const ws = this.getWorkspaceRootForTools();
+    const d = (rawDir || '').trim();
+    if (!ws) {
+      return path.resolve(d || '.');
+    }
+    if (!d || d === '.') {
+      return path.resolve(ws);
+    }
+    return normalizeAgentFilePath(ws, d);
+  }
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
@@ -309,7 +465,8 @@ export class AgenticCore {
         properties: {
           filePath: {
             type: 'string',
-            description: 'Path to file to read'
+            description:
+              'Path: use [File: ...] label from the user message, or workspace-relative (src/x.js). Leading / is workspace root (/src/x.js), not OS root.'
           }
         },
         required: ['filePath']
@@ -407,7 +564,8 @@ export class AgenticCore {
         properties: {
           filePath: {
             type: 'string',
-            description: 'Path to file to create'
+            description:
+              'Path under the workspace (e.g. src/server.js or /src/server.js — both mean workspace root). Prefer edit_file for existing files.'
           },
           content: {
             type: 'string',
@@ -430,7 +588,8 @@ export class AgenticCore {
         properties: {
           filePath: {
             type: 'string',
-            description: 'Path to file to edit'
+            description:
+              'Existing file to replace/append. Use [File: ...] label or workspace path; /src/x.js is workspace-relative. The workspace is writable — use edit_file to save changes.'
           },
           content: {
             type: 'string',
@@ -449,56 +608,6 @@ export class AgenticCore {
       },
       execute: async (params: any) => {
         return await this.executeEditFile(params.filePath, params.content, params.append, params.hashForIntegrity);
-      }
-    });
-
-    // Tool 12: DAST - Surface Monitoring (replaces StackHawk/Intruder)
-    this.tools.set('scan_dast', {
-      name: 'scan_dast',
-      description: 'Run dynamic application security testing (DAST) / surface monitoring on a running web app or API. Simulates attacks (SQL injection, XSS, SSRF, path traversal, etc.), checks security headers, uses AI to analyze responses. Replaces StackHawk and Intruder. Requires a URL to a running application.',
-      parameters: {
-        type: 'object',
-        properties: {
-          targetUrl: {
-            type: 'string',
-            description: 'Base URL of the web app or API to test (e.g. https://api.example.com or http://localhost:3000)'
-          },
-          discoverEndpoints: {
-            type: 'boolean',
-            description: 'Discover endpoints from OpenAPI/Swagger and workspace code. Default true.'
-          },
-          useAIAnalysis: {
-            type: 'boolean',
-            description: 'Use AI to analyze responses for vulnerability evidence. Default true.'
-          },
-          maxEndpoints: {
-            type: 'number',
-            description: 'Max endpoints to test (default 20)'
-          }
-        },
-        required: ['targetUrl']
-      },
-      execute: async (params: any) => {
-        return await this.executeDastScan(params);
-      }
-    });
-
-    // Tool 13: Pentest - 200+ agents, replaces Cobalt/XBOW. No High+? Money back.
-    this.tools.set('scan_pentest', {
-      name: 'scan_pentest',
-      description: 'Run full penetration test with 200+ attack agents. Use when user asks for pentest, penetration test, or wants maximum coverage. Replaces Cobalt and XBOW. Brutal payloads, timing blind SQLi, 30 deep-dive agents. No High+ finding? Money back.',
-      parameters: {
-        type: 'object',
-        properties: {
-          targetUrl: {
-            type: 'string',
-            description: 'Base URL to pentest (e.g. https://api.example.com or http://localhost:3000)'
-          },
-        },
-        required: ['targetUrl']
-      },
-      execute: async (params: any) => {
-        return await this.executePentestScan(params);
       }
     });
   }
@@ -527,45 +636,37 @@ export class AgenticCore {
       this.fixResultDisposable = fixService.onFixComplete((event: any) => {
         console.log('AgenticCore: Received fix completion event');
 
+        const fixSummary =
+          event.summary != null && String(event.summary).replace(/[\u200B-\u200D\uFEFF]/g, '').trim().length > 0
+            ? String(event.summary)
+            : 'Fix operation finished (no summary text was returned). Check the editor and **View Results** for changes.';
+
         // Add result summary to conversation
         this.state.conversation.push({
           role: 'assistant',
-          content: event.summary
+          content: fixSummary
         });
 
         // Notify chat interface if available
         if (this.chatInterface && typeof this.chatInterface.addMessage === 'function') {
-          this.chatInterface.addMessage('assistant', event.summary);
+          this.chatInterface.addMessage('assistant', fixSummary);
         }
       });
     }
   }
 
-  /** Build user message content - supports text + image attachments for vision models */
-  private buildUserMessageContent(
-    userRequest: string,
-    attachments?: Array<{ type: string; data: string; mimeType?: string; name?: string }>
-  ): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
-    if (!attachments?.length) return userRequest;
-    const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [
-      { type: 'text', text: userRequest || 'Analyze the attached image(s).' },
-      ...attachments.map(a => ({ type: 'image_url' as const, image_url: { url: a.data } })),
-    ];
-    return parts;
-  }
-
   /**
    * Main agent execution - processes user request autonomously
    */
-  async processRequest(
-    userRequest: string,
-    workspacePath?: string,
-    opts?: { attachments?: Array<{ type: string; data: string; mimeType?: string; name?: string }> }
-  ): Promise<string> {
-    const attachments = opts?.attachments;
-    // Generate message ID for citation tracking
-    this.currentMessageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    
+  async processRequest(userRequest: string, workspacePath?: string, citationMessageId?: string): Promise<string> {
+    // Generate message ID for citation tracking (must match streaming bubble id from chat UI when provided)
+    this.currentMessageId =
+      citationMessageId && citationMessageId.length > 0
+        ? citationMessageId
+        : `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    this.lastSessionToolExecutions = 0;
+    this.lastFileEditDiff = null;
+
     // Check if workspace is open
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const hasWorkspace = workspaceFolders && workspaceFolders.length > 0;
@@ -595,8 +696,19 @@ export class AgenticCore {
                         process.cwd();
     this.state.context.workspacePath = detectedPath;
 
+    // File contents injected by chat (@file / resolveImplicitFilePaths) — use tool loop (edit_file), not batch scan/fix shortcuts
+    const hasInlineFileContext =
+      /\[Instruction: Specific file\(s\) are attached above/i.test(userRequest) ||
+      /\[File:\s*[^\]]+\]/i.test(userRequest);
+
+    /** @file / attached code + user asked to change code — must use read_file/edit_file, not repo scan */
+    const isFileScopedRemediation =
+      hasInlineFileContext &&
+      /\b(fix|recode|rewrite|patch|remediat|repair|secure|harden|apply\s+fix|edit|refactor)\b/i.test(userRequest);
+
     // Check for fix request using intent recognizer (consistent with natural language routing)
-    const isFixRequest = recognizedIntent.intent === 'FIX_VULNERABILITIES';
+    const isFixRequest =
+      recognizedIntent.intent === 'FIX_VULNERABILITIES' && !hasInlineFileContext;
     const isHighPriorityOnly = /fix.*(high|critical)\s*(priority|issues?|vulns?)|high\s*priority.*fix|(critical|high)\s+only/i.test(userRequest);
     const isCriticalOnly = /fix.*critical\s*only|only.*critical|critical\s+issues?\s+only/i.test(userRequest);
 
@@ -607,7 +719,7 @@ export class AgenticCore {
       // Add user message to conversation for context
       this.state.conversation.push({
         role: 'user',
-        content: this.buildUserMessageContent(userRequest, attachments)
+        content: userRequest
       });
 
       // Check if we have scan results to fix
@@ -715,7 +827,7 @@ export class AgenticCore {
       return fixMessage;
     }
 
-    if (isSecurityRequest) {
+    if (isSecurityRequest && !hasInlineFileContext) {
       // IMMEDIATELY execute security request - don't even ask the AI
       // This ensures security requests always work, regardless of AI model capabilities
       console.log('AgenticCore: Detected security request, immediately executing');
@@ -724,13 +836,11 @@ export class AgenticCore {
       const scanSubIntent = intentRecognizer.getScanSubIntent(userRequest);
       const isSecretsRequest = scanSubIntent === 'secrets';
       const isDependencyRequest = scanSubIntent === 'dependencies';
-      const isIacRequest = scanSubIntent === 'iac';
-      const isContainersRequest = scanSubIntent === 'containers';
       
       // Add user message to conversation for context
       this.state.conversation.push({
         role: 'user',
-        content: this.buildUserMessageContent(userRequest, attachments)
+        content: userRequest
       });
       
       // Clean up conversation history periodically to prevent memory issues
@@ -743,8 +853,6 @@ export class AgenticCore {
         let firstMessage = 'I\'m scanning your repository. Results will follow shortly.';
         if (isSecretsRequest) firstMessage = 'I\'m scanning your repository for hardcoded secrets. Results will follow shortly.';
         else if (isDependencyRequest) firstMessage = 'I\'m scanning your repository for dependency vulnerabilities. Results will follow shortly.';
-        else if (isIacRequest) firstMessage = 'I\'m scanning your Terraform, CloudFormation & Kubernetes for misconfigurations. Results will follow shortly.';
-        else if (isContainersRequest) firstMessage = 'I\'m scanning your Dockerfiles and container images. Results will follow shortly.';
         else firstMessage = 'I\'m running a full security scan of your repository. Results will follow shortly.';
         if (this.chatInterface && typeof this.chatInterface.addMessage === 'function') {
           this.chatInterface.addMessage('assistant', firstMessage);
@@ -776,8 +884,7 @@ export class AgenticCore {
                   undefined, 
                   {
                     filterSecrets: isSecretsRequest,
-                    filterDependencies: isDependencyRequest,
-                    scanners: isIacRequest ? ['iac-scanner'] : isContainersRequest ? ['container-scanner'] : undefined,
+                    filterDependencies: isDependencyRequest
                   }
                 );
                 
@@ -1106,17 +1213,22 @@ export class AgenticCore {
     }
     
     // For non-scan requests, proceed with normal AI processing
-    // Add user message (with image attachments for vision processing)
+    // Add user message
     this.state.conversation.push({
       role: 'user',
-      content: this.buildUserMessageContent(userRequest, attachments)
+      content: userRequest
     });
 
     // System prompt with tool definitions
-    const systemPrompt = this.buildSystemPrompt();
+    const systemPrompt = this.buildSystemPrompt(isFileScopedRemediation);
     
     let iteration = 0;
     let lastResponse = '';
+    let toolCallExecutions = 0;
+    let fileWasEdited = false;
+    /** Extra user nudges when the model runs tools but skips edit_file (weak tool-use models). */
+    let fileEditMandatoryNudges = 0;
+    const maxFileEditMandatoryNudges = 2;
 
     while (iteration < this.maxIterations) {
       // Build messages for AI
@@ -1128,8 +1240,9 @@ export class AgenticCore {
       // Call AI with tool support
       const response = await this.callAIWithTools(messages);
       
-      // Add assistant response
-      this.state.conversation.push(response);
+      // Store assistant turn with trimmed tool arguments so the next API request is not megabytes
+      // (some OpenRouter backends 400 on huge tool_call argument strings in history).
+      this.state.conversation.push(this.assistantMessageForHistory(response));
 
       // Check if AI wants to use tools
       if (response.tool_calls && response.tool_calls.length > 0) {
@@ -1155,6 +1268,47 @@ export class AgenticCore {
           }
           
           try {
+            if (isFileScopedRemediation && toolName === 'scan_repository') {
+              this.state.conversation.push({
+                role: 'tool',
+                content: JSON.stringify(
+                  {
+                    success: false,
+                    blocked: true,
+                    reason: 'scan_repository is disabled for file-scoped remediation (@file + fix/recode)',
+                    instruction: 'Use read_file then edit_file on the path from the user message or [File: ...] block.',
+                  },
+                  null,
+                  2
+                ),
+                tool_call_id: toolCall.id,
+                name: toolName,
+              });
+              continue;
+            }
+
+            // scan_file lets some models "finish" with findings only — same gap as skipping edit_file.
+            if (isFileScopedRemediation && toolName === 'scan_file') {
+              this.state.conversation.push({
+                role: 'tool',
+                content: JSON.stringify(
+                  {
+                    success: false,
+                    blocked: true,
+                    reason:
+                      'scan_file is disabled for file-scoped fix/recode — the user asked to change the file on disk',
+                    instruction:
+                      'Call read_file if you need the exact source, then call edit_file with the complete new file body (append: false).',
+                  },
+                  null,
+                  2
+                ),
+                tool_call_id: toolCall.id,
+                name: toolName,
+              });
+              continue;
+            }
+
             const tool = this.tools.get(toolName);
             if (!tool) {
               throw new Error(`Tool ${toolName} not found`);
@@ -1184,6 +1338,11 @@ export class AgenticCore {
 
             // Execute tool
             const toolResult = await tool.execute(toolParams);
+            toolCallExecutions++;
+            this.lastSessionToolExecutions = toolCallExecutions;
+            if (toolName === 'edit_file' || toolName === 'create_file' || toolName === 'apply_fix') {
+              fileWasEdited = true;
+            }
             
             // Add file citations if tool accessed files
             if (toolResult.filePath || toolResult.files) {
@@ -1213,10 +1372,10 @@ export class AgenticCore {
               }
             }
             
-            // Add tool result to conversation
+            // Add tool result to conversation (compact large read_file / scan payloads)
             this.state.conversation.push({
               role: 'tool',
-              content: JSON.stringify(toolResult, null, 2),
+              content: JSON.stringify(this.compactToolResultForLlm(toolName, toolResult), null, 2),
               tool_call_id: toolCall.id,
               name: toolName
             });
@@ -1234,16 +1393,42 @@ export class AgenticCore {
           }
         }
       } else {
+        // Only treat as "no tools" when the model never executed any tools this turn.
+        // If tools already ran (read_file/scan_file) and this reply has no tool_calls, the issue is
+        // "stopped without edit_file" — handled after the loop, not here (avoids false "no executable tools").
+        if (isFileScopedRemediation && !fileWasEdited && toolCallExecutions === 0) {
+          const raw = String(response.content || '');
+          const pseudoToolCall =
+            raw.includes('<tool_call>') ||
+            raw.includes('&lt;tool_call&gt;') ||
+            raw.includes('"name": "edit_file"') ||
+            raw.includes('"name":"edit_file"');
+          const fallback = pseudoToolCall
+            ? `This request needs **real tool execution** (\`read_file\` → \`edit_file\`) to change your file on disk.\n\n` +
+              `The model returned **pseudo tool text** instead of executable tool calls, so **no file was modified**.\n\n` +
+              `**Fix:** In CipherMate settings, pick a model with reliable **function/tool calling** (e.g. \`anthropic/claude-sonnet-4\` on OpenRouter), then resend the same \`@file\` fix request.`
+            : `This request needs **tool calls** (\`read_file\` / \`edit_file\`) to modify the file.\n\n` +
+              `The model returned **no executable tools** on this step, so **no file was modified**.\n\n` +
+              `**Fix:** Use a model that supports OpenAI-style tool calls (e.g. \`anthropic/claude-sonnet-4\` via OpenRouter). Note: \`openrouter/free\` may route to models that omit tools—try a named coding model.`;
+
+          this.state.conversation.push({
+            role: 'assistant',
+            content: fallback,
+          });
+          return fallback;
+        }
+
         // No tool calls - check if we should auto-trigger based on response content
-        const contentStr = typeof response.content === 'string' ? response.content : '';
-        const responseLower = contentStr.toLowerCase();
-        const shouldAutoScan = isSecurityRequest && 
-          (responseLower.includes("don't have access") || 
-           responseLower.includes("can't access") ||
-           responseLower.includes("no access") ||
-           responseLower.includes("unable to scan") ||
-           !responseLower.includes("scanning") && !responseLower.includes("found"));
-        
+        const responseLower = response.content.toLowerCase();
+        const shouldAutoScan =
+          !hasInlineFileContext &&
+          isSecurityRequest &&
+          (responseLower.includes("don't have access") ||
+            responseLower.includes("can't access") ||
+            responseLower.includes("no access") ||
+            responseLower.includes("unable to scan") ||
+            (!responseLower.includes('scanning') && !responseLower.includes('found')));
+
         if (shouldAutoScan && this.state.context.workspacePath && iteration === 0) {
           // AI didn't call the tool but user asked to scan - auto-trigger it
           console.log('AgenticCore: AI response suggests it cannot scan, auto-triggering scan_repository tool');
@@ -1252,7 +1437,13 @@ export class AgenticCore {
             const scanResult = await this.executeScanRepository(this.state.context.workspacePath);
             
             if (scanResult.success) {
-              return `Scan initiated.\n\n${scanResult.message}\n\nResult: ${scanResult.count} findings (${scanResult.critical} critical, ${scanResult.high} high). Use "fix vulnerabilities" for remediation.`;
+              const findings = Array.isArray(scanResult.vulnerabilities) ? scanResult.vulnerabilities : [];
+              const formatted = this.formatScanResultsWithoutAI(findings, userRequest);
+              this.state.conversation.push({
+                role: 'assistant',
+                content: formatted,
+              });
+              return formatted;
             } else {
               return `Failed to scan repository: ${scanResult.error || 'Unknown error'}`;
             }
@@ -1260,20 +1451,57 @@ export class AgenticCore {
             return `Error scanning repository: ${error instanceof Error ? error.message : String(error)}`;
           }
         }
+
+        // Model ran read_file / etc. but returned prose only — nudge + retry before giving up.
+        if (
+          isFileScopedRemediation &&
+          !fileWasEdited &&
+          toolCallExecutions > 0 &&
+          fileEditMandatoryNudges < maxFileEditMandatoryNudges
+        ) {
+          fileEditMandatoryNudges++;
+          console.log(
+            `AgenticCore: File-scoped remediation nudge ${fileEditMandatoryNudges}/${maxFileEditMandatoryNudges} (tools ran, no edit_file yet)`
+          );
+          if (this.chatInterface) {
+            this.chatInterface.showThinkingAction(
+              `Follow-up ${fileEditMandatoryNudges}/${maxFileEditMandatoryNudges}: requiring edit_file…`,
+              'CipherMate is asking the model again to write the file on disk.'
+            );
+          }
+          this.state.conversation.push({
+            role: 'user',
+            content:
+              `[CipherMate — required next step]\n` +
+              `The user asked to **fix / recode / harden** a specific file (@file or [File: ...] in this chat). ` +
+              `Tools already ran, but **edit_file** was not called, so **nothing was saved**.\n\n` +
+              `You MUST respond with **tool_calls** on this turn: call **edit_file** with:\n` +
+              `- **filePath**: the path the user meant (from @file, [File: ...], or the file you read)\n` +
+              `- **content**: the **complete** new file source (full file body as one string)\n` +
+              `- **append**: false\n\n` +
+              `Do **not** use scan_file or scan_repository for this request. ` +
+              `Do **not** reply with only prose. ` +
+              `If you believe the file is already secure, call **edit_file** anyway with the same contents as after read_file (no-op write).`,
+          });
+          iteration++;
+          continue;
+        }
         
         // No more tools to call - agent is done
-        lastResponse = contentStr;
+        lastResponse = response.content;
         
         // Get citations and append to response
         const citations = this.citationService.getCitations(this.currentMessageId);
-        if (citations && citations.length > 0 && this.chatInterface) {
-          // updateCitations expects an array of citation objects
-          this.chatInterface.updateCitations(this.currentMessageId, citations);
-          
-          // Append citations to response using summary string
-          const citationSummary = this.citationService.getCitationSummary(this.currentMessageId);
-          if (citationSummary) {
-            lastResponse += `\n\n---\n**Sources:** ${citationSummary}`;
+        if (citations && citations.length > 0) {
+          if (this.chatInterface) {
+            this.chatInterface.updateCitations(this.currentMessageId, citations);
+          }
+          // Webview shows Sources; avoid duplicating in body when chat UI is wired
+          if (!this.chatInterface) {
+            const citationSummary = this.citationService.getCitationSummary(this.currentMessageId);
+            if (citationSummary) {
+              lastResponse += `\n\n---\n**Sources:** ${citationSummary}`;
+            }
           }
         }
         
@@ -1287,13 +1515,31 @@ export class AgenticCore {
     const finalCitations = this.citationService.getCitations(this.currentMessageId);
     if (finalCitations && finalCitations.length > 0 && !lastResponse.includes('Sources:')) {
       if (this.chatInterface) {
-        // updateCitations expects an array of citation objects
         this.chatInterface.updateCitations(this.currentMessageId, finalCitations);
       }
-      const citationSummary = this.citationService.getCitationSummary(this.currentMessageId);
-      if (citationSummary) {
-        lastResponse += `\n\n---\n**Sources:** ${citationSummary}`;
+      if (!this.chatInterface) {
+        const citationSummary = this.citationService.getCitationSummary(this.currentMessageId);
+        if (citationSummary) {
+          lastResponse += `\n\n---\n**Sources:** ${citationSummary}`;
+        }
       }
+    }
+
+    if (isFileScopedRemediation && !fileWasEdited && toolCallExecutions > 0) {
+      const fallback =
+        `**Tools ran** (e.g. \`read_file\` / \`scan_file\`), but the model **did not call** \`edit_file\`, \`create_file\`, or \`apply_fix\`, so **nothing was written to disk**.\n\n` +
+        `**Next steps:**\n` +
+        `- Resend the request and ask explicitly: *"Call edit_file with the full recoded file for [path]"*.\n` +
+        `- Or switch CipherMate’s coding model to one with strong tool use (e.g. \`anthropic/claude-sonnet-4\` on OpenRouter). \`openrouter/free\` can route to models that stop after reading.\n`;
+      const combined =
+        lastResponse && String(lastResponse).trim().length > 0
+          ? `${fallback}\n\n---\n**Model reply (no write applied):**\n${lastResponse}`
+          : fallback;
+      this.state.conversation.push({
+        role: 'assistant',
+        content: combined,
+      });
+      return combined;
     }
 
     return lastResponse || 'Agent completed processing.';
@@ -1302,11 +1548,21 @@ export class AgenticCore {
   /**
    * Build system prompt with tool definitions
    */
-  private buildSystemPrompt(): string {
+  private buildSystemPrompt(fileScopedRemediation = false): string {
     const toolsDescription = Array.from(this.tools.values()).map(tool => {
       return `- ${tool.name}: ${tool.description}
   Parameters: ${JSON.stringify(tool.parameters, null, 2)}`;
     }).join('\n\n');
+
+    const fileRemediationBlock = fileScopedRemediation
+      ? `
+FILE-SCOPED FIX / RECODE (user attached a file or @file path):
+- You MUST end the task by calling **edit_file** with the **complete new file contents** (full file body), unless the user only asked for review with no changes.
+- **scan_repository** and **scan_file** are DISABLED in this mode — CipherMate will reject them. Use **read_file** if you need the exact source, then **edit_file**.
+- **Do not** stop after read_file with only prose: prose does not change files. Your next assistant turn after read_file MUST include an **edit_file** tool call.
+- Prefer one read_file (if needed) then one edit_file with the full secure implementation.
+`
+      : '';
 
     return `You are CipherMate, an autonomous security agent running as a VS Code extension. You help developers scan their code repositories and fix security vulnerabilities.
 
@@ -1324,11 +1580,14 @@ Your core expertise:
 
 Available Tools:
 ${toolsDescription}
-
+${fileRemediationBlock}
 Instructions:
 - When asked to scan a repository, use scan_repository tool with the workspace path (auto-detected)
 - When vulnerabilities are found, analyze and generate fixes
 - Apply fixes when appropriate
+- If the message includes [File: ...] blocks or the instruction that specific files are attached, and the user asks to fix, patch, recode, rewrite, or secure the code, you MUST call edit_file (or read_file then edit_file) to write changes to the workspace. Never claim the file was fixed or "remediation applied" without actually invoking a tool that modifies files.
+- If the user @-mentions or clearly names a file path in the current message, use edit_file / create_file on THAT path only for changes that match that request. Do not reuse a filename from an older, unrelated message (e.g. do not write server code into a .py file the user mentioned for a different task).
+- Match file extension to the task: JavaScript/Node fixes go to .js/.ts paths; Python to .py paths unless the user explicitly asks otherwise.
 - Use technical, concise language. Report findings with severity, location, remediation.
 - Plan multi-step operations (e.g., scan → analyze → fix → verify)
 - Be thorough and security-focused
@@ -1528,7 +1787,7 @@ Always think step by step and use tools to accomplish tasks.`;
     path: string, 
     includePatterns?: string[], 
     excludePatterns?: string[],
-    options?: { filterSecrets?: boolean; filterDependencies?: boolean; scanners?: string[] }
+    options?: { filterSecrets?: boolean; filterDependencies?: boolean }
   ): Promise<any> {
     try {
       // Use provided path, or fall back to workspace, or current directory
@@ -1564,10 +1823,7 @@ Always think step by step and use tools to accomplish tasks.`;
 
       // Use new unified RepositoryScanner (primary scanner) - this is fast and reliable
       const scanner = new RepositoryScanner(workspacePath);
-      const scanResult = await scanner.scan({
-        onProgress,
-        scanners: options?.scanners,
-      });
+      const scanResult = await scanner.scan({ onProgress });
 
       // Convert to format expected by agent
       const allVulnerabilities = scanner.getAllVulnerabilities(scanResult.results);
@@ -1576,12 +1832,8 @@ Always think step by step and use tools to accomplish tasks.`;
       // Tag each vulnerability with its scanner name
       let allResults = allVulnerabilities.map((v: any) => {
         // Determine scanner name from vulnerability metadata or type
-        let scannerName = (v as any).scanner || (v.metadata?.scanner as string) || 'code-pattern-scanner'; // Default fallback
-        if (v.type?.startsWith('IAC-')) {
-          scannerName = 'iac-scanner';
-        } else if (v.type?.startsWith('CONT-') || v.type === 'container-cve' || v.metadata?.scanner === 'trivy') {
-          scannerName = 'container-scanner';
-        } else if (v.type?.includes('dependency') || v.type?.includes('cve') || v.type?.includes('package')) {
+        let scannerName = (v as any).scanner || 'code-pattern-scanner'; // Default fallback
+        if (v.type?.includes('dependency') || v.type?.includes('cve') || v.type?.includes('package')) {
           scannerName = 'dependency-scanner';
         } else if (v.type?.includes('secret') || v.type?.includes('credential') || v.type?.includes('key') || 
                    v.type?.includes('password') || v.type?.includes('token')) {
@@ -1692,22 +1944,23 @@ Always think step by step and use tools to accomplish tasks.`;
 
   private async executeScanFile(filePath: string): Promise<any> {
     try {
-      if (!fs.existsSync(filePath)) {
+      const resolved = this.resolveToolFilePath(filePath);
+      if (!fs.existsSync(resolved)) {
         return { success: false, error: 'File not found' };
       }
 
-      const code = await fs.promises.readFile(filePath, 'utf-8');
-      const language = this.detectLanguage(filePath);
+      const code = await fs.promises.readFile(resolved, 'utf-8');
+      const language = this.detectLanguage(resolved);
       
       // Use AI to analyze the file
-      const analysis = await this.runAIAnalysisOnCode(code, filePath, language);
+      const analysis = await this.runAIAnalysisOnCode(code, resolved, language);
       
-      this.state.context.filesScanned.push(filePath);
+      this.state.context.filesScanned.push(resolved);
       
       return {
         success: true,
         vulnerabilities: analysis.issues || [],
-        file: filePath,
+        file: resolved,
         language: language,
         message: `File scan completed: Found ${(analysis.issues || []).length} issues`
       };
@@ -1830,18 +2083,20 @@ Generate a secure fix. Return JSON:
   private async executeSafeApplyFix(params: any): Promise<any> {
     try {
       const { vulnerability, filePath, originalCode, fixedCode, lineNumber, confirmed } = params;
+      const resolvedFile = this.resolveToolFilePath(filePath);
 
-      // If no vulnerability object provided, construct one from params
-      const vuln = vulnerability || {
-        id: `vuln-${Date.now()}`,
-        type: 'detected_vulnerability',
-        severity: 'medium' as const,
-        title: 'Detected Vulnerability',
-        description: 'Vulnerability detected during scan',
-        file: filePath,
-        line: lineNumber,
-        code: originalCode
-      };
+      const vuln = vulnerability
+        ? { ...vulnerability, file: resolvedFile }
+        : {
+            id: `vuln-${Date.now()}`,
+            type: 'detected_vulnerability',
+            severity: 'medium' as const,
+            title: 'Detected Vulnerability',
+            description: 'Vulnerability detected during scan',
+            file: resolvedFile,
+            line: lineNumber,
+            code: originalCode
+          };
 
       // Generate fix proposal using FixService
       const proposal = await this.fixService.generateFix(vuln);
@@ -1883,8 +2138,8 @@ Generate a secure fix. Return JSON:
       if (result.success) {
         return {
           success: true,
-          message: `Fix applied successfully to ${path.basename(filePath)} at line ${lineNumber}`,
-          file: filePath,
+          message: `Fix applied successfully to ${path.basename(resolvedFile)} at line ${lineNumber}`,
+          file: resolvedFile,
           line: lineNumber,
           fixId: result.fixId,
           backupId: result.backupId,
@@ -1912,11 +2167,12 @@ Generate a secure fix. Return JSON:
    */
   private async executeApplyFix(filePath: string, originalCode: string, fixedCode: string, lineNumber: number): Promise<any> {
     try {
-      if (!fs.existsSync(filePath)) {
+      const resolved = this.resolveToolFilePath(filePath);
+      if (!fs.existsSync(resolved)) {
         return { success: false, error: 'File not found' };
       }
 
-      const fileContent = await fs.promises.readFile(filePath, 'utf-8');
+      const fileContent = await fs.promises.readFile(resolved, 'utf-8');
       const lines = fileContent.split('\n');
       
       // Find the line to replace
@@ -1942,12 +2198,12 @@ Generate a secure fix. Return JSON:
       }
       
       const newContent = lines.join('\n');
-      await fs.promises.writeFile(filePath, newContent, 'utf-8');
+      await fs.promises.writeFile(resolved, newContent, 'utf-8');
       
       return {
         success: true,
-        message: `Fix applied to ${path.basename(filePath)} at line ${lineNumber}`,
-        file: filePath,
+        message: `Fix applied to ${path.basename(resolved)} at line ${lineNumber}`,
+        file: resolved,
         line: lineNumber
       };
     } catch (error) {
@@ -1960,7 +2216,8 @@ Generate a secure fix. Return JSON:
 
   private async executeReadFile(filePath: string): Promise<any> {
     try {
-      const content = await fs.promises.readFile(filePath, 'utf-8');
+      const resolved = this.resolveToolFilePath(filePath);
+      const content = await fs.promises.readFile(resolved, 'utf-8');
       return { success: true, content };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -1969,7 +2226,8 @@ Generate a secure fix. Return JSON:
 
   private async executeListFiles(directory: string, pattern?: string, recursive?: boolean): Promise<any> {
     try {
-      if (!fs.existsSync(directory)) {
+      const dir = this.resolveToolDirectory(directory);
+      if (!fs.existsSync(dir)) {
         return { success: false, error: 'Directory not found' };
       }
 
@@ -1999,7 +2257,7 @@ Generate a secure fix. Return JSON:
         }
       }
       
-      await scanDir(directory);
+      await scanDir(dir);
       
       return {
         success: true,
@@ -2197,11 +2455,10 @@ Return JSON with issues array.`;
     this.state.context.pendingRequest = originalRequest;
     
     // Check if we've already asked about this (to vary responses)
-    const getMsgText = (c: AgentMessage['content']) => typeof c === 'string' ? c : (Array.isArray(c) ? c.find((p: any) => p.type === 'text')?.text || '' : '');
     const previousNoWorkspaceMessages = this.state.conversation
       .filter(msg => msg.role === 'assistant')
       .slice(-3)
-      .map(msg => getMsgText(msg.content).toLowerCase());
+      .map(msg => msg.content.toLowerCase());
     
     const hasAskedBefore = previousNoWorkspaceMessages.some(msg => 
       msg.includes('open folder') || msg.includes('file → open')
@@ -2257,7 +2514,7 @@ Response:`;
       ];
       
       const response = await this.callAIWithTools(messages);
-      const generatedText = (typeof response.content === 'string' ? response.content : '')?.trim() || '';
+      const generatedText = response.content?.trim() || '';
       
       // Validate the response
       if (generatedText && this.isValidNoWorkspaceResponse(generatedText)) {
@@ -2456,6 +2713,8 @@ Response:`;
    */
   private async executeCreateFile(filePath: string, content: string): Promise<any> {
     try {
+      const resolvedPath = this.resolveToolFilePath(filePath);
+
       // Add citation
       this.citationService.addServiceCitation(
         this.currentMessageId,
@@ -2465,7 +2724,7 @@ Response:`;
       
       // Show action during thinking
       if (this.chatInterface) {
-        this.chatInterface.showThinkingAction(`Creating file: ${filePath}`);
+        this.chatInterface.showThinkingAction(`Creating file: ${resolvedPath}`);
         const citations = this.citationService.getCitations(this.currentMessageId);
         if (citations.length > 0) {
           const citationTexts = citations.map(c => {
@@ -2478,10 +2737,10 @@ Response:`;
         }
       }
 
-      const result = await this.fileService.createFile(filePath, content);
+      const result = await this.fileService.createFile(resolvedPath, content);
 
       if (result.success) {
-        this.citationService.addFileCitation(this.currentMessageId, filePath);
+        this.citationService.addFileCitation(this.currentMessageId, resolvedPath);
         
         // Update citations after file creation
         if (this.chatInterface) {
@@ -2498,7 +2757,7 @@ Response:`;
         }
         return {
           success: true,
-          message: `File created: ${filePath}`,
+          message: `File created: ${resolvedPath}`,
           filePath: result.path,
         };
       } else {
@@ -2525,6 +2784,8 @@ Response:`;
     hashForIntegrity: boolean = false
   ): Promise<any> {
     try {
+      const resolvedPath = this.resolveToolFilePath(filePath);
+
       // Add citation
       this.citationService.addServiceCitation(
         this.currentMessageId,
@@ -2534,7 +2795,7 @@ Response:`;
       
       // Show action during thinking
       if (this.chatInterface) {
-        this.chatInterface.showThinkingAction(`${append ? 'Appending to' : 'Editing'} file: ${filePath}`);
+        this.chatInterface.showThinkingAction(`${append ? 'Appending to' : 'Editing'} file: ${resolvedPath}`);
         const citations = this.citationService.getCitations(this.currentMessageId);
         if (citations.length > 0) {
           const citationTexts = citations.map(c => {
@@ -2547,21 +2808,38 @@ Response:`;
         }
       }
 
+      let beforeSnapshot = '';
+      if (!append) {
+        try {
+          beforeSnapshot = await this.fileService.readFile(resolvedPath);
+        } catch {
+          beforeSnapshot = '';
+        }
+      }
+
       let result;
       if (append) {
-        const existing = await this.fileService.readFile(filePath).catch(() => '');
-        result = await this.fileService.writeFile(filePath, existing + '\n' + content);
+        let existingStr = '';
+        try {
+          existingStr = await this.fileService.readFile(resolvedPath);
+        } catch {
+          existingStr = '';
+        }
+        result = await this.fileService.writeFile(resolvedPath, existingStr + '\n' + content);
       } else {
-        result = await this.fileService.writeFile(filePath, content);
+        result = await this.fileService.writeFile(resolvedPath, content);
       }
 
       if (result.success) {
-        this.citationService.addFileCitation(this.currentMessageId, filePath);
+        if (!append) {
+          this.lastFileEditDiff = { path: resolvedPath, before: beforeSnapshot, after: content };
+        }
+        this.citationService.addFileCitation(this.currentMessageId, resolvedPath);
 
         // Generate hash if requested
         let hash: string | undefined;
         if (hashForIntegrity) {
-          hash = await this.projectGenService.hashFile(filePath);
+          hash = await this.projectGenService.hashFile(resolvedPath);
           this.citationService.addServiceCitation(
             this.currentMessageId,
             'HashingService',
@@ -2571,7 +2849,7 @@ Response:`;
 
         return {
           success: true,
-          message: `File ${append ? 'appended' : 'updated'}: ${filePath}`,
+          message: `File ${append ? 'appended' : 'updated'}: ${resolvedPath}`,
           filePath: result.path,
           hash,
         };
@@ -2581,128 +2859,6 @@ Response:`;
           error: result.error || 'Unknown error',
         };
       }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  /**
-   * Execute Pentest scan (200+ agents, replaces Cobalt/XBOW)
-   */
-  private async executePentestScan(params: { targetUrl: string }): Promise<any> {
-    const config = vscode.workspace.getConfiguration('ciphermate');
-    const targetUrl = (params.targetUrl || '').trim();
-    if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
-      return { success: false, error: 'Valid target URL required' };
-    }
-    if (this.chatInterface) {
-      this.chatInterface.showThinkingAction(`Running Pentest on ${targetUrl}... 200+ agents unleashed.`);
-    }
-    try {
-      const orchestrator = new AgentOrchestrator(this.context);
-      const result = await orchestrator.run({
-        targetUrl,
-        discoverFromWorkspace: true,
-        pentestMode: true,
-        enableAIResponseAnalysis: config.get<boolean>('dast.enableAIAnalysis', true),
-        enableContextAware: config.get<boolean>('dast.enableContextAware', true),
-        enableDeepDive: true,
-        maxDeepDiveAgents: config.get<number>('dast.pentestAgentSwarmSize', 100),
-        agentsPerFinding: config.get<number>('dast.pentestAgentsPerFinding', 4),
-        maxEndpoints: config.get<number>('dast.pentestMaxEndpoints', 300),
-        concurrency: config.get<number>('dast.pentestConcurrency', 50),
-        brutalMode: true,
-        enableGraphQL: true,
-        enableJwtOAuth: true,
-        enableIdor: true,
-        enableFileUploadTests: config.get<boolean>('dast.enableFileUploadTests', true),
-      });
-      if (!result.success) {
-        return { success: false, error: result.error };
-      }
-      return {
-        success: true,
-        targetUrl: result.targetUrl,
-        endpointsTested: result.endpointsTested,
-        attacksPerformed: result.attacksPerformed,
-        vulnerabilities: result.vulnerabilities,
-        pentestHighPlusFindings: result.pentestHighPlusFindings,
-        duration: result.duration,
-        summary: {
-          total: result.vulnerabilities.length,
-          critical: result.vulnerabilities.filter((v: any) => v.severity === 'critical').length,
-          high: result.vulnerabilities.filter((v: any) => v.severity === 'high').length,
-          medium: result.vulnerabilities.filter((v: any) => v.severity === 'medium').length,
-        },
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  /**
-   * Execute DAST scan (Surface Monitoring - replaces StackHawk/Intruder)
-   */
-  private async executeDastScan(params: {
-    targetUrl: string;
-    discoverEndpoints?: boolean;
-    useAIAnalysis?: boolean;
-    maxEndpoints?: number;
-  }): Promise<any> {
-    try {
-      const targetUrl = (params.targetUrl || '').trim();
-      if (!targetUrl || (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://'))) {
-        return {
-          success: false,
-          error: 'Valid target URL required (e.g. https://api.example.com or http://localhost:3000)',
-        };
-      }
-
-      if (this.chatInterface) {
-        this.chatInterface.showThinkingAction(`Running DAST on ${targetUrl}...`);
-      }
-
-      const scanner = new DastScanner(this.context);
-      const result = await scanner.scan({
-        targetUrl,
-        discoverFromWorkspace: params.discoverEndpoints !== false,
-        enableAIResponseAnalysis: params.useAIAnalysis !== false,
-        maxEndpoints: params.maxEndpoints ?? 30,
-        concurrency: 5,
-        adaptiveThrottling: true,
-        enableGraphQL: true,
-        enableJwtOAuth: true,
-        enableIdor: true,
-      });
-
-      if (!result.success) {
-        return {
-          success: false,
-          error: result.error || 'DAST scan failed',
-        };
-      }
-
-      return {
-        success: true,
-        targetUrl: result.targetUrl,
-        endpointsTested: result.endpointsTested,
-        attacksPerformed: result.attacksPerformed,
-        vulnerabilities: result.vulnerabilities,
-        securityHeaders: result.securityHeaders,
-        duration: result.duration,
-        summary: {
-          total: result.vulnerabilities.length,
-          critical: result.vulnerabilities.filter((v) => v.severity === 'critical').length,
-          high: result.vulnerabilities.filter((v) => v.severity === 'high').length,
-          medium: result.vulnerabilities.filter((v) => v.severity === 'medium').length,
-        },
-      };
     } catch (error) {
       return {
         success: false,
@@ -2730,8 +2886,7 @@ Return JSON with:
         { role: 'user', content: prompt }
       ];
       const response = await this.callAIWithTools(messages);
-      const responseContent = typeof response.content === 'string' ? response.content : '';
-      const parsed = JSON.parse(responseContent);
+      const parsed = JSON.parse(response.content);
 
       const name = parsed.name || 'my-project';
       const type = parsed.type || 'web';

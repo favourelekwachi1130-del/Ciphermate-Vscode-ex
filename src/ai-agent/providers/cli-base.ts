@@ -8,12 +8,19 @@ export interface ConversationMessage {
   content: string;
 }
 
+/** Optional args for chat (extension host); CLI parity preserved via optional param. */
+export interface AIChatOptions {
+  signal?: AbortSignal;
+  /** If set, appended as vision parts on the last user turn (OpenAI/OpenRouter-compatible providers). */
+  userImages?: Array<{ mimeType: string; base64: string }>;
+}
+
 export interface AIProvider {
   /**
    * Send a message and get a response
    * EXACT signature from CLI
    */
-  chat(messages: ConversationMessage[], systemPrompt: string): Promise<string>;
+  chat(messages: ConversationMessage[], systemPrompt: string, options?: AIChatOptions): Promise<string>;
 
   /**
    * Get provider name

@@ -29,7 +29,7 @@ export const PROVIDER_MODELS: Record<ProviderType, string[]> = {
   claude: ['claude-sonnet-4-5-20250929', 'claude-sonnet-4-20250514', 'claude-3-5-haiku-latest'],
   openai: ['gpt-5.1', 'gpt-5', 'gpt-5-mini'],
   gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-lite'],
-  ollama: ['deepseek-r1:8b', 'gemma3:4b']
+  ollama: ['llama3:8b', 'gemma3:4b']
 };
 
 /**
@@ -216,19 +216,19 @@ export function getErrorSuggestion(error: unknown, currentProvider: ProviderType
       suggestions.push('  1. Add credits at https://console.anthropic.com/');
       suggestions.push('  2. Try OpenAI: Set ciphermate.ai.provider to "openai"');
       suggestions.push('  3. Try Gemini: Set ciphermate.ai.provider to "gemini"');
-      suggestions.push('  4. Use Ollama (free, local): ollama pull deepseek-r1:8b');
+      suggestions.push('  4. Use Ollama (free, local): ollama pull llama3:8b');
     } else if (currentProvider === 'openai') {
       suggestions.push('Options:');
       suggestions.push('  1. Add credits at https://platform.openai.com/');
       suggestions.push('  2. Try Claude: Set ciphermate.ai.provider to "anthropic"');
       suggestions.push('  3. Try Gemini: Set ciphermate.ai.provider to "gemini"');
-      suggestions.push('  4. Use Ollama (free, local): ollama pull deepseek-r1:8b');
+      suggestions.push('  4. Use Ollama (free, local): ollama pull llama3:8b');
     } else if (currentProvider === 'gemini') {
       suggestions.push('Options:');
       suggestions.push('  1. Check billing at https://aistudio.google.com/');
       suggestions.push('  2. Try Claude: Set ciphermate.ai.provider to "anthropic"');
       suggestions.push('  3. Try OpenAI: Set ciphermate.ai.provider to "openai"');
-      suggestions.push('  4. Use Ollama (free, local): ollama pull deepseek-r1:8b');
+      suggestions.push('  4. Use Ollama (free, local): ollama pull llama3:8b');
     }
   } else if (isAuthError(error)) {
     suggestions.push(`${currentProvider} API key is invalid.`);

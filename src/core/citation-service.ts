@@ -126,6 +126,32 @@ export class CitationService {
   }
 
   /**
+   * Deduped rows for webview Sources (file paths, tools, services).
+   */
+  citationsToDisplayStrings(citations: Citation[]): string[] {
+    const seen = new Set<string>();
+    const rows: string[] = [];
+    for (const c of citations) {
+      const key = `${c.type}:${c.source}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      if (c.type === 'file') {
+        const line = c.metadata?.line as number | undefined;
+        rows.push(line != null && line > 0 ? `${c.source}:${line}` : c.source);
+      } else if (c.type === 'tool') {
+        rows.push(`Tool: ${c.source}`);
+      } else if (c.type === 'service') {
+        rows.push(`Service: ${c.source}`);
+      } else {
+        rows.push(c.description || c.source);
+      }
+    }
+    return rows;
+  }
+
+  /**
    * Format citations for display
    */
   formatCitations(citations: Citation[]): string {
@@ -133,7 +159,18 @@ export class CitationService {
       return '';
     }
 
-    const grouped = citations.reduce((acc, cite) => {
+    const deduped: Citation[] = [];
+    const seen = new Set<string>();
+    for (const cite of citations) {
+      const key = `${cite.type}:${cite.source}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      deduped.push(cite);
+    }
+
+    const grouped = deduped.reduce((acc, cite) => {
       if (!acc[cite.type]) {
         acc[cite.type] = [];
       }

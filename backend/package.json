@@ -1,0 +1,14 @@
+{
+  "name": "ciphermate-api",
+  "version": "1.0.0",
+  "description": "Minimal CipherMate API proxy — makes Scripter live and callable",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0"
+  }
+}

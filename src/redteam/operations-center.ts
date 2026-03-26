@@ -7,6 +7,7 @@ import { AgentOrchestrator } from '../dast/agent-orchestrator';
 import { startWarRoomServer } from '../dast/war-room-server';
 import { dastEventBus } from '../dast/dast-event-bus';
 import { getFontConfig, getFontConfigCss, getFontConfigRaw } from '../core/font-config';
+import { wrapWebviewHtml } from '../security/webview-csp';
 
 // Red Team Operations Center
 export class RedTeamOperationsCenter {
@@ -74,7 +75,7 @@ export class RedTeamOperationsCenter {
   }
 
   private getOperationsCenterHtml(): string {
-    return `
+    const html = `
       <!DOCTYPE html>
       <html lang="en">
       <head>
@@ -108,7 +109,7 @@ export class RedTeamOperationsCenter {
               .browser-bar {
                   background: var(--vscode-titleBar-activeBackground);
                   border-bottom: 1px solid var(--vscode-panel-border);
-                  padding: 12px 16px;
+                  padding: 16px 20px;
                   flex-shrink: 0;
               }
               
@@ -123,11 +124,11 @@ export class RedTeamOperationsCenter {
               
               .url-input {
                   flex: 1;
-                  padding: 10px 14px;
+                  padding: 12px 20px;
                   background: var(--vscode-input-background);
                   color: var(--vscode-input-foreground);
                   border: 1px solid var(--vscode-input-border);
-                  border-radius: 6px;
+                  border-radius: 9999px;
                   font-family: inherit;
                   font-size: 13px;
               }
@@ -145,6 +146,13 @@ export class RedTeamOperationsCenter {
                   background: var(--vscode-button-background);
                   color: var(--vscode-button-foreground);
                   font-weight: 600;
+                  border-radius: 9999px;
+                  padding: 10px 20px;
+                  transition: transform 0.2s ease, box-shadow 0.2s ease;
+              }
+              .btn-pentest:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
               }
               
               .btn-pentest:disabled {
@@ -155,6 +163,13 @@ export class RedTeamOperationsCenter {
               .btn-warroom {
                   background: var(--vscode-button-secondaryBackground);
                   color: var(--vscode-button-secondaryForeground);
+                  border-radius: 9999px;
+                  padding: 10px 20px;
+                  transition: transform 0.2s ease, box-shadow 0.2s ease;
+              }
+              .btn-warroom:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
               }
               
               .status-row {
@@ -166,8 +181,8 @@ export class RedTeamOperationsCenter {
               }
               
               .status-badge {
-                  padding: 2px 8px;
-                  border-radius: 4px;
+                  padding: 4px 14px;
+                  border-radius: 9999px;
                   background: var(--vscode-badge-background);
                   color: var(--vscode-badge-foreground);
               }
@@ -220,9 +235,9 @@ export class RedTeamOperationsCenter {
               }
               
               .feed-item {
-                  margin-bottom: 10px;
-                  padding: 10px 12px;
-                  border-radius: 2px;
+                  margin-bottom: 12px;
+                  padding: 12px 16px;
+                  border-radius: 12px;
                   border-left: 4px solid #0a5c0a;
                   background: #000;
               }
@@ -284,10 +299,13 @@ export class RedTeamOperationsCenter {
                   background: #000 !important;
                   color: #00ff00 !important;
                   border: 1px solid #0a5c0a !important;
+                  border-radius: 9999px !important;
+                  padding: 8px 16px !important;
               }
               .btn-terminal:hover {
                   background: #0a3d0a !important;
                   color: #00ff00 !important;
+                  transform: translateY(-1px);
               }
               
               .activity-feed::-webkit-scrollbar {
@@ -303,9 +321,10 @@ export class RedTeamOperationsCenter {
               
               .qa-container {
                   flex-shrink: 0;
-                  padding: 12px 16px;
+                  padding: 16px 20px;
                   background: var(--vscode-input-background);
                   border-top: 1px solid var(--vscode-panel-border);
+                  border-radius: 16px 16px 0 0;
               }
               
               .qa-header {
@@ -322,11 +341,11 @@ export class RedTeamOperationsCenter {
               
               .qa-input {
                   flex: 1;
-                  padding: 8px 12px;
+                  padding: 10px 18px;
                   background: var(--vscode-input-background);
                   color: var(--vscode-input-foreground);
                   border: 1px solid var(--vscode-input-border);
-                  border-radius: 4px;
+                  border-radius: 9999px;
                   font-family: inherit;
                   font-size: 12px;
               }
@@ -347,10 +366,10 @@ export class RedTeamOperationsCenter {
               }
               
               .qa-response {
-                  padding: 8px 10px;
-                  margin-bottom: 6px;
+                  padding: 10px 16px;
+                  margin-bottom: 8px;
                   background: var(--vscode-editor-background);
-                  border-radius: 4px;
+                  border-radius: 12px;
                   font-size: 12px;
                   line-height: 1.4;
                   font-family: var(--ciphermate-font-code);
@@ -363,11 +382,11 @@ export class RedTeamOperationsCenter {
               }
               
               .btn {
-                  padding: 8px 16px;
+                  padding: 10px 20px;
                   background: var(--vscode-button-background);
                   color: var(--vscode-button-foreground);
                   border: 1px solid var(--vscode-button-border);
-                  border-radius: 4px;
+                  border-radius: 9999px;
                   cursor: pointer;
                   font-size: 12px;
                   transition: all 0.2s;
@@ -447,14 +466,24 @@ export class RedTeamOperationsCenter {
               .quick-access {
                   display: flex;
                   align-items: center;
-                  gap: 6px;
-                  margin-top: 6px;
+                  gap: 8px;
+                  margin-top: 10px;
                   font-size: 11px;
                   color: var(--vscode-descriptionForeground);
               }
               .quick-access .qa-label { margin-right: 4px; }
-              .quick-access a { color: var(--vscode-textLink-foreground); text-decoration: none; }
-              .quick-access a:hover { text-decoration: underline; }
+              .quick-access a {
+                  color: var(--vscode-textLink-foreground);
+                  text-decoration: none;
+                  padding: 4px 12px;
+                  background: var(--vscode-input-background);
+                  border-radius: 9999px;
+                  transition: background 0.2s, transform 0.2s;
+              }
+              .quick-access a:hover {
+                  background: var(--vscode-list-hoverBackground);
+                  transform: translateY(-1px);
+              }
               .quick-access .qa-sep { color: var(--vscode-panel-border); }
           </style>
       </head>
@@ -641,6 +670,7 @@ export class RedTeamOperationsCenter {
       </body>
       </html>
     `;
+    return wrapWebviewHtml(this.panel!.webview, html);
   }
 
   private setupMessageHandlers(): void {

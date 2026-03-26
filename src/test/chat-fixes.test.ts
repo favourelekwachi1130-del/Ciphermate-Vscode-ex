@@ -104,7 +104,7 @@ class MessageTracker {
 
 const OLLAMA_CONFIG = {
     apiUrl: 'http://64.225.56.89:11434',
-    model: 'deepseek-coder:1.3b',
+    model: 'llama3:8b',
     timeout: 60000
 };
 

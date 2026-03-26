@@ -9,7 +9,7 @@
 import * as vscode from 'vscode';
 import { AgentMode } from './cyber-agent-adapter';
 import { SYSTEM_PROMPTS } from './cyber-agent-prompts';
-import { AIProvider, ConversationMessage } from './providers/cli-base';
+import { AIProvider, AIChatOptions, ConversationMessage } from './providers/cli-base';
 import { ClaudeProvider } from './providers/cli-claude';
 import { GeminiProvider } from './providers/cli-gemini';
 import { OllamaProvider } from './providers/ollama-provider';
@@ -127,8 +127,11 @@ export class CyberAgent {
    * Send a message to the agent and get a response
    * EXACT match to CLI implementation with automatic fallback
    */
-  async chat(userMessage: string): Promise<string> {
+  async chat(userMessage: string, chatOptions?: AIChatOptions): Promise<string> {
     try {
+      if (chatOptions?.signal?.aborted) {
+        throw Object.assign(new Error('Request aborted'), { name: 'AbortError' });
+      }
       // Add user message to history
       this.conversationHistory.push({
         role: 'user',
@@ -140,7 +143,8 @@ export class CyberAgent {
       // Call provider's chat method (EXACT match to CLI)
       const assistantMessage = await this.provider.chat(
         this.conversationHistory,
-        this.systemPrompt
+        this.systemPrompt,
+        chatOptions
       );
 
       // Add assistant response to history
@@ -155,8 +159,12 @@ export class CyberAgent {
       // Remove the failed user message from history
       this.conversationHistory.pop();
 
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw error;
+      }
+
       // Try automatic fallback to other providers if available
-      const fallbackResult = await this.tryFallbackProviders(userMessage);
+      const fallbackResult = await this.tryFallbackProviders(userMessage, new Set(), chatOptions);
       if (fallbackResult) {
         return fallbackResult;
       }
@@ -177,7 +185,14 @@ export class CyberAgent {
    * Try fallback providers automatically
    * Uses EXACT CLI fallback logic from fallback.ts
    */
-  private async tryFallbackProviders(userMessage: string, attemptedProviders: Set<ProviderType> = new Set()): Promise<string | null> {
+  private async tryFallbackProviders(
+    userMessage: string,
+    attemptedProviders: Set<ProviderType> = new Set(),
+    chatOptions?: AIChatOptions
+  ): Promise<string | null> {
+    if (chatOptions?.signal?.aborted) {
+      return null;
+    }
     const config = vscode.workspace.getConfiguration('ciphermate');
     const fallbackEnabled = config.get('ai.enableAutoFallback', true) as boolean;
     
@@ -258,7 +273,7 @@ export class CyberAgent {
         const fallbackAgent = new CyberAgent(agentConfig);
         
         // Try the fallback provider (it will handle its own fallback if needed)
-        const response = await fallbackAgent.chat(userMessage);
+        const response = await fallbackAgent.chat(userMessage, chatOptions);
         
         // Success! Update current provider
         this.provider = fallbackAgent['provider'];
@@ -276,7 +291,7 @@ export class CyberAgent {
     } catch (fallbackError) {
       console.warn(`CyberAgent: Fallback provider ${nextProvider.provider} also failed:`, fallbackError);
       // Try next provider in chain (pass attemptedProviders to prevent loops)
-      return this.tryFallbackProviders(userMessage, attemptedProviders);
+      return this.tryFallbackProviders(userMessage, attemptedProviders, chatOptions);
     }
     
     return null; // All fallbacks failed
@@ -288,7 +303,7 @@ export class CyberAgent {
    */
   async analyze(task: string, context?: any): Promise<string> {
     const prompt = this.buildAnalysisPrompt(task, context);
-    return this.chat(prompt);
+    return this.chat(prompt, undefined);
   }
 
   private buildAnalysisPrompt(task: string, context?: any): string {
